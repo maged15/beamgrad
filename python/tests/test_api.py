@@ -450,6 +450,31 @@ def test_vmap_matches_a_batched_call():
     assert torch.equal(unbatched, expected[:, 0])
 
 
+def test_torch_func_transforms():
+    options = BeamOptions(beam_size=3, eos_token=2, length_penalty_alpha=0.6)
+    x = random_log_probs(2, 5, 3, 13, seed=19)
+    weights = torch.tensor([1.0, -0.5, 0.25])
+    reference = x.clone().requires_grad_(True)
+    (final_scores(reference, options) * weights).sum().backward()
+
+    assert torch.equal(torch.func.grad(lambda y: (final_scores(y, options) * weights).sum())(x), reference.grad)
+    _, vjp = torch.func.vjp(lambda y: final_scores(y, options), x)
+    assert torch.equal(vjp(weights.expand(2, 3))[0], reference.grad)
+    jacobian = torch.func.jacrev(lambda y: final_scores(y, options))(x[0])
+    assert jacobian.shape == (3, 5, 3, 13)
+    torch.testing.assert_close(torch.einsum("k,k...->...", weights, jacobian), reference.grad[0])
+
+
+@pytest.mark.skipif(not hasattr(torch.library, "register_vmap"), reason="torch.library.register_vmap needs PyTorch 2.5")
+def test_per_example_gradients_with_vmap_of_grad():
+    options = BeamOptions(beam_size=3, eos_token=2)
+    x = random_log_probs(4, 6, 3, 11, seed=23)
+    reference = x.clone().requires_grad_(True)
+    final_scores(reference, options).sum().backward()
+    per_example = torch.vmap(torch.func.grad(lambda y: final_scores(y, options).sum()))(x)
+    assert torch.equal(per_example, reference.grad)
+
+
 def test_version_and_capabilities():
     assert beamgrad.__version__.count(".") == 2
     assert isinstance(beamgrad.cuda_available(), bool)

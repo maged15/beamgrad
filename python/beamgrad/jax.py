@@ -61,8 +61,11 @@ def _host_decode(x, steps, options: BeamOptions, lib_path: str | None):
     n = math.prod(lead)
     x = np.ascontiguousarray(x.reshape(n, T, K, V))
     steps = _fold_steps(steps, lead, n)
-    mask = options.banned_mask(V)
-    banned = None if mask is None else np.asarray(mask, dtype=np.uint8)
+    ids = options.banned_ids(V)
+    banned = None
+    if ids is not None:
+        banned = np.zeros(V, dtype=np.uint8)
+        banned[list(ids)] = 1
     constraints = constraints_to_c(options, banned)
 
     final = np.empty((n, K), dtype=np.float32)
@@ -144,7 +147,7 @@ def final_scores(log_probs, options: BeamOptions, steps=None, lib_path: str | No
         raise ValueError(f"log_probs has {K} beams but options.beam_size is {options.beam_size}")
     if options.eos_token >= V:
         raise ValueError(f"eos_token {options.eos_token} is outside the vocabulary (size {V})")
-    options.banned_mask(V)  # checks the banned ids against the vocabulary
+    options.banned_ids(V)  # checks the banned ids against the vocabulary
     x = x.astype(jnp.float32)  # differentiable: gradients return in the input dtype
 
     trace_shapes = (
