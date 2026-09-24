@@ -18,6 +18,7 @@ dist/
 *.pyd
 
 # Python
+python/beamgrad/_build_info.py
 __pycache__/
 *.pyc
 .pytest_cache/

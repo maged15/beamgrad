@@ -22,13 +22,19 @@ A complete, compiling example is [`examples/c_api.c`](../examples/c_api.c).
 
 ## Conventions
 
-- **Return codes.** Functions returning `int` return `0` on success, `-1` for
-  invalid arguments, `-2` for an error raised during the computation, `-3` for
-  an unexpected internal error.
-- **Errors.** `dbs_last_error(handle)` returns the last error message for a
-  decoder; `dbs_last_global_error()` returns the calling thread's last error
-  (use it when `dbs_create_ex` fails). The returned pointer is valid until the
-  next call on the same thread.
+- **Return codes.** Functions returning a status return `DBS_OK` (`0`) on
+  success, `DBS_ERROR_INVALID_ARGUMENT` (`-1`) for invalid arguments or inputs
+  (null pointers, bad shapes or options, sizes that overflow, NaN/`+inf`
+  log-probs when `validate_inputs` is set), `DBS_ERROR_RUNTIME` (`-2`) for a
+  failure during the computation (out of memory, a callback that reported an
+  error) and `DBS_ERROR_UNKNOWN` (`-3`).
+- **Errors.** Every failing call records a message, including early failures
+  such as a null handle. `dbs_last_global_error()` returns the calling
+  thread's latest message and `dbs_last_error(handle)` a decoder's latest one;
+  a successful call clears both. When threads share a decoder, a call on one
+  thread can replace the decoder's message before another thread reads it, so
+  prefer the thread-local `dbs_last_global_error()` there. Returned pointers
+  are valid until the next call on the same thread.
 - **Ownership.** Every handle returned through an out-parameter belongs to the
   caller and is released with its matching function (`dbs_destroy`,
   `dbs_free_result`, `dbs_free_backward`, `dbs_free_batch_result`,
@@ -39,8 +45,8 @@ A complete, compiling example is [`examples/c_api.c`](../examples/c_api.c).
   Batches are `[B, T, K, V]`. Sparse gradient indices use the flattened
   `[T, K, V]` layout.
 - **Threads.** A decoder's options are immutable after creation; one decoder
-  may be used from several threads at once. Stats and error messages are
-  per decoder.
+  may be used from several threads at once. Stats are per decoder (last writer
+  wins); error messages are per thread and per decoder (see above).
 
 ## Options
 
@@ -57,11 +63,22 @@ token 0, so set it to `-1` to disable EOS handling.
 | `length_penalty_alpha` | 0 | GNMT length penalty exponent |
 | `selected_temperature` | 1.0 | softmax temperature of the selected-beam weights |
 | `soft_topk_temperature` | 0.25 | sigmoid temperature of the relaxed pool |
-| `relaxed_pool_multiplier` | 8 | relaxed pool size `P = K * multiplier` |
+| `relaxed_pool_multiplier` | 0 | relaxed pool size `P = K * multiplier`; 0 disables the pool |
 | `soft_topk_tolerance` | 1e-4 | bisection tolerance for the relaxed pool |
 | `soft_topk_max_iters` | 48 | bisection iteration cap |
-| `vocab_block` | 4096 | vocabulary scan block (tuning only; results do not depend on it) |
-| `validate_inputs` | (none) | non-zero: reject NaN/`+inf` log-probs (checks up to 1000 sampled entries) |
+| `vocab_block` | (ignored) | kept for source compatibility |
+| `validate_inputs` | (none) | non-zero: fail with `-1` when a row the search reads contains NaN or `+inf` |
+
+`validate_inputs` checks every element of every row the search reads (the rows
+of live, unfinished beams, including tokens that are banned or masked) as part
+of the scan, so it costs no extra pass. Rows that are never read, such as
+beams 1..K-1 at step 0 or the rows of finished beams, are not checked. Without
+it, NaN and `+inf` entries are never selected.
+
+The relaxed pool (the `pool_*` and `relaxed_weights` outputs and
+`grad_relaxed_weights`) is only kept when `relaxed_pool_multiplier` is at
+least 1; it never changes which beams are selected, and keeping `P` candidates
+per step costs time, so it is off by default.
 | `max_dense_gradient_elements` | 1e8 | cap on `T*K*V` for `dbs_backward_dense` |
 
 ## Decoding
@@ -74,7 +91,38 @@ token 0, so set it to `-1` to disable EOS handling.
 | `dbs_decode_constrained_ex` | `DBSAdvancedConstraintsC`: the above plus repetition penalty, no-repeat n-gram size, and a token-filter callback |
 | `dbs_decode_batch` / `dbs_decode_batch_typed` | `[B, T, K, V]`, decoded on `num_threads` threads (0 = all cores) |
 | `dbs_decode_batch_variable` | `[B, maxT, maxK, V]` with per-example steps, beam sizes, EOS tokens, min lengths, banned masks and forced schedules |
-| `dbs_decode_model_steps` / `..._with_workspace` | a callback produces each step's `[K, V]` rows from the current beams |
+| `dbs_decode_model_steps_ex` | a callback produces each step's `[K, V]` rows from the current beams (see below); optional constraints |
+| `dbs_decode_model_steps` / `..._with_workspace` | the original callback, which sees only each beam's previous token and score |
+| `dbs_decode_batch_into` | `[B, T, K, V]` with optional per-example steps and constraints, straight into caller-owned arrays (`DBSDecodeOutputsC`), no result handles |
+
+Constraints (`DBSAdvancedConstraintsC`) are applied per beam: `banned_tokens`
+removes tokens everywhere, `no_repeat_ngram_size = n` blocks every token that
+would complete an n-gram already present in the beam's own prefix, and
+`repetition_penalty > 1` subtracts `log(repetition_penalty)` from tokens the
+beam has already emitted. The blocked and penalised sets are computed once per
+beam and step, so constrained decoding runs at nearly the speed of
+unconstrained decoding (a `token_filter` callback is still called per token).
+
+### Model-step decoding
+
+When each step's rows depend on the beams chosen so far (an autoregressive
+model), `dbs_decode_model_steps_ex` runs the search one step at a time and
+calls
+
+```c
+int step_fn(void* user_data, const DBSModelStepInfoC* info, float* out_log_probs /* [K, V] */);
+```
+
+once per step. `info` describes the beams entering the step: for each slot
+`k`, the slot it came from at the previous step (`parents[k]`), the token it
+emitted (`tokens[k]`), its length, scores and finished flag, and its whole
+token prefix (`prefixes[k * step + s]`). Beams are re-ranked every step, so
+slot `k` usually continues a different hypothesis than slot `k` did one step
+earlier: a model that keeps per-beam state (a KV cache) reorders it by
+`parents`, exactly like `index_select` on the beam dimension. Entries the
+callback leaves untouched are `-inf`; returning non-zero aborts the decode with
+`DBS_ERROR_RUNTIME`. The search runs incrementally, `T` callbacks for `T`
+steps.
 
 A result (`DBSResultHandle`) exposes, per step `[T, K]`: `tokens`, `parents`,
 `lengths`, `scores`, `raw_scores`, `weights` (selected-beam softmax); per final
@@ -100,6 +148,16 @@ returns a sparse gradient: `dbs_backward_sparse_logprob_indices` /
 `T*K*V` exceeds `max_dense_gradient_elements`. The gradients are defined in
 [algorithm.md](algorithm.md#backward-surrogate-gradients).
 
+The backward reads the beam size, vocabulary, temperatures and length penalty
+from the result, so a result decoded with other options (for example an
+example of `dbs_decode_batch_variable` with its own beam size) can go through
+any decoder handle.
+
+`dbs_backward_batch_into` is the array counterpart of `dbs_decode_batch_into`:
+it takes that call's `parents`, `tokens`, `lengths` and `from_logprob` outputs
+and `grad_final_scores [B, K]`, checks that the trace is in range, and
+accumulates the final-score gradient into `grad_log_probs [B, T, K, V]`.
+
 ## Introspection
 
 - `dbs_abi_version()`, `dbs_version_string()`
@@ -108,13 +166,16 @@ returns a sparse gradient: `dbs_backward_sparse_logprob_indices` /
 - `dbs_get_stats` / `dbs_get_stats_json` / `dbs_reset_stats`: timings, sizes,
   kernel, and error category of the last call on a decoder
 - `dbs_result_summary_json`, `dbs_result_eos_count`,
-  `dbs_result_validate_deterministic_order`
-- `dbs_allocator_*`: process-wide allocation counters
+  `dbs_result_validate_deterministic_order` (checks each step's beams against
+  the decoder's full candidate order)
+- `dbs_allocator_call_count` (allocations since the last
+  `dbs_allocator_counters_reset`) and `dbs_allocator_byte_count` (bytes
+  currently allocated; a gauge the reset leaves alone)
 
-`dbs_set_deterministic_seed` / `dbs_get_deterministic_seed` store a seed with
-the decoder for reproducibility metadata; decoding itself uses no randomness.
-`dbs_validate_production_gate_manifest` is a deprecated no-op kept for ABI
-compatibility; it always returns non-zero.
+`dbs_is_deterministic()` always returns 1: decoding uses no randomness and a
+total order over candidates. `dbs_set_deterministic_seed` /
+`dbs_get_deterministic_seed` only store a value with the decoder (nothing
+reads it); they remain for ABI compatibility.
 
 ## CUDA
 
@@ -133,13 +194,16 @@ int status = dbs_cuda_decode(d_log_probs, &args, &out, NULL, 0, stream);
 
 - `dbs_cuda_decode` runs the full search on the device; optional per-example
   `steps_per_example`, `beam_sizes_per_example`, `eos_tokens_per_example` and
-  `min_lengths_per_example` arrays give variable-length batches.
+  `min_lengths_per_example` arrays give variable-length batches, and
+  `banned_tokens`, `no_repeat_ngram_size` and `repetition_penalty` apply the
+  CPU decoder's constraints. `outputs->invalid_input` (optional, `[B]`)
+  reports the examples whose rows contained NaN or `+inf`.
 - `dbs_cuda_backward` takes the `parents`, `tokens`, `lengths` and
   `from_logprob` outputs plus `grad_final_scores [B, K]` and accumulates the
   final-score gradient into `grad_log_probs [B, T, K, V]`.
 - Scratch memory: pass `NULL` to have it allocated with `cudaMallocAsync` on
-  the stream, or provide `dbs_cuda_decode_workspace_size(&args)` /
-  `dbs_cuda_backward_workspace_size(&args)` bytes yourself.
+  the stream, or provide `dbs_cuda_decode_workspace_size(&args)` bytes
+  yourself (`dbs_cuda_backward_workspace_size` is 0: the backward needs none).
 - Status codes: `DBS_CUDA_STATUS_OK`, `_UNAVAILABLE` (CPU-only build or no
   device), `_INVALID_ARGUMENT`, `_LAUNCH_FAILED`, `_OUT_OF_MEMORY`;
   `dbs_cuda_status_string` describes them.

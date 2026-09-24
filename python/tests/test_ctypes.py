@@ -34,10 +34,17 @@ def test_library_errors_are_actionable(tmp_path):
         _ctypes.load_library(missing)
 
 
-def test_c_errors_surface_as_runtime_errors():
+def test_c_errors_carry_the_library_message():
     lib = _ctypes.load_library()
     bad = _ctypes.options_to_c(BeamOptions(beam_size=2))
     bad.beam_size = -3
     handle = ctypes.c_void_p()
-    with pytest.raises(RuntimeError, match="beam_size"):
+    # DBS_ERROR_INVALID_ARGUMENT (-1) becomes ValueError, other failures RuntimeError.
+    with pytest.raises(ValueError, match="beam_size"):
         _ctypes.check(lib, None, lib.dbs_create_ex(bad, ctypes.byref(handle)))
+
+
+def test_validate_inputs_is_passed_to_the_library():
+    assert _ctypes.options_to_c(BeamOptions(beam_size=2)).validate_inputs == 1
+    assert _ctypes.options_to_c(BeamOptions(beam_size=2, validate_inputs=False)).validate_inputs == 0
+    assert _ctypes.constraints_to_c(BeamOptions(beam_size=2), None) is None

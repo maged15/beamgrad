@@ -9,7 +9,7 @@ import torch
 
 import beamgrad
 from beamgrad import BeamOptions, backtrack, decode, final_scores
-from beamgrad._ctypes import check, load_library, options_to_c
+from beamgrad._ctypes import DBSAdvancedConstraintsC, check, constraints_to_c, load_library, options_to_c
 
 
 def random_log_probs(*shape, seed=0, dtype=torch.float32):
@@ -299,10 +299,155 @@ def test_nan_and_positive_infinity_are_rejected_unless_disabled():
     for bad in (float("nan"), float("inf")):
         y = x.clone()
         y[1, 1, 3] = bad
-        with pytest.raises(ValueError, match="NaN"):
+        with pytest.raises(ValueError, match="NaN or \\+inf"):
             final_scores(y, BeamOptions(beam_size=2))
         out = final_scores(y, BeamOptions(beam_size=2, validate_inputs=False))
         assert out.shape == (2,)
+
+
+def test_validation_covers_exactly_the_rows_the_search_reads():
+    x = random_log_probs(2, 3, 2, 8)
+    # Beam 1 is not live at step 0, so its row is never read.
+    y = x.clone()
+    y[0, 0, 1, 4] = float("nan")
+    final_scores(y, BeamOptions(beam_size=2))
+    # A banned token of a row that is read still counts.
+    y = x.clone()
+    y[1, 0, 0, 5] = float("inf")
+    with pytest.raises(ValueError, match="example 1"):
+        final_scores(y, BeamOptions(beam_size=2, banned_tokens=[5]))
+    # Padding steps past an example's length are not read either.
+    y = x.clone()
+    y[1, 2] = float("nan")
+    final_scores(y, BeamOptions(beam_size=2), steps=[3, 2])
+
+
+# ---------------------------------------------------------------------------
+# Constraints
+# ---------------------------------------------------------------------------
+
+
+def c_abi_constrained(x, options):
+    """Final scores of each example through dbs_decode_constrained_ex."""
+    lib = load_library()
+    handle = ctypes.c_void_p()
+    check(lib, None, lib.dbs_create_ex(options_to_c(options), ctypes.byref(handle)))
+    lib.dbs_decode_constrained_ex.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_int,
+        ctypes.c_int,
+        ctypes.POINTER(DBSAdvancedConstraintsC),
+        ctypes.POINTER(ctypes.c_void_p),
+    ]
+    lib.dbs_decode_constrained_ex.restype = ctypes.c_int
+    try:
+        B, T, K, V = x.shape
+        mask = options.banned_mask(V)
+        banned = None if mask is None else torch.tensor(mask, dtype=torch.uint8)
+        c = constraints_to_c(options, None if banned is None else banned.numpy())
+        out = torch.empty(B, K)
+        for b in range(B):
+            xb = x[b].contiguous()
+            result = ctypes.c_void_p()
+            status = lib.dbs_decode_constrained_ex(handle, xb.data_ptr(), T, V, ctypes.byref(c), ctypes.byref(result))
+            check(lib, handle, status)
+            out[b] = torch.tensor([lib.dbs_result_final_scores(result)[k] for k in range(K)])
+            lib.dbs_free_result(result)
+        return out
+    finally:
+        lib.dbs_destroy(handle)
+
+
+@pytest.mark.parametrize(
+    "extra",
+    [
+        {"banned_tokens": [0, 3]},
+        {"no_repeat_ngram_size": 1},
+        {"no_repeat_ngram_size": 2},
+        {"repetition_penalty": 1.8},
+        {"banned_tokens": (2,), "no_repeat_ngram_size": 2, "repetition_penalty": 1.3},
+    ],
+)
+def test_constraints_match_the_c_abi(extra):
+    # A small vocabulary over many steps, so prefixes repeat.
+    x = random_log_probs(2, 9, 3, 6, seed=21)
+    options = BeamOptions(beam_size=3, eos_token=5, length_penalty_alpha=0.5, **extra)
+    assert torch.equal(final_scores(x, options), c_abi_constrained(x, options))
+
+
+def test_no_repeat_ngram_blocks_repeats():
+    x = random_log_probs(8, 2, 5, seed=4)
+    paths = backtrack(decode(x, BeamOptions(beam_size=2, no_repeat_ngram_size=1)))
+    for path in paths:
+        tokens = [t for t in path.tolist() if t >= 0]
+        assert len(tokens) == len(set(tokens))
+
+
+def test_repetition_penalty_gradient_is_unchanged():
+    # The penalty shifts penalised entries by a constant: the path gradient is the same.
+    x = random_log_probs(5, 2, 7, seed=8).requires_grad_(True)
+    final_scores(x, BeamOptions(beam_size=2, repetition_penalty=1.5))[0].backward()
+    assert set(x.grad.unique().tolist()) <= {0.0, 1.0}
+
+
+def test_constraint_options_are_validated():
+    for kwargs in (
+        {"banned_tokens": [-1]},
+        {"banned_tokens": "ab"},
+        {"no_repeat_ngram_size": -1},
+        {"repetition_penalty": 0.0},
+        {"repetition_penalty": float("inf")},
+    ):
+        with pytest.raises(ValueError):
+            BeamOptions(beam_size=2, **kwargs)
+    with pytest.raises(ValueError, match="vocabulary"):
+        final_scores(random_log_probs(3, 2, 8), BeamOptions(beam_size=2, banned_tokens=[8]))
+
+
+# ---------------------------------------------------------------------------
+# torch.library integration: compile, fake tensors, vmap
+# ---------------------------------------------------------------------------
+
+
+def test_operators_are_registered():
+    assert hasattr(torch.ops.beamgrad, "decode")
+    assert hasattr(torch.ops.beamgrad, "final_scores_backward")
+
+
+def test_fake_tensor_shapes():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    with FakeTensorMode():
+        out = decode(torch.empty(3, 5, 4, 17), BeamOptions(beam_size=4))
+        assert out.final_scores.shape == (3, 4)
+        assert out.tokens.shape == (3, 5, 4) and out.tokens.dtype == torch.int64
+        assert out.from_logprob.dtype == torch.bool
+
+
+def test_torch_compile_fullgraph_forward_and_backward():
+    options = BeamOptions(beam_size=3, eos_token=2, length_penalty_alpha=0.6)
+
+    def loss(x):
+        return (final_scores(x, options) * torch.tensor([1.0, -0.5, 0.25])).sum()
+
+    compiled = torch.compile(loss, fullgraph=True, backend="aot_eager")
+    x = random_log_probs(2, 6, 3, 11, seed=13)
+    a = x.clone().requires_grad_(True)
+    b = x.clone().requires_grad_(True)
+    loss(a).backward()
+    compiled(b).backward()
+    assert torch.equal(a.grad, b.grad)
+
+
+@pytest.mark.skipif(not hasattr(torch.library, "register_vmap"), reason="torch.library.register_vmap needs PyTorch 2.5")
+def test_vmap_matches_a_batched_call():
+    options = BeamOptions(beam_size=2, eos_token=1)
+    x = random_log_probs(4, 3, 5, 2, 9, seed=17)  # [N, B, T, K, V]
+    expected = final_scores(x.reshape(12, 5, 2, 9), options).reshape(4, 3, 2)
+    assert torch.equal(torch.vmap(lambda y: final_scores(y, options))(x), expected)
+    unbatched = torch.vmap(lambda y: final_scores(y, options))(x[:, 0])
+    assert torch.equal(unbatched, expected[:, 0])
 
 
 def test_version_and_capabilities():

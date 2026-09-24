@@ -63,8 +63,8 @@ selects GPU architectures, for example `"8.0;9.0"`.
 | test | what it checks |
 |---|---|
 | `dbs_tests` | the C ABI: decoding, constraints, EOS, batching, typed input, backward vs finite differences, options validation, error reporting |
-| `dbs_simd_internal_tests` | every SIMD path the host supports against the scalar reference, bit for bit, on adversarial cases (ties at the pool boundary, `-inf` rows, EOS, constraints) |
-| `dbs_cuda_emulation_tests` | the CUDA engine, run through the emulation layer, against libdbs, bit for bit (Linux) |
+| `dbs_internal_tests` | every SIMD row scan the host supports against the scalar reference, bit for bit, on random rows (ties, `-inf`, NaN/`+inf`, banned and masked tokens); full decode + backward on every path; constrained decoding against a direct reference implementation; input validation; model-step decoding |
+| `dbs_cuda_emulation_tests` | the CUDA engine, run through the emulation layer under three thread schedules, against libdbs, bit for bit (Linux) |
 | `dbs_c_api_test` | both headers compile as C and both libraries export their API |
 | `dbs_example_c_api` | `examples/c_api.c` builds and runs |
 | `dbs_abi_symbols` | exported symbols match `abi/libdbs.symbols` and keep the baseline (Linux, shared builds) |
@@ -74,8 +74,9 @@ Release and Debug builds.
 
 `pytest python/tests` covers the Python API (exact parity with the C ABI,
 finite-difference gradients, path/score consistency, EOS/min-length/length
-penalty, variable steps, validation), the ctypes bindings, JAX (when
-installed), and CUDA-vs-CPU parity (when a GPU is available).
+penalty, constraints, variable steps, validation, `torch.compile`, fake
+tensors, `torch.vmap`), the ctypes bindings, JAX (values, gradients, `jit`,
+`vmap`, validation), and exact CUDA-vs-CPU parity (when a GPU is available).
 
 Sanitizers and fuzzing:
 
@@ -92,7 +93,8 @@ cmake --build build-fuzz && ./build-fuzz/dbs_fuzz -max_total_time=300
   warnings as errors, plus a static build), macOS and Windows; ASan/UBSan,
   TSan and a fuzz smoke run; an nvcc build of libdbs_cuda and of the Python
   CUDA operators in a CUDA 12.6 container; the Python package on Linux, macOS
-  and Windows; lint and version metadata.
+  and Windows with the newest PyTorch, and on Linux with the oldest supported
+  versions (Python 3.10, PyTorch 2.4, JAX 0.4.20); lint and version metadata.
 - **GPU**: the CUDA tests and benchmark on a self-hosted GPU runner. It is
   enabled by the repository variable `BEAMGRAD_GPU_RUNNER=true` and a runner
   labelled `gpu`.
