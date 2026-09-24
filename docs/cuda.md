@@ -25,21 +25,29 @@ of millions) with the CPU's exact tie-breaking. Each step runs:
    and every element of the rows of live, unfinished beams is checked for
    NaN and `+inf` on the way (per-example flags in
    `DBSCudaDecodeOutputs::invalid_input`).
-   - **`scan_small_kernel`** (`K <= 16`), grid `(B, ceil(K*V / 8192))`: each
-     of the 256 threads scans 32 candidates and keeps its own top `K` in
-     registers (most candidates are rejected by one comparison); the block
-     then sorts only the `256 * K` thread winners.
+   - **`scan_small_kernel`** (`K <= 16`): each of the 256 threads scans 4 to
+     32 candidates and keeps its own top `K` in registers (most candidates are
+     rejected by one comparison). The number per thread is chosen from the
+     problem size so that the whole batch spans about 512 blocks: a single
+     example still fills a large GPU, and big batches keep 32 per thread.
    - **`scan_tiles_kernel`** (`K > 16`), grid `(B, ceil(K*V / 4096))`: each
-     block sorts its tile of 4096 keys with a shared-memory bitonic network.
+     thread holds 16 candidates of the block's tile in registers.
 
-   Blocks with no valid candidate (dead or finished parents) skip the sort.
-2. **`reduce_tiles_kernel`** repeats the top-`K` reduction over the block
+   Both then find the block's `K` largest keys with `block_top_k`, a radix
+   select over 4-bit digits: a 16-bin shared histogram of the keys still in
+   the running locates the digit of the `K`-th largest key, most significant
+   digit first, until the keys above it and its digit bucket are exactly
+   `K`. Nothing is sorted, and the keys never leave registers, so the scans
+   use a few hundred bytes of shared memory. The winners are written in no
+   particular order: keys are unique, so the `K` largest are one set however
+   the candidates are split into blocks, and step 3 sorts them.
+2. **`reduce_tiles_kernel`** repeats the top-`K` selection over the block
    winners until at most 4096 keys per example remain. For typical shapes
-   this needs no launch with the register scan, and zero or one otherwise.
-3. **`select_step_kernel`**, one block per example, sorts the survivors,
-   decodes their keys, merges them with the EOS carry-forward candidates of
-   finished beams, and writes the step's tokens, parents, lengths, scores and
-   the new beam state.
+   this needs zero or one launch.
+3. **`select_step_kernel`**, one block per example, selects the `K` best
+   survivors (`block_top_k`), sorts only those, decodes their keys, merges
+   them with the EOS carry-forward candidates of finished beams, and writes
+   the step's tokens, parents, lengths, scores and the new beam state.
 
 **Why the key reproduces the CPU order.** The CPU ranks candidates by
 `(score, raw, parent, token, length, origin)`. All candidates scanned in one
@@ -57,10 +65,27 @@ evaluated in double precision from basic IEEE operations only (no `pow`),
 which round identically on the host and the device. `log(repetition_penalty)`
 is computed once on the host, as the CPU does.
 
-Resource use (CUDA 13, sm_80 and sm_90, from `ptxas -v`): the register scan
-uses 31–64 registers and up to 33 KB of static shared memory, the tile scan
-and reduce kernels 32–44 registers and 33 KB, the select kernel 48 registers
-and 42 KB, the backward 36 registers and 16 KB; no kernel spills.
+Resource use (CUDA 13.2, sm_80 and sm_90, from `ptxas -v`): the register
+scan uses 32–64 registers and under 300 bytes of static shared memory, the
+tile scan and reduce kernels 48–56 registers and 96 bytes, the select kernel
+56–62 registers and 38 KB, the backward 36–39 registers and 16 KB; no kernel
+spills.
+
+Decode time through the C APIs on an RTX 4080 SUPER, against the CPU decoder
+(`dbs_decode_batch_into`) on all 8 hardware threads of the same machine
+(steady state, `eos_token=2`, `length_penalty_alpha=0.6`):
+
+| B × T × K × V | CUDA | CPU |
+|---|--:|--:|
+| 1 × 16 × 4 × 32k | 0.27 ms | 0.22 ms |
+| 8 × 16 × 4 × 32k | 0.43 ms | 0.46 ms |
+| 8 × 32 × 8 × 32k | 1.5 ms | 3.2 ms |
+| 4 × 16 × 8 × 128k | 1.0 ms | 2.8 ms |
+| 16 × 64 × 4 × 50k | 3.2 ms | 13.0 ms |
+| 8 × 16 × 64 × 32k | 4.3 ms | 16.2 ms |
+| 4 × 8 × 256 × 32k | 4.2 ms | 14.8 ms |
+
+Small problems are bound by kernel launches (two or three per step).
 
 ## Backward
 
