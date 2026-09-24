@@ -5,48 +5,84 @@
 
 namespace dbs {
 
+#if DBS_X86_SIMD && defined(_MSC_VER) && !defined(__clang__)
+namespace {
+
+struct X86Features {
+    bool sse42 = false;
+    bool avx2 = false;
+    bool avx512f = false;
+};
+
+// CPUID plus the OS's XSAVE state: AVX needs the YMM state enabled, AVX-512
+// additionally the opmask and ZMM states.
+X86Features detect_x86_features() noexcept {
+    X86Features f;
+    int regs[4] = {};
+    __cpuid(regs, 0);
+    const int max_leaf = regs[0];
+    __cpuid(regs, 1);
+    f.sse42 = (regs[2] & (1 << 20)) != 0;
+    const bool osxsave = (regs[2] & (1 << 27)) != 0;
+    const bool avx = (regs[2] & (1 << 28)) != 0;
+    const unsigned long long xcr0 = osxsave ? _xgetbv(0) : 0;
+    const bool ymm_state = (xcr0 & 0x6) == 0x6;
+    const bool zmm_state = (xcr0 & 0xe6) == 0xe6;
+    if (max_leaf >= 7) {
+        __cpuidex(regs, 7, 0);
+        f.avx2 = avx && ymm_state && (regs[1] & (1 << 5)) != 0;
+        f.avx512f = avx && zmm_state && (regs[1] & (1 << 16)) != 0;
+    }
+    return f;
+}
+
+const X86Features& x86_features() noexcept {
+    static const X86Features features = detect_x86_features();
+    return features;
+}
+
+} // namespace
+
+bool runtime_has_avx512() noexcept { return x86_features().avx512f; }
+bool runtime_has_avx2() noexcept { return x86_features().avx2; }
+bool runtime_has_sse42() noexcept { return x86_features().sse42; }
+
+#elif DBS_X86_SIMD
+
 bool runtime_has_avx512() noexcept {
-#if DBS_CAN_COMPILE_AVX512
     static const bool supported = []() noexcept {
         __builtin_cpu_init();
-        return __builtin_cpu_supports("avx512f") && __builtin_cpu_supports("fma");
+        return __builtin_cpu_supports("avx512f") != 0;
     }();
     return supported;
-#else
-    return false;
-#endif
 }
 
 bool runtime_has_avx2() noexcept {
-#if DBS_X86 && (defined(__GNUC__) || defined(__clang__))
     static const bool supported = []() noexcept {
         __builtin_cpu_init();
-        return __builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma");
+        return __builtin_cpu_supports("avx2") != 0;
     }();
     return supported;
-#else
-    return false;
-#endif
 }
 
 bool runtime_has_sse42() noexcept {
-#if DBS_X86 && (defined(__GNUC__) || defined(__clang__))
     static const bool supported = []() noexcept {
         __builtin_cpu_init();
-        return __builtin_cpu_supports("sse4.2");
+        return __builtin_cpu_supports("sse4.2") != 0;
     }();
     return supported;
-#else
-    return false;
-#endif
 }
 
-bool runtime_has_neon() noexcept {
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
-    return true;
 #else
-    return false;
+
+bool runtime_has_avx512() noexcept { return false; }
+bool runtime_has_avx2() noexcept { return false; }
+bool runtime_has_sse42() noexcept { return false; }
+
 #endif
+
+bool runtime_has_neon() noexcept {
+    return DBS_ARM_NEON != 0;
 }
 
 namespace {

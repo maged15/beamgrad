@@ -13,7 +13,10 @@ Decoding consumes per-step log-probabilities `log_probs[t, k, v]` of shape
   `k`'s prefix* after step `t - 1`;
 - at `t = 0` only beam 0 is live (all beams share the empty prefix);
 - `-inf` marks an impossible token; NaN and `+inf` are rejected when input
-  validation is on, and otherwise never selected.
+  validation is on, and otherwise never selected. Validation covers exactly
+  the rows the search reads: those of live, unfinished beams (every element,
+  including banned or masked tokens). Rows of beams that are not live, such as
+  beams 1..K-1 at `t = 0`, and of finished beams are never read.
 
 The tensor can come from a model evaluated on each beam's prefix, or from any
 scoring function that produces one distribution per beam and step.
@@ -39,8 +42,12 @@ finished flag. At every step `t`:
    raw score and length unchanged. Finished hypotheses therefore compete
    fairly with longer ones at every later step.
 
-3. **Mask early EOS.** While a hypothesis is shorter than `min_length` tokens
-   (counting the EOS itself), EOS is not proposed.
+3. **Mask early EOS and apply constraints.** While a hypothesis is shorter
+   than `min_length` tokens (counting the EOS itself), EOS is not proposed.
+   Banned tokens are never proposed. With `no_repeat_ngram_size = n`, a beam
+   does not propose a token that would complete an n-gram already present in
+   its own prefix. With `repetition_penalty = r > 1`, a token already in the
+   beam's prefix is proposed with `log_probs[t, p, v] - log(r)`.
 
 4. **Select.** The `K` best candidates become the next beams. Candidates are
    ranked by a strict total order, so selection is deterministic:
@@ -58,9 +65,13 @@ The final scores are the `K` surviving scores after step `T - 1`, best first.
 
 All backends implement this order exactly: the scalar, AVX-512, AVX2, SSE4.2
 and NEON CPU kernels and the CUDA engine select the same beams with
-bitwise-identical scores. The length penalty is evaluated in double precision
-and rounded once, so the host and the GPU agree on it too. Tests enforce this
-(see [development.md](development.md#testing)).
+bitwise-identical scores and gradients. No operation is fused into a
+multiply-add, and the length penalty is evaluated in double precision from
+basic IEEE operations only and rounded once, so every CPU and the GPU compute
+the same bits. (The C-level softmax and sigmoid surrogates below use the
+platform's `expf`, so they are identical across kernel paths on one machine
+but may differ in the last bit between C libraries.) Tests enforce this (see
+[development.md](development.md#testing)).
 
 ## Backward: surrogate gradients
 
@@ -105,8 +116,9 @@ relaxations of the selection itself, and accepts upstream gradients for them:
   selected_temperature)` over the `K` selected beams. The gradient
   `w * (g - <w, g>) / temperature` flows to each beam's score and from there,
   through its path, to `log_probs`.
-- **Relaxed top-k pool.** Each step also keeps the best
-  `P = K * relaxed_pool_multiplier` candidates and a sigmoid "k-hot"
+- **Relaxed top-k pool** (opt-in: set `relaxed_pool_multiplier >= 1`). Each
+  step also keeps the best `P = K * relaxed_pool_multiplier` candidates and a
+  sigmoid "k-hot"
   relaxation of membership in the top `K`:
   `r_i = sigmoid((score_i - theta) / soft_topk_temperature)`, with `theta`
   found by bisection so that `sum_i r_i = K`. Its gradient is obtained by
@@ -126,6 +138,7 @@ final scores or the final-score gradient.
   change; a beam that is not selected receives no gradient.
 - **Precomputed rows.** beamgrad consumes a `[T, K, V]` tensor. When each
   row depends on its beam's prefix (an autoregressive model), the model must
-  produce those rows during decoding; the C ABI's `dbs_decode_model_steps`
-  does this with a callback, re-running the decode prefix at each step
-  (`O(T^2)` work), which is suitable for experiments rather than serving.
+  produce those rows during decoding; the C ABI's `dbs_decode_model_steps_ex`
+  runs the search step by step and asks a callback for each step's rows,
+  telling it which previous beam each row continues (see
+  [c-api.md](c-api.md#model-step-decoding)).

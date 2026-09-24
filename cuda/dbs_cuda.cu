@@ -4,15 +4,21 @@
 //
 // Algorithm, per decode step t:
 //
-//   1. scan_tiles_kernel: the K*V candidate space of every example is split
-//      into tiles of kTile candidates, one thread block per (example, tile).
-//      Each candidate (parent beam p, token v) gets a 64-bit key
+//   0. constraint_kernel (only with n-gram blocking or a repetition penalty):
+//      rebuilds, for every live beam, bitmaps of the tokens its prefix blocks
+//      and penalises.
+//   1. A scan kernel turns the K*V candidates of every example into 64-bit keys
 //          ordered(raw score) << 32 | ~(p * V + v)
-//      and the block keeps the K largest keys of its tile (bitonic sort).
-//   2. reduce_tiles_kernel: tile winners are reduced the same way until at
+//      and keeps the K largest per block: for K <= 16, every thread keeps its
+//      own top K in registers over a chunk of kChunk candidates and the block
+//      sorts only those (scan_small_kernel); for larger beams each block sorts
+//      a tile of kTile candidates (scan_tiles_kernel). Both check every element
+//      of the rows they read for NaN and +inf.
+//   2. reduce_tiles_kernel: block winners are reduced the same way until at
 //      most kTile keys per example remain.
 //   3. select_step_kernel: one block per example sorts the survivors, merges
-//      them with the EOS carry-forward candidates, and writes the step's beams.
+//      them with the EOS carry-forward candidates, writes the step's beams and
+//      advances the beam state (and the beams' token prefixes).
 //
 // Why a 64-bit key reproduces the CPU order exactly: the CPU ranks candidates
 // by (score, raw, parent, token, length, origin). Every scanned candidate of a
@@ -22,9 +28,15 @@
 // the same total order. Carry-forward candidates (finished beams, other
 // lengths) are few and are merged with the full comparator in step 3.
 //
+// All floating-point operations that feed results use explicitly rounded
+// intrinsics (no fused multiply-add), and the length penalty comes from
+// src/penalty.hpp, which the CPU decoder shares, so both backends produce the
+// same bits.
+//
 // The backward pass walks each example's selected paths from the last step to
-// the first, exactly like the CPU sparse backward, with one thread per example
-// so accumulation order (and therefore every bit of the result) is fixed.
+// the first with one block per example. Within a step every beam is handled by
+// its own thread (their gradient entries are distinct), and each parent sums
+// its children in slot order, the same order as the CPU backward.
 #include "dbs_cuda.h"
 
 #if defined(DBS_CUDA_EMULATION)
@@ -35,6 +47,8 @@
 #define DBS_LAUNCH(kernel, grid, block, stream, ...) kernel<<<(grid), (block), 0, (stream)>>>(__VA_ARGS__)
 #endif
 
+#include "penalty.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -44,14 +58,18 @@
 
 namespace {
 
-constexpr int kThreads = 256;                 // threads per block for tile/select kernels
-constexpr int kTile = 4096;                   // candidates sorted per block
+constexpr int kThreads = 256;                 // threads per block for scan/select kernels
+constexpr int kTile = 4096;                   // candidates sorted per block (large beams)
+constexpr int kSmallBeam = 16;                // largest beam handled by the register top-k scan
+constexpr int kSmallItems = 32;               // candidates per thread in the register top-k scan
+constexpr int kChunk = kThreads * kSmallItems;
 constexpr int kMaxBeam = DBS_CUDA_MAX_BEAM;
-constexpr int kBackwardThreads = 128;         // examples per backward block
+constexpr int kBackwardThreads = 256;
 constexpr int64_t kAlign = 256;               // workspace sub-buffer alignment
 
 static_assert(kTile % kThreads == 0, "tile must be a multiple of the block size");
 static_assert(2 * kMaxBeam <= kTile, "tile reduction must shrink the candidate set");
+static_assert(kThreads * kSmallBeam <= kTile, "the register scan's merge must fit a tile");
 
 std::atomic<int> g_synchronize{0};
 
@@ -60,18 +78,14 @@ std::atomic<int> g_synchronize{0};
 // ---------------------------------------------------------------------------
 
 __device__ __forceinline__ float neg_inf() { return __uint_as_float(0xff800000u); }
+__device__ __forceinline__ float pos_inf() { return __uint_as_float(0x7f800000u); }
 
 __device__ __forceinline__ bool is_finite(float x) {
     return (__float_as_uint(x) & 0x7f800000u) != 0x7f800000u;
 }
 
-// Same formula as dbs::gnmt_length_penalty in src/common.hpp: computed in double
-// and rounded once, so it matches the host bit for bit (a float powf would not).
-// Called a handful of times per beam and step, so double throughput is irrelevant.
 __device__ __forceinline__ float length_penalty(int length, float alpha) {
-    if (alpha == 0.0f) return 1.0f;
-    const int l = length > 1 ? length : 1;
-    return static_cast<float>(pow((5.0 + static_cast<double>(l)) / 6.0, static_cast<double>(alpha)));
+    return dbs::gnmt_length_penalty(length, alpha);
 }
 
 __device__ __forceinline__ uint64_t make_key(float raw, uint32_t index) {
@@ -111,18 +125,20 @@ __device__ __forceinline__ Meta load_meta(const DBSCudaDecodeArgs& a, int b) {
     return m;
 }
 
-// Descending bitonic sort of n (a power of two) keys in shared memory.
-// Must be called by every thread of the block.
-__device__ void bitonic_sort_desc(uint64_t* keys, int n) {
+// Bitonic sort of n (a power of two) keys in shared memory, descending or
+// ascending. Must be called by every thread of the block.
+template <class Key, bool kDescending>
+__device__ void bitonic_sort(Key* keys, int n) {
     for (int k = 2; k <= n; k <<= 1) {
         for (int j = k >> 1; j > 0; j >>= 1) {
             for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) {
                 const int partner = i ^ j;
                 if (partner > i) {
-                    const uint64_t a = keys[i];
-                    const uint64_t b = keys[partner];
-                    const bool descending = (i & k) == 0;
-                    if (descending ? (a < b) : (a > b)) {
+                    const Key a = keys[i];
+                    const Key b = keys[partner];
+                    const bool first_half = (i & k) == 0;
+                    const bool swap = kDescending == first_half ? (a < b) : (a > b);
+                    if (swap) {
                         keys[i] = b;
                         keys[partner] = a;
                     }
@@ -152,6 +168,45 @@ __device__ __forceinline__ bool better(const Cand& a, const Cand& b) {
     return a.from_logprob > b.from_logprob;
 }
 
+// Everything a scan kernel needs besides the beam state.
+struct ScanParams {
+    DBSCudaDecodeArgs a;
+    const float* log_probs;
+    const uint32_t* blocked;    // [B, K, words] n-gram bitmap, or null
+    const uint32_t* penalised;  // [B, K, words] repetition bitmap, or null
+    int words;                  // bitmap words per beam
+    float log_penalty;          // logf(repetition_penalty), computed on the host
+    uint8_t* invalid;           // [B] NaN/+inf flags, or null
+};
+
+// The key of candidate (parent, token) of example b at step t, or 0 if it is
+// not a candidate. Sets `invalid` if the log-prob is NaN or +inf. Only called
+// for live, unfinished parents, so every element of their rows is checked.
+__device__ __forceinline__ uint64_t candidate_key(
+    const ScanParams& p, int b, int t, int parent, int token, float parent_raw, int parent_len, const Meta& m,
+    uint32_t index, bool& invalid) {
+    const int K = p.a.beam_size;
+    const int V = p.a.vocab_size;
+    const float lp = p.log_probs[((static_cast<int64_t>(b) * p.a.steps + t) * K + parent) * V + token];
+    if (!(lp < pos_inf())) {
+        invalid = true;
+        return 0;
+    }
+    if (lp == neg_inf()) return 0;
+    if (p.a.banned_tokens && p.a.banned_tokens[token]) return 0;
+    if (m.eos >= 0 && token == m.eos && parent_len + 1 < m.min_length) return 0;
+    float value = lp;
+    if (p.blocked) {
+        const int64_t word = (static_cast<int64_t>(b) * K + parent) * p.words + (token >> 5);
+        const uint32_t bit = 1u << (token & 31);
+        if (p.blocked[word] & bit) return 0;
+        if (p.penalised[word] & bit) value = __fsub_rn(lp, p.log_penalty);
+    }
+    const float raw = __fadd_rn(parent_raw, value);
+    if (raw == neg_inf()) return 0;
+    return make_key(raw, index);
+}
+
 // ---------------------------------------------------------------------------
 // Kernels
 // ---------------------------------------------------------------------------
@@ -167,7 +222,8 @@ __global__ void validate_meta_kernel(DBSCudaDecodeArgs a, int* status) {
     if (!ok) atomicCAS(status, DBS_CUDA_STATUS_OK, DBS_CUDA_STATUS_INVALID_ARGUMENT);
 }
 
-__global__ void init_state_kernel(DBSCudaDecodeArgs a, float* beam_raw, int32_t* beam_len, uint8_t* beam_ended) {
+__global__ void init_state_kernel(DBSCudaDecodeArgs a, float* beam_raw, int32_t* beam_len, uint8_t* beam_ended,
+                                  uint8_t* invalid) {
     const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t total = static_cast<int64_t>(a.batch_size) * a.beam_size;
     if (i >= total) return;
@@ -177,12 +233,166 @@ __global__ void init_state_kernel(DBSCudaDecodeArgs a, float* beam_raw, int32_t*
     beam_raw[i] = (k == 0 && k < m.beam) ? 0.0f : neg_inf();
     beam_len[i] = 0;
     beam_ended[i] = 0;
+    if (invalid && k == 0) invalid[b] = 0;
+}
+
+// Constraint state of one beam slot: its token prefix (double-buffered across
+// steps), and the tokens whose bits are set in its bitmaps.
+struct ConstraintState {
+    const int32_t* prefix;      // [B, K, T]
+    const int32_t* prefix_len;  // [B, K]
+    uint32_t* blocked;          // [B, K, words]
+    uint32_t* penalised;        // [B, K, words]
+    int32_t* marked;            // [B, K, 2T] tokens with bits set
+    int32_t* marked_count;      // [B, K]
+    int words;
+    int ngram;
+    int penalise;
+};
+
+// grid = (B). Rebuilds each live beam's blocked and penalised token bitmaps
+// from its prefix, with the same rules as the CPU decoder.
+__global__ void constraint_kernel(DBSCudaDecodeArgs a, int t, ConstraintState c, const float* beam_raw) {
+    const int b = static_cast<int>(blockIdx.x);
+    const int K = a.beam_size;
+    const int T = a.steps;
+    const Meta m = load_meta(a, b);
+    if (t >= m.steps) return;
+    for (int p = static_cast<int>(threadIdx.x); p < m.beam; p += static_cast<int>(blockDim.x)) {
+        const int64_t slot = static_cast<int64_t>(b) * K + p;
+        uint32_t* blocked = c.blocked + slot * c.words;
+        uint32_t* penalised = c.penalised + slot * c.words;
+        int32_t* marked = c.marked + slot * 2 * T;
+        // Clear the bits of the hypothesis that held this slot at the previous step.
+        for (int i = 0; i < c.marked_count[slot]; ++i) {
+            blocked[marked[i] >> 5] = 0;
+            penalised[marked[i] >> 5] = 0;
+        }
+        int count = 0;
+        if (is_finite(beam_raw[slot])) {
+            const int32_t* prefix = c.prefix + slot * T;
+            const int L = c.prefix_len[slot];
+            const int n = c.ngram;
+            if (n == 1) {
+                for (int i = 0; i < L; ++i) {
+                    blocked[prefix[i] >> 5] |= 1u << (prefix[i] & 31);
+                    marked[count++] = prefix[i];
+                }
+            } else if (n > 1 && L >= n - 1) {
+                const int suffix_start = L - (n - 1);
+                for (int i = 0; i + n <= L; ++i) {
+                    bool same = true;
+                    for (int j = 0; j < n - 1 && same; ++j) same = prefix[i + j] == prefix[suffix_start + j];
+                    if (same) {
+                        const int token = prefix[i + n - 1];
+                        blocked[token >> 5] |= 1u << (token & 31);
+                        marked[count++] = token;
+                    }
+                }
+            }
+            if (c.penalise) {
+                for (int i = 0; i < L; ++i) {
+                    penalised[prefix[i] >> 5] |= 1u << (prefix[i] & 31);
+                    marked[count++] = prefix[i];
+                }
+            }
+        }
+        c.marked_count[slot] = count;
+    }
+}
+
+// grid = (B, chunks), for beam_size <= KMAX <= kSmallBeam. Every thread keeps
+// its KMAX best keys in registers; the block then sorts K keys per thread and
+// writes the K best keys of its chunk (0 = no candidate).
+template <int KMAX>
+__global__ void scan_small_kernel(
+    ScanParams p,
+    int t,
+    const float* __restrict__ beam_raw,
+    const int32_t* __restrict__ beam_len,
+    const uint8_t* __restrict__ beam_ended,
+    uint64_t* __restrict__ out_keys,
+    int chunks) {
+    __shared__ uint64_t keys[kThreads * KMAX];
+    __shared__ float parent_raw[KMAX];
+    __shared__ int32_t parent_len[KMAX];
+    __shared__ int expand[KMAX];
+    __shared__ int any_valid;
+
+    const int b = static_cast<int>(blockIdx.x);
+    const int chunk = static_cast<int>(blockIdx.y);
+    const int K = p.a.beam_size;
+    const int V = p.a.vocab_size;
+    const Meta m = load_meta(p.a, b);
+    const bool step_active = t < m.steps;
+
+    if (threadIdx.x == 0) any_valid = 0;
+    for (int k = static_cast<int>(threadIdx.x); k < K; k += static_cast<int>(blockDim.x)) {
+        const int64_t s = static_cast<int64_t>(b) * K + k;
+        parent_raw[k] = beam_raw[s];
+        parent_len[k] = beam_len[s];
+        expand[k] = step_active && k < m.beam && is_finite(beam_raw[s]) && !(m.eos >= 0 && beam_ended[s] != 0);
+    }
+    __syncthreads();
+
+    uint64_t best[KMAX];
+#pragma unroll
+    for (int j = 0; j < KMAX; ++j) best[j] = 0;
+    bool invalid = false;
+
+    if (step_active) {
+        const int64_t total = static_cast<int64_t>(K) * V;
+        int64_t c = static_cast<int64_t>(chunk) * kChunk + threadIdx.x;
+        int parent = static_cast<int>(c / V);
+        int token = static_cast<int>(c - static_cast<int64_t>(parent) * V);
+        for (int i = 0; i < kSmallItems && c < total; ++i) {
+            if (expand[parent]) {
+                const uint64_t key = candidate_key(p, b, t, parent, token, parent_raw[parent], parent_len[parent], m,
+                                                   static_cast<uint32_t>(c), invalid);
+                if (key > best[KMAX - 1]) {
+                    best[KMAX - 1] = key;
+#pragma unroll
+                    for (int j = KMAX - 1; j > 0; --j) {
+                        if (best[j] > best[j - 1]) {
+                            const uint64_t tmp = best[j];
+                            best[j] = best[j - 1];
+                            best[j - 1] = tmp;
+                        }
+                    }
+                }
+            }
+            c += kThreads;
+            token += kThreads;
+            while (token >= V) {
+                token -= V;
+                ++parent;
+            }
+        }
+    }
+    if (invalid && p.invalid) p.invalid[b] = 1;
+
+    // The chunk's K best keys are among the threads' K best.
+#pragma unroll
+    for (int j = 0; j < KMAX; ++j) {
+        if (j < K) keys[threadIdx.x * K + j] = best[j];
+    }
+    if (best[0] != 0) atomicOr(&any_valid, 1);
+    const int n = next_pow2(kThreads * K);
+    for (int i = kThreads * K + static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) keys[i] = 0;
+    __syncthreads();
+
+    const bool active = any_valid != 0;
+    if (active) bitonic_sort<uint64_t, true>(keys, n);
+
+    uint64_t* out = out_keys + (static_cast<int64_t>(b) * chunks + chunk) * K;
+    for (int i = static_cast<int>(threadIdx.x); i < K; i += static_cast<int>(blockDim.x)) {
+        out[i] = active ? keys[i] : 0;
+    }
 }
 
 // grid = (B, tiles). Writes the K best keys of each tile (0 = no candidate).
 __global__ void scan_tiles_kernel(
-    const float* __restrict__ log_probs,
-    DBSCudaDecodeArgs a,
+    ScanParams p,
     int t,
     const float* __restrict__ beam_raw,
     const int32_t* __restrict__ beam_len,
@@ -194,9 +404,9 @@ __global__ void scan_tiles_kernel(
 
     const int b = static_cast<int>(blockIdx.x);
     const int tile = static_cast<int>(blockIdx.y);
-    const int K = a.beam_size;
-    const int V = a.vocab_size;
-    const Meta m = load_meta(a, b);
+    const int K = p.a.beam_size;
+    const int V = p.a.vocab_size;
+    const Meta m = load_meta(p.a, b);
     const int64_t base = static_cast<int64_t>(tile) * kTile;
     const int64_t remaining = static_cast<int64_t>(K) * V - base;
     const int count = static_cast<int>(remaining < kTile ? remaining : kTile);
@@ -207,6 +417,7 @@ __global__ void scan_tiles_kernel(
     __syncthreads();
 
     int mine = 0;
+    bool invalid = false;
     for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) {
         uint64_t key = 0;
         if (step_active && i < count) {
@@ -217,24 +428,20 @@ __global__ void scan_tiles_kernel(
                 const int64_t s = static_cast<int64_t>(b) * K + parent;
                 const float parent_raw = beam_raw[s];
                 const bool ended = m.eos >= 0 && beam_ended[s] != 0;
-                const bool eos_masked = m.eos >= 0 && token == m.eos && beam_len[s] + 1 < m.min_length;
-                if (is_finite(parent_raw) && !ended && !eos_masked) {
-                    const float lp = log_probs[((static_cast<int64_t>(b) * a.steps + t) * K + parent) * V + token];
-                    if (is_finite(lp)) {
-                        const float raw = __fadd_rn(parent_raw, lp);
-                        if (raw != neg_inf()) key = make_key(raw, static_cast<uint32_t>(c));
-                    }
+                if (is_finite(parent_raw) && !ended) {
+                    key = candidate_key(p, b, t, parent, token, parent_raw, beam_len[s], m, static_cast<uint32_t>(c), invalid);
                 }
             }
         }
         keys[i] = key;
         mine |= key != 0 ? 1 : 0;
     }
+    if (invalid && p.invalid) p.invalid[b] = 1;
     if (mine) atomicOr(&any_valid, 1);
     __syncthreads();
 
     const bool active = any_valid != 0;
-    if (active) bitonic_sort_desc(keys, n);
+    if (active) bitonic_sort<uint64_t, true>(keys, n);
 
     uint64_t* out = out_keys + (static_cast<int64_t>(b) * tiles + tile) * K;
     for (int i = static_cast<int>(threadIdx.x); i < K; i += static_cast<int>(blockDim.x)) {
@@ -272,7 +479,7 @@ __global__ void reduce_tiles_kernel(
     __syncthreads();
 
     const bool active = any_valid != 0;
-    if (active) bitonic_sort_desc(keys, n);
+    if (active) bitonic_sort<uint64_t, true>(keys, n);
 
     uint64_t* out = out_keys + (static_cast<int64_t>(b) * tiles_out + tile) * K;
     for (int i = static_cast<int>(threadIdx.x); i < K; i += static_cast<int>(blockDim.x)) {
@@ -287,6 +494,15 @@ struct StepOutputs {
     float* scores;
     float* raw_scores;
     uint8_t* from_logprob;
+};
+
+// Token prefixes of the beams (only with n-gram blocking or a repetition
+// penalty): read from `prefix`, written for the next step to `next_prefix`.
+struct PrefixBuffers {
+    const int32_t* prefix;
+    const int32_t* prefix_len;
+    int32_t* next_prefix;
+    int32_t* next_prefix_len;
 };
 
 __device__ __forceinline__ void write_slot(const StepOutputs& o, int64_t slot, const Cand& c) {
@@ -338,12 +554,14 @@ __global__ void select_step_kernel(
     float* __restrict__ beam_raw,
     int32_t* __restrict__ beam_len,
     uint8_t* __restrict__ beam_ended,
-    StepOutputs out) {
+    StepOutputs out,
+    PrefixBuffers prefixes) {
     __shared__ SelectShared sh;
 
     const int b = static_cast<int>(blockIdx.x);
     const int K = a.beam_size;
     const int V = a.vocab_size;
+    const int T = a.steps;
     const Meta m = load_meta(a, b);
     const int64_t slot_base = (static_cast<int64_t>(b) * a.steps + t) * K;
 
@@ -367,7 +585,7 @@ __global__ void select_step_kernel(
         sh.u.keys[i] = i < n_in ? in[i] : 0;
     }
     __syncthreads();
-    bitonic_sort_desc(sh.u.keys, n);
+    bitonic_sort<uint64_t, true>(sh.u.keys, n);
 
     // Keep this thread's share of the top m.beam keys in registers, then reuse
     // the key buffer for the merge arrays.
@@ -451,6 +669,15 @@ __global__ void select_step_kernel(
         beam_raw[s] = c.raw;
         beam_len[s] = c.length;
         beam_ended[s] = static_cast<uint8_t>(c.from_logprob ? (c.token == m.eos && m.eos >= 0) : 1);
+        if (prefixes.next_prefix) {
+            // The new hypothesis' prefix: its parent's, plus the token it emitted.
+            const int64_t from = static_cast<int64_t>(b) * K + c.parent;
+            const int L = prefixes.prefix_len[from];
+            for (int i = 0; i < L; ++i) prefixes.next_prefix[s * T + i] = prefixes.prefix[from * T + i];
+            const bool append = c.from_logprob && c.token >= 0;
+            if (append) prefixes.next_prefix[s * T + L] = c.token;
+            prefixes.next_prefix_len[s] = L + (append ? 1 : 0);
+        }
     };
 
     // Scanned candidates are already in rank order; carry-forward candidates are
@@ -476,6 +703,7 @@ __global__ void select_step_kernel(
         beam_raw[s] = neg_inf();
         beam_len[s] = 0;
         beam_ended[s] = 0;
+        if (prefixes.next_prefix) prefixes.next_prefix_len[s] = 0;
     }
 }
 
@@ -505,8 +733,11 @@ __global__ void finalize_kernel(
     if (final_lengths) final_lengths[i] = length;
 }
 
-// One thread per example; mirrors the CPU sparse backward with only
-// grad_final_scores supplied.
+// grid = (B). Mirrors the CPU backward with only grad_final_scores supplied.
+// Per step, each thread handles some beams: it computes the beam's raw-score
+// gradient, writes its log-prob entry (distinct beams of a step have distinct
+// entries), and files (parent, beam) as a sort key; after sorting, each parent
+// sums its children's gradients in beam order, like the CPU.
 __global__ void backward_kernel(
     DBSCudaDecodeArgs a,
     const int32_t* __restrict__ parents,
@@ -514,34 +745,67 @@ __global__ void backward_kernel(
     const int32_t* __restrict__ lengths,
     const uint8_t* __restrict__ from_logprob,
     const float* __restrict__ grad_final_scores,
-    float* __restrict__ grad_log_probs,
-    float* __restrict__ scratch) {
-    const int b = static_cast<int>(blockIdx.x * blockDim.x + threadIdx.x);
-    if (b >= a.batch_size) return;
+    float* __restrict__ grad_log_probs) {
+    __shared__ float grad_a[kMaxBeam];
+    __shared__ float grad_b[kMaxBeam];
+    __shared__ float draw[kMaxBeam];
+    __shared__ uint32_t order[kMaxBeam];
+
+    const int b = static_cast<int>(blockIdx.x);
     const int K = a.beam_size;
     const int V = a.vocab_size;
     const Meta m = load_meta(a, b);
-    float* next = scratch + static_cast<int64_t>(b) * 2 * K;
-    float* prev = next + K;
-    for (int k = 0; k < m.beam; ++k) next[k] = 0.0f;
+    const int Kb = m.beam;
+    const int n = next_pow2(Kb);
+    constexpr uint32_t kNone = 0xffffffffu;
+
+    float* next = grad_a;  // raw-score gradient of each beam after step t
+    float* prev = grad_b;  // ... after step t - 1
+    for (int k = static_cast<int>(threadIdx.x); k < Kb; k += static_cast<int>(blockDim.x)) next[k] = 0.0f;
+    __syncthreads();
 
     for (int t = m.steps - 1; t >= 0; --t) {
-        for (int k = 0; k < m.beam; ++k) prev[k] = 0.0f;
-        for (int k = 0; k < m.beam; ++k) {
-            const int64_t slot = (static_cast<int64_t>(b) * a.steps + t) * K + k;
-            const int parent = parents[slot];
-            if (parent < 0 || parent >= m.beam) continue;  // also rejects malformed traces
-            const float drank = (t == m.steps - 1) ? grad_final_scores[static_cast<int64_t>(b) * K + k] : 0.0f;
-            const float inv_penalty = __fdiv_rn(1.0f, length_penalty(lengths[slot], a.length_penalty_alpha));
-            const float draw = __fadd_rn(next[k], __fmul_rn(drank, inv_penalty));
-            if (draw == 0.0f) continue;
-            prev[parent] = __fadd_rn(prev[parent], draw);
-            const int token = tokens[slot];
-            if (from_logprob[slot] && token >= 0 && token < V) {
-                const int64_t g = ((static_cast<int64_t>(b) * a.steps + t) * K + parent) * V + token;
-                grad_log_probs[g] = __fadd_rn(grad_log_probs[g], draw);
+        for (int k = static_cast<int>(threadIdx.x); k < n; k += static_cast<int>(blockDim.x)) {
+            uint32_t key = kNone;
+            float d = 0.0f;
+            if (k < Kb) {
+                prev[k] = 0.0f;
+                const int64_t slot = (static_cast<int64_t>(b) * a.steps + t) * K + k;
+                const int parent = parents[slot];
+                if (parent >= 0 && parent < Kb) {  // also rejects malformed traces
+                    const float drank = t == m.steps - 1 ? grad_final_scores[static_cast<int64_t>(b) * K + k] : 0.0f;
+                    const float inv_penalty = __fdiv_rn(1.0f, length_penalty(lengths[slot], a.length_penalty_alpha));
+                    d = __fadd_rn(next[k], __fmul_rn(drank, inv_penalty));
+                    if (d != 0.0f) {
+                        const int token = tokens[slot];
+                        if (from_logprob[slot] && token >= 0 && token < V) {
+                            const int64_t g = ((static_cast<int64_t>(b) * a.steps + t) * K + parent) * V + token;
+                            grad_log_probs[g] = __fadd_rn(grad_log_probs[g], d);
+                        }
+                        key = static_cast<uint32_t>(parent) * static_cast<uint32_t>(Kb) + static_cast<uint32_t>(k);
+                    }
+                }
+                draw[k] = d;
             }
+            order[k] = key;
         }
+        __syncthreads();
+        bitonic_sort<uint32_t, false>(order, n);
+
+        // Children of one parent are now contiguous and in beam order: the
+        // first entry of each run sums the run.
+        for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) {
+            const uint32_t key = order[i];
+            if (key == kNone) continue;
+            const uint32_t parent = key / static_cast<uint32_t>(Kb);
+            if (i > 0 && order[i - 1] != kNone && order[i - 1] / static_cast<uint32_t>(Kb) == parent) continue;
+            float sum = 0.0f;
+            for (int j = i; j < n && order[j] != kNone && order[j] / static_cast<uint32_t>(Kb) == parent; ++j) {
+                sum = __fadd_rn(sum, draw[order[j] % static_cast<uint32_t>(Kb)]);
+            }
+            prev[parent] = sum;
+        }
+        __syncthreads();
         float* tmp = next;
         next = prev;
         prev = tmp;
@@ -576,6 +840,10 @@ bool has_per_example(const DBSCudaDecodeArgs& a) {
     return a.steps_per_example || a.beam_sizes_per_example || a.eos_tokens_per_example || a.min_lengths_per_example;
 }
 
+bool constrained(const DBSCudaDecodeArgs& a) {
+    return a.no_repeat_ngram_size > 0 || a.repetition_penalty > 1.0f;
+}
+
 bool valid_args(const DBSCudaDecodeArgs* a) {
     if (!a) return false;
     if (a->batch_size <= 0 || a->steps <= 0 || a->beam_size <= 0 || a->vocab_size <= 0) return false;
@@ -583,6 +851,7 @@ bool valid_args(const DBSCudaDecodeArgs* a) {
     if (a->eos_token < -1 || a->eos_token >= a->vocab_size) return false;
     if (a->min_length < 0) return false;
     if (!std::isfinite(a->length_penalty_alpha) || a->length_penalty_alpha < 0.0f) return false;
+    if (!std::isfinite(a->repetition_penalty) || a->repetition_penalty < 0.0f) return false;
     if (a->reserved0 != 0) return false;
     // Candidate indices p * V + v must fit in int32, and the tile count must fit
     // in gridDim.y (65535 tiles of kTile candidates, about 268M candidates).
@@ -595,15 +864,23 @@ bool valid_args(const DBSCudaDecodeArgs* a) {
 }
 
 struct DecodePlan {
-    int tiles0;
-    int64_t keys0_bytes;
-    int64_t keys1_bytes;
+    bool small;          // register top-k scan (beam_size <= kSmallBeam)
+    int blocks0;         // scan blocks per example
+    int words;           // constraint bitmap words per beam
     int64_t state_raw_offset;
     int64_t state_len_offset;
     int64_t state_ended_offset;
     int64_t keys0_offset;
     int64_t keys1_offset;
     int64_t status_offset;
+    // Constraint buffers (only when n-gram blocking or a repetition penalty is on).
+    int64_t prefix_offset[2];
+    int64_t prefix_len_offset[2];
+    int64_t blocked_offset;
+    int64_t penalised_offset;
+    int64_t marked_offset;
+    int64_t marked_count_offset;
+    int64_t constraint_bytes;  // bytes to zero before decoding (bitmaps and counts)
     int64_t total_bytes;
 };
 
@@ -611,24 +888,38 @@ DecodePlan make_plan(const DBSCudaDecodeArgs& a) {
     DecodePlan p{};
     const int64_t B = a.batch_size;
     const int64_t K = a.beam_size;
-    p.tiles0 = static_cast<int>(ceil_div(K * a.vocab_size, kTile));
-    const int64_t n0 = static_cast<int64_t>(p.tiles0) * K;
+    const int64_t T = a.steps;
+    const int64_t candidates = K * a.vocab_size;
+    p.small = K <= kSmallBeam;
+    p.blocks0 = static_cast<int>(ceil_div(candidates, p.small ? kChunk : kTile));
+    const int64_t n0 = static_cast<int64_t>(p.blocks0) * K;
     const int64_t n1 = n0 > kTile ? ceil_div(n0, kTile) * K : 0;
-    p.keys0_bytes = B * n0 * static_cast<int64_t>(sizeof(uint64_t));
-    p.keys1_bytes = B * n1 * static_cast<int64_t>(sizeof(uint64_t));
     int64_t off = 0;
-    p.state_raw_offset = off;
-    off = align_up(off + B * K * static_cast<int64_t>(sizeof(float)));
-    p.state_len_offset = off;
-    off = align_up(off + B * K * static_cast<int64_t>(sizeof(int32_t)));
-    p.state_ended_offset = off;
-    off = align_up(off + B * K);
-    p.keys0_offset = off;
-    off = align_up(off + p.keys0_bytes);
-    p.keys1_offset = off;
-    off = align_up(off + p.keys1_bytes);
-    p.status_offset = off;
-    off = align_up(off + static_cast<int64_t>(sizeof(int)));
+    auto take = [&off](int64_t bytes) {
+        const int64_t at = off;
+        off = align_up(off + bytes);
+        return at;
+    };
+    p.state_raw_offset = take(B * K * static_cast<int64_t>(sizeof(float)));
+    p.state_len_offset = take(B * K * static_cast<int64_t>(sizeof(int32_t)));
+    p.state_ended_offset = take(B * K);
+    p.keys0_offset = take(B * n0 * static_cast<int64_t>(sizeof(uint64_t)));
+    p.keys1_offset = take(B * n1 * static_cast<int64_t>(sizeof(uint64_t)));
+    p.status_offset = take(static_cast<int64_t>(sizeof(int)));
+    if (constrained(a)) {
+        p.words = static_cast<int>(ceil_div(a.vocab_size, 32));
+        for (int i = 0; i < 2; ++i) {
+            p.prefix_offset[i] = take(B * K * T * static_cast<int64_t>(sizeof(int32_t)));
+            p.prefix_len_offset[i] = take(B * K * static_cast<int64_t>(sizeof(int32_t)));
+        }
+        p.marked_offset = take(B * K * 2 * T * static_cast<int64_t>(sizeof(int32_t)));
+        // Zeroed together: bitmaps and marked counts.
+        const int64_t zero_begin = off;
+        p.blocked_offset = take(B * K * p.words * static_cast<int64_t>(sizeof(uint32_t)));
+        p.penalised_offset = take(B * K * p.words * static_cast<int64_t>(sizeof(uint32_t)));
+        p.marked_count_offset = take(B * K * static_cast<int64_t>(sizeof(int32_t)));
+        p.constraint_bytes = off - zero_begin;
+    }
     p.total_bytes = off;
     return p;
 }
@@ -687,6 +978,27 @@ private:
     int status_ = DBS_CUDA_STATUS_OK;
 };
 
+void launch_scan(const DecodePlan& plan, const ScanParams& params, int t, const float* beam_raw, const int32_t* beam_len,
+                 const uint8_t* beam_ended, uint64_t* keys, cudaStream_t stream) {
+    const dim3 grid(static_cast<unsigned int>(params.a.batch_size), static_cast<unsigned int>(plan.blocks0));
+    if (!plan.small) {
+        DBS_LAUNCH(scan_tiles_kernel, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0);
+        return;
+    }
+    const int K = params.a.beam_size;
+    if (K <= 1) {
+        DBS_LAUNCH(scan_small_kernel<1>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0);
+    } else if (K <= 2) {
+        DBS_LAUNCH(scan_small_kernel<2>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0);
+    } else if (K <= 4) {
+        DBS_LAUNCH(scan_small_kernel<4>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0);
+    } else if (K <= 8) {
+        DBS_LAUNCH(scan_small_kernel<8>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0);
+    } else {
+        DBS_LAUNCH(scan_small_kernel<16>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0);
+    }
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -728,7 +1040,7 @@ extern "C" DBS_CUDA_EXPORT int64_t dbs_cuda_decode_workspace_size(const DBSCudaD
 
 extern "C" DBS_CUDA_EXPORT int64_t dbs_cuda_backward_workspace_size(const DBSCudaDecodeArgs* args) {
     if (!valid_args(args)) return -1;
-    return align_up(static_cast<int64_t>(args->batch_size) * 2 * args->beam_size * static_cast<int64_t>(sizeof(float)));
+    return 0;  // the backward keeps its state in shared memory
 }
 
 extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode(
@@ -756,7 +1068,42 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode(
 
     const int64_t beams = static_cast<int64_t>(a.batch_size) * a.beam_size;
     const dim3 beam_grid(static_cast<unsigned int>(ceil_div(beams, kThreads)));
-    DBS_LAUNCH(init_state_kernel, beam_grid, dim3(kThreads), stream, a, beam_raw, beam_len, beam_ended);
+    DBS_LAUNCH(init_state_kernel, beam_grid, dim3(kThreads), stream, a, beam_raw, beam_len, beam_ended, outputs->invalid_input);
+
+    ScanParams params{};
+    params.a = a;
+    params.log_probs = log_probs;
+    params.invalid = outputs->invalid_input;
+
+    ConstraintState cons{};
+    PrefixBuffers prefixes{};
+    int32_t* prefix[2] = {nullptr, nullptr};
+    int32_t* prefix_len[2] = {nullptr, nullptr};
+    const bool with_constraints = constrained(a);
+    if (with_constraints) {
+        if (cudaMemsetAsync(ws.at<char>(plan.blocked_offset), 0, static_cast<size_t>(plan.constraint_bytes), stream) != cudaSuccess) {
+            return DBS_CUDA_STATUS_LAUNCH_FAILED;
+        }
+        for (int i = 0; i < 2; ++i) {
+            prefix[i] = ws.at<int32_t>(plan.prefix_offset[i]);
+            prefix_len[i] = ws.at<int32_t>(plan.prefix_len_offset[i]);
+        }
+        if (cudaMemsetAsync(prefix_len[0], 0, static_cast<size_t>(beams) * sizeof(int32_t), stream) != cudaSuccess) {
+            return DBS_CUDA_STATUS_LAUNCH_FAILED;
+        }
+        cons.blocked = ws.at<uint32_t>(plan.blocked_offset);
+        cons.penalised = ws.at<uint32_t>(plan.penalised_offset);
+        cons.marked = ws.at<int32_t>(plan.marked_offset);
+        cons.marked_count = ws.at<int32_t>(plan.marked_count_offset);
+        cons.words = plan.words;
+        cons.ngram = a.no_repeat_ngram_size;
+        cons.penalise = a.repetition_penalty > 1.0f ? 1 : 0;
+        params.blocked = cons.blocked;
+        params.penalised = cons.penalised;
+        params.words = plan.words;
+        // Computed on the host exactly as the CPU decoder does.
+        params.log_penalty = cons.penalise ? std::log(a.repetition_penalty) : 0.0f;
+    }
 
     StepOutputs step_out;
     step_out.tokens = outputs->tokens;
@@ -768,9 +1115,17 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode(
 
     const unsigned int B = static_cast<unsigned int>(a.batch_size);
     for (int t = 0; t < a.steps; ++t) {
-        DBS_LAUNCH(scan_tiles_kernel, dim3(B, static_cast<unsigned int>(plan.tiles0)), dim3(kThreads), stream,
-                   log_probs, a, t, beam_raw, beam_len, beam_ended, keys0, plan.tiles0);
-        int n = plan.tiles0 * a.beam_size;
+        if (with_constraints) {
+            cons.prefix = prefix[t & 1];
+            cons.prefix_len = prefix_len[t & 1];
+            prefixes.prefix = prefix[t & 1];
+            prefixes.prefix_len = prefix_len[t & 1];
+            prefixes.next_prefix = prefix[(t + 1) & 1];
+            prefixes.next_prefix_len = prefix_len[(t + 1) & 1];
+            DBS_LAUNCH(constraint_kernel, dim3(B), dim3(kThreads), stream, a, t, cons, static_cast<const float*>(beam_raw));
+        }
+        launch_scan(plan, params, t, beam_raw, beam_len, beam_ended, keys0, stream);
+        int n = plan.blocks0 * a.beam_size;
         uint64_t* src = keys0;
         uint64_t* dst = keys1;
         while (n > kTile) {
@@ -783,7 +1138,7 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode(
             dst = tmp;
         }
         DBS_LAUNCH(select_step_kernel, dim3(B), dim3(kThreads), stream,
-                   a, t, src, n, beam_raw, beam_len, beam_ended, step_out);
+                   a, t, src, n, beam_raw, beam_len, beam_ended, step_out, prefixes);
     }
 
     DBS_LAUNCH(finalize_kernel, beam_grid, dim3(kThreads), stream,
@@ -802,15 +1157,14 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_backward(
     void* workspace,
     int64_t workspace_bytes,
     void* stream_ptr) {
+    (void)workspace;
+    (void)workspace_bytes;
     if (!valid_args(args) || !parents || !tokens || !lengths || !from_logprob || !grad_final_scores || !grad_log_probs) {
         return DBS_CUDA_STATUS_INVALID_ARGUMENT;
     }
     const DBSCudaDecodeArgs& a = *args;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    Workspace ws(workspace, workspace_bytes, dbs_cuda_backward_workspace_size(args), stream);
-    if (!ws.ok()) return ws.status();
-    const int blocks = static_cast<int>(ceil_div(a.batch_size, kBackwardThreads));
-    DBS_LAUNCH(backward_kernel, dim3(static_cast<unsigned int>(blocks)), dim3(kBackwardThreads), stream,
-               a, parents, tokens, lengths, from_logprob, grad_final_scores, grad_log_probs, ws.at<float>(0));
+    DBS_LAUNCH(backward_kernel, dim3(static_cast<unsigned int>(a.batch_size)), dim3(kBackwardThreads), stream,
+               a, parents, tokens, lengths, from_logprob, grad_final_scores, grad_log_probs);
     return finish(stream);
 }

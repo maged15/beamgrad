@@ -58,6 +58,40 @@ OPTIONS_LAYOUT = {
 OPTIONS_SIZE = 64
 
 
+class DBSAdvancedConstraintsC(ctypes.Structure):
+    """Mirror of ``DBSAdvancedConstraintsC``."""
+
+    _fields_ = [
+        ("banned_tokens", ctypes.c_void_p),
+        ("forced_tokens", ctypes.c_void_p),
+        ("min_length", ctypes.c_int),
+        ("repetition_penalty", ctypes.c_float),
+        ("no_repeat_ngram_size", ctypes.c_int),
+        ("token_filter", ctypes.c_void_p),
+        ("token_filter_user_data", ctypes.c_void_p),
+        ("batch_index", ctypes.c_int),
+    ]
+
+
+class DBSDecodeOutputsC(ctypes.Structure):
+    """Mirror of ``DBSDecodeOutputsC`` (all fields are pointers)."""
+
+    _fields_ = [
+        (name, ctypes.c_void_p)
+        for name in (
+            "final_scores",
+            "final_raw_scores",
+            "final_lengths",
+            "tokens",
+            "parents",
+            "lengths",
+            "scores",
+            "raw_scores",
+            "from_logprob",
+        )
+    ]
+
+
 def options_to_c(options: BeamOptions) -> DBSOptionsC:
     """Convert :class:`BeamOptions`; unused C fields take their documented defaults."""
     c = DBSOptionsC()
@@ -65,8 +99,23 @@ def options_to_c(options: BeamOptions) -> DBSOptionsC:
     c.eos_token = options.eos_token
     c.min_length = options.min_length
     c.length_penalty_alpha = options.length_penalty_alpha
-    c.validate_inputs = 0  # the Python front ends validate the whole tensor themselves
-    c.relaxed_pool_multiplier = 1
+    c.validate_inputs = 1 if options.validate_inputs else 0
+    return c
+
+
+def constraints_to_c(options: BeamOptions, banned_mask) -> DBSAdvancedConstraintsC | None:
+    """The options' decoding constraints, or ``None`` when there are none.
+
+    ``banned_mask`` is a contiguous uint8 ``[V]`` array (or ``None``) that must
+    outlive the call it is passed to.
+    """
+    if banned_mask is None and options.no_repeat_ngram_size == 0 and options.repetition_penalty == 1.0:
+        return None
+    c = DBSAdvancedConstraintsC()
+    c.banned_tokens = None if banned_mask is None else banned_mask.ctypes.data
+    c.min_length = -1
+    c.repetition_penalty = float(options.repetition_penalty)
+    c.no_repeat_ngram_size = options.no_repeat_ngram_size
     return c
 
 
@@ -105,6 +154,11 @@ def _bind(lib: ctypes.CDLL) -> None:
         "dbs_backward_sparse_logprob_count": ([p], i64),
         "dbs_backward_sparse_logprob_indices": ([p], ctypes.POINTER(ctypes.c_int64)),
         "dbs_backward_sparse_logprob_values": ([p], f32),
+        "dbs_decode_batch_into": (
+            [p, p, i32, i32, i32, p, ctypes.POINTER(DBSAdvancedConstraintsC), i32, ctypes.POINTER(DBSDecodeOutputsC)],
+            i32,
+        ),
+        "dbs_backward_batch_into": ([p, i32, i32, i32, p, p, p, p, p, p, i32, p], i32),
     }
     for name, (argtypes, restype) in signatures.items():
         fn = getattr(lib, name)
@@ -128,11 +182,14 @@ def load_library(path: str | None = None) -> ctypes.CDLL:
 
 
 def check(lib: ctypes.CDLL, handle: int | None, status: int) -> None:
-    """Raise a RuntimeError carrying libdbs' error message if ``status`` is non-zero."""
+    """Raise if ``status`` is non-zero: ValueError for invalid arguments or inputs
+    (DBS_ERROR_INVALID_ARGUMENT), RuntimeError otherwise, with libdbs' message."""
     if status == 0:
         return
-    message = lib.dbs_last_error(handle) if handle else lib.dbs_last_global_error()
-    raise RuntimeError((message or b"libdbs call failed").decode("utf-8", errors="replace"))
+    # The thread-local message is reliable even when threads share a handle.
+    message = lib.dbs_last_global_error() or (lib.dbs_last_error(handle) if handle else None)
+    text = (message or b"libdbs call failed").decode("utf-8", errors="replace")
+    raise ValueError(text) if status == -1 else RuntimeError(text)
 
 
 def _check_layout() -> None:

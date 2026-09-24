@@ -1,41 +1,158 @@
 // SPDX-License-Identifier: MIT
 //
-// Scalar reference kernels, the NEON helpers, and the runtime dispatchers.
+// Scalar reference kernels, the NEON row scan, and the runtime dispatcher.
 #include "kernels.hpp"
+
+#include <cstring>
 
 namespace dbs {
 
-float dot_scalar(const float* a, const float* b, int n) {
+namespace {
+
+constexpr float kInf = std::numeric_limits<float>::infinity();
+
+// Only one candidate, but every element of the row is still checked.
+bool scan_row_forced(const RowScan& s, Candidate* top, int top_count) {
+    bool invalid = false;
+    for (int v = 0; v < s.vocab_size; ++v) invalid |= !(s.row[v] < kInf);
+    const int v = s.forced_token;
+    const float lp = s.row[v];
+    if (lp < kInf && lp != -kInf && !(s.banned && s.banned[v]) && v != s.masked_token) {
+        const float raw = s.parent_raw + lp;
+        insert_topk(top, top_count, Candidate{raw * s.inv_penalty, raw, s.parent, v, s.new_length, 1});
+    }
+    return invalid;
+}
+
+float safe_exp(float x) {
+    x = std::min(88.3762626647949f, std::max(-88.3762626647949f, x));
+    return std::exp(x);
+}
+
+float sigmoid(float x) {
+    if (x >= 0.0f) return 1.0f / (1.0f + safe_exp(-x));
+    const float e = safe_exp(x);
+    return e / (1.0f + e);
+}
+
+float sum_sigmoid_shifted(const float* scores, int n, float theta, float temperature) {
+    constexpr float kNegGuard = -1.0e30f;
+    float sum = 0.0f;
+    for (int i = 0; i < n; ++i) {
+        if (scores[i] > kNegGuard) sum += sigmoid((scores[i] - theta) / temperature);
+    }
+    return sum;
+}
+
+} // namespace
+
+bool scan_row_scalar(const RowScan& s, Candidate* top, int top_count) {
+    if (s.forced_token >= 0) return scan_row_forced(s, top, top_count);
+    return scan_around_masked(s, [&](int begin, int end) {
+        bool invalid = false;
+        for (int v = begin; v < end; ++v) invalid |= scan_token(s, v, top, top_count);
+        return invalid;
+    });
+}
+
+#if DBS_ARM_NEON
+namespace neon {
+
+namespace {
+
+bool scan_range(const RowScan& s, int begin, int end, Candidate* top, int top_count) {
+    const float32x4_t parent_vec = vdupq_n_f32(s.parent_raw);
+    const float32x4_t scale_vec = vdupq_n_f32(s.inv_penalty);
+    const float32x4_t pos_inf = vdupq_n_f32(kInf);
+    const float32x4_t neg_inf = vdupq_n_f32(-kInf);
+    const uint32x4_t zero = vdupq_n_u32(0);
+    uint32x4_t below_all = vdupq_n_u32(0xffffffffu);
+
+    int v = begin;
+    for (; v + 4 <= end; v += 4) {
+        const float32x4_t lp = vld1q_f32(s.row + v);
+        const uint32x4_t below_inf = vcltq_f32(lp, pos_inf);  // false for NaN and +inf
+        below_all = vandq_u32(below_all, below_inf);
+        uint32x4_t ok = vandq_u32(below_inf, vmvnq_u32(vceqq_f32(lp, neg_inf)));
+        if (s.banned) {
+            uint32_t bytes = 0;
+            std::memcpy(&bytes, s.banned + v, 4);
+            const uint16x8_t wide = vmovl_u8(vreinterpret_u8_u32(vdup_n_u32(bytes)));
+            ok = vandq_u32(ok, vceqq_u32(vmovl_u16(vget_low_u16(wide)), zero));
+        }
+        const float32x4_t raw = vaddq_f32(lp, parent_vec);
+        const float32x4_t rank = vmulq_f32(raw, scale_vec);
+        const uint32x4_t hit = vandq_u32(ok, vcgeq_f32(rank, vdupq_n_f32(top[top_count - 1].score)));
+        const uint32x2_t any = vorr_u32(vget_low_u32(hit), vget_high_u32(hit));
+        if ((vget_lane_u32(any, 0) | vget_lane_u32(any, 1)) == 0) continue;
+
+        float rank_tmp[4];
+        float raw_tmp[4];
+        uint32_t hit_tmp[4];
+        vst1q_f32(rank_tmp, rank);
+        vst1q_f32(raw_tmp, raw);
+        vst1q_u32(hit_tmp, hit);
+        for (int lane = 0; lane < 4; ++lane) {
+            if (hit_tmp[lane] == 0) continue;
+            insert_topk(top, top_count, Candidate{rank_tmp[lane], raw_tmp[lane], s.parent, v + lane, s.new_length, 1});
+        }
+    }
+    const uint32x2_t all = vand_u32(vget_low_u32(below_all), vget_high_u32(below_all));
+    bool invalid = (vget_lane_u32(all, 0) & vget_lane_u32(all, 1)) == 0;
+    for (; v < end; ++v) invalid |= scan_token(s, v, top, top_count);
+    return invalid;
+}
+
+} // namespace
+
+bool scan_row(const RowScan& s, Candidate* top, int top_count) {
+    if (s.forced_token >= 0) return scan_row_forced(s, top, top_count);
+    return scan_around_masked(s, [&](int begin, int end) { return scan_range(s, begin, end, top, top_count); });
+}
+
+} // namespace neon
+#endif
+
+bool scan_row(const RowScan& s, Candidate* top, int top_count) {
+#if DBS_CAN_COMPILE_AVX512
+    if (kernel_path_enabled(KernelPath::AVX512) && runtime_has_avx512()) return avx512::scan_row(s, top, top_count);
+#endif
+#if DBS_CAN_COMPILE_AVX2
+    if (kernel_path_enabled(KernelPath::AVX2) && runtime_has_avx2()) return avx2::scan_row(s, top, top_count);
+#endif
+#if DBS_CAN_COMPILE_SSE42
+    if (kernel_path_enabled(KernelPath::SSE42) && runtime_has_sse42()) return sse42::scan_row(s, top, top_count);
+#endif
+#if DBS_ARM_NEON
+    if (kernel_path_enabled(KernelPath::NEON) && runtime_has_neon()) return neon::scan_row(s, top, top_count);
+#endif
+    return scan_row_scalar(s, top, top_count);
+}
+
+float dot(const float* a, const float* b, int n) {
     float s = 0.0f;
     for (int i = 0; i < n; ++i) s += a[i] * b[i];
     return s;
 }
 
-void softmax_selected_scalar(
-    const float* scores,
-    float* out,
-    int n,
-    float temperature
-) {
-    constexpr float NEG_GUARD = -1.0e30f;
+void softmax_selected(const float* scores, float* out, int n, float temperature) {
+    constexpr float kNegGuard = -1.0e30f;
 
     std::fill(out, out + n, 0.0f);
 
-    float maxv = -std::numeric_limits<float>::infinity();
+    float maxv = -kInf;
     for (int i = 0; i < n; ++i) {
-        if (scores[i] > NEG_GUARD) maxv = std::max(maxv, scores[i] / temperature);
+        if (scores[i] > kNegGuard) maxv = std::max(maxv, scores[i] / temperature);
     }
-
     if (!std::isfinite(maxv)) return;
 
     float sum = 0.0f;
     for (int i = 0; i < n; ++i) {
-        if (scores[i] > NEG_GUARD) {
-            out[i] = safe_exp_scalar(scores[i] / temperature - maxv);
+        if (scores[i] > kNegGuard) {
+            out[i] = safe_exp(scores[i] / temperature - maxv);
             sum += out[i];
         }
     }
-
     if (!(sum > 0.0f) || !std::isfinite(sum)) {
         std::fill(out, out + n, 0.0f);
         return;
@@ -43,216 +160,6 @@ void softmax_selected_scalar(
 
     const float inv_sum = 1.0f / sum;
     for (int i = 0; i < n; ++i) out[i] *= inv_sum;
-}
-
-float sum_sigmoid_shifted_scalar(
-    const float* scores,
-    int n,
-    float theta,
-    float temperature
-) {
-    constexpr float NEG_GUARD = -1.0e30f;
-
-    float sum = 0.0f;
-    for (int i = 0; i < n; ++i) {
-        if (scores[i] > NEG_GUARD) {
-            sum += sigmoid_scalar((scores[i] - theta) / temperature);
-        }
-    }
-    return sum;
-}
-
-void soft_topk_write_scalar(
-    const float* scores,
-    float* out,
-    int n,
-    float theta,
-    float temperature
-) {
-    constexpr float NEG_GUARD = -1.0e30f;
-
-    for (int i = 0; i < n; ++i) {
-        if (scores[i] > NEG_GUARD) out[i] = sigmoid_scalar((scores[i] - theta) / temperature);
-        else out[i] = 0.0f;
-    }
-}
-
-void scan_parent_row_scalar(
-    const float* row,
-    float parent_raw,
-    int parent_length,
-    int parent,
-    int vocab_size,
-    Candidate* top,
-    int top_count,
-    int vocab_block,
-    float length_penalty_alpha,
-    const uint8_t* banned_tokens,
-    int forced_token,
-    int eos_token,
-    int min_length
-) {
-    const int new_len = parent_length + 1;
-    const float inv_penalty = 1.0f / gnmt_length_penalty(new_len, length_penalty_alpha);
-
-    for (int base = 0; base < vocab_size; base += vocab_block) {
-        const int end = std::min(vocab_size, base + vocab_block);
-        for (int v = base; v < end; ++v) {
-            if (forced_token >= 0 && v != forced_token) continue;
-            if (banned_tokens && banned_tokens[v]) continue;
-            if (eos_token >= 0 && v == eos_token && new_len < min_length) continue;
-
-            const float lp = row[v];
-            if (!std::isfinite(lp)) continue;
-
-            const float raw = parent_raw + lp;
-            const float rank = raw * inv_penalty;
-            insert_topk(top, top_count, Candidate{rank, raw, parent, v, new_len, 1});
-        }
-    }
-}
-
-#if DBS_ARM_NEON
-namespace neon {
-namespace {
-
-float dot(const float* a, const float* b, int n) {
-    float32x4_t acc = vdupq_n_f32(0.0f);
-    int i = 0;
-    for (; i + 3 < n; i += 4) {
-        acc = vmlaq_f32(acc, vld1q_f32(a + i), vld1q_f32(b + i));
-    }
-    float tmp[4];
-    vst1q_f32(tmp, acc);
-    float s = tmp[0] + tmp[1] + tmp[2] + tmp[3];
-    for (; i < n; ++i) s += a[i] * b[i];
-    return s;
-}
-
-void softmax_selected(const float* scores, float* out, int n, float temperature) {
-    // Scalar exp is deliberate here: it keeps results bit-identical across platforms.
-    softmax_selected_scalar(scores, out, n, temperature);
-}
-
-} // namespace
-} // namespace neon
-#endif
-
-float dot(const float* a, const float* b, int n) {
-#if DBS_CAN_COMPILE_AVX512
-    if (kernel_path_enabled(KernelPath::AVX512) && runtime_has_avx512()) return avx512::dot(a, b, n);
-#endif
-#if DBS_CAN_COMPILE_AVX2
-    if (kernel_path_enabled(KernelPath::AVX2) && runtime_has_avx2()) return avx2::dot(a, b, n);
-#endif
-#if DBS_CAN_COMPILE_SSE42
-    if (kernel_path_enabled(KernelPath::SSE42) && runtime_has_sse42()) return sse42::dot(a, b, n);
-#endif
-#if DBS_ARM_NEON
-    if (kernel_path_enabled(KernelPath::NEON) && runtime_has_neon()) return neon::dot(a, b, n);
-#endif
-    return dot_scalar(a, b, n);
-}
-
-void softmax_selected(
-    const float* scores,
-    float* out,
-    int n,
-    float temperature
-) {
-#if DBS_CAN_COMPILE_AVX512
-    if (kernel_path_enabled(KernelPath::AVX512) && runtime_has_avx512()) {
-        avx512::softmax_selected(scores, out, n, temperature);
-        return;
-    }
-#endif
-#if DBS_CAN_COMPILE_AVX2
-    if (kernel_path_enabled(KernelPath::AVX2) && runtime_has_avx2()) {
-        avx2::softmax_selected(scores, out, n, temperature);
-        return;
-    }
-#endif
-#if DBS_CAN_COMPILE_SSE42
-    if (kernel_path_enabled(KernelPath::SSE42) && runtime_has_sse42()) {
-        sse42::softmax_selected(scores, out, n, temperature);
-        return;
-    }
-#endif
-#if DBS_ARM_NEON
-    if (kernel_path_enabled(KernelPath::NEON) && runtime_has_neon()) {
-        neon::softmax_selected(scores, out, n, temperature);
-        return;
-    }
-#endif
-    softmax_selected_scalar(scores, out, n, temperature);
-}
-
-float sum_sigmoid_shifted(
-    const float* scores,
-    int n,
-    float theta,
-    float temperature
-) {
-#if DBS_CAN_COMPILE_AVX512
-    if (kernel_path_enabled(KernelPath::AVX512) && runtime_has_avx512()) return avx512::sum_sigmoid_shifted(scores, n, theta, temperature);
-#endif
-    return sum_sigmoid_shifted_scalar(scores, n, theta, temperature);
-}
-
-void soft_topk_write(
-    const float* scores,
-    float* out,
-    int n,
-    float theta,
-    float temperature
-) {
-#if DBS_CAN_COMPILE_AVX512
-    if (kernel_path_enabled(KernelPath::AVX512) && runtime_has_avx512()) {
-        avx512::soft_topk_write(scores, out, n, theta, temperature);
-        return;
-    }
-#endif
-    soft_topk_write_scalar(scores, out, n, theta, temperature);
-}
-
-void scan_parent_row(
-    const float* row,
-    float parent_raw,
-    int parent_length,
-    int parent,
-    int vocab_size,
-    Candidate* top,
-    int top_count,
-    int vocab_block,
-    float length_penalty_alpha,
-    const uint8_t* banned_tokens,
-    int forced_token,
-    int eos_token,
-    int min_length
-) {
-#if DBS_CAN_COMPILE_AVX512
-    if (kernel_path_enabled(KernelPath::AVX512) && runtime_has_avx512()) {
-        avx512::scan_parent_row(row, parent_raw, parent_length, parent, vocab_size, top, top_count, vocab_block,
-                                length_penalty_alpha, banned_tokens, forced_token, eos_token, min_length);
-        return;
-    }
-#endif
-#if DBS_CAN_COMPILE_AVX2
-    if (kernel_path_enabled(KernelPath::AVX2) && runtime_has_avx2()) {
-        avx2::scan_parent_row(row, parent_raw, parent_length, parent, vocab_size, top, top_count, vocab_block,
-                              length_penalty_alpha, banned_tokens, forced_token, eos_token, min_length);
-        return;
-    }
-#endif
-#if DBS_CAN_COMPILE_SSE42
-    if (kernel_path_enabled(KernelPath::SSE42) && runtime_has_sse42()) {
-        sse42::scan_parent_row(row, parent_raw, parent_length, parent, vocab_size, top, top_count, vocab_block,
-                               length_penalty_alpha, banned_tokens, forced_token, eos_token, min_length);
-        return;
-    }
-#endif
-    scan_parent_row_scalar(row, parent_raw, parent_length, parent, vocab_size, top, top_count, vocab_block,
-                           length_penalty_alpha, banned_tokens, forced_token, eos_token, min_length);
 }
 
 void soft_topk_inclusion(
@@ -264,50 +171,46 @@ void soft_topk_inclusion(
     float tolerance,
     int max_iters
 ) {
-    constexpr float NEG_GUARD = -1.0e30f;
+    constexpr float kNegGuard = -1.0e30f;
 
     std::fill(out, out + n, 0.0f);
 
     int active = 0;
-    float min_s = std::numeric_limits<float>::infinity();
-    float max_s = -std::numeric_limits<float>::infinity();
-
+    float min_s = kInf;
+    float max_s = -kInf;
     for (int i = 0; i < n; ++i) {
-        if (scores[i] > NEG_GUARD) {
+        if (scores[i] > kNegGuard) {
             ++active;
             min_s = std::min(min_s, scores[i]);
             max_s = std::max(max_s, scores[i]);
         }
     }
-
     if (active == 0 || target_k <= 0) return;
 
     if (target_k >= active) {
         for (int i = 0; i < n; ++i) {
-            if (scores[i] > NEG_GUARD) out[i] = 1.0f;
+            if (scores[i] > kNegGuard) out[i] = 1.0f;
         }
         return;
     }
 
     float lo = min_s - 80.0f * temperature;
     float hi = max_s + 80.0f * temperature;
-
     for (int it = 0; it < max_iters; ++it) {
         const float mid = 0.5f * (lo + hi);
-        const float s = sum_sigmoid_shifted(scores, n, mid, temperature);
-        const float err = s - static_cast<float>(target_k);
-
+        const float err = sum_sigmoid_shifted(scores, n, mid, temperature) - static_cast<float>(target_k);
         if (std::fabs(err) <= tolerance || std::fabs(hi - lo) <= tolerance * std::max(1.0f, std::fabs(mid))) {
             lo = hi = mid;
             break;
         }
-
         if (err > 0.0f) lo = mid;
         else hi = mid;
     }
 
     const float theta = 0.5f * (lo + hi);
-    soft_topk_write(scores, out, n, theta, temperature);
+    for (int i = 0; i < n; ++i) {
+        out[i] = scores[i] > kNegGuard ? sigmoid((scores[i] - theta) / temperature) : 0.0f;
+    }
 }
 
 } // namespace dbs

@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 //
 // The exported C ABI (include/dbs.h): opaque handles, error reporting, stats,
-// and thin exception-safe wrappers around dbs::BeamSearchDecoder.
+// and exception-safe wrappers around dbs::BeamSearchDecoder.
 #include "dbs.h"
 
 #include "decoder.hpp"
@@ -18,12 +18,11 @@
 struct DBSDecoderHandle {
     std::unique_ptr<dbs::BeamSearchDecoder> decoder;
     dbs::BeamOptions options;
-    int beam_size = 0;
     mutable std::mutex error_mutex;
     std::string last_error;
     mutable std::mutex stats_mutex;
     DBSStatsC stats{};
-    uint64_t deterministic_seed = 0;
+    std::atomic<uint64_t> deterministic_seed{0};
 };
 
 struct DBSResultHandle {
@@ -44,45 +43,76 @@ struct DBSWorkspaceHandle {
     std::vector<int32_t> i32;
 };
 
-static thread_local std::string g_dbs_last_error;
+namespace {
 
-static void dbs_set_error(DBSDecoderHandle* handle, const std::string& message) {
-    g_dbs_last_error = message;
+thread_local std::string g_last_error;
+
+void set_error(DBSDecoderHandle* handle, const std::string& message) {
+    g_last_error = message;
     if (handle) {
         std::lock_guard<std::mutex> lock(handle->error_mutex);
         handle->last_error = message;
     }
 }
 
-static void dbs_clear_error(DBSDecoderHandle* handle) {
-    g_dbs_last_error.clear();
+void clear_error(DBSDecoderHandle* handle) {
+    g_last_error.clear();
     if (handle) {
         std::lock_guard<std::mutex> lock(handle->error_mutex);
         handle->last_error.clear();
     }
 }
 
-static int classify_exception(const std::exception& e) {
-    if (dynamic_cast<const std::invalid_argument*>(&e)) return 1;
-    if (dynamic_cast<const std::bad_alloc*>(&e)) return 3;
-    if (dynamic_cast<const std::overflow_error*>(&e)) return 4;
-    if (dynamic_cast<const std::length_error*>(&e)) return 4;
-    return 2;
-}
-
-static int64_t now_ns_since(const std::chrono::steady_clock::time_point& start) {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now() - start).count();
-}
-
-static void dbs_mark_error(DBSDecoderHandle* handle, int category) {
+// DBSStatsC::last_error_category: 1 invalid argument, 2 runtime, 3 allocation, 4 overflow.
+void mark_error(DBSDecoderHandle* handle, int category) {
     if (!handle) return;
     std::lock_guard<std::mutex> lock(handle->stats_mutex);
     handle->stats.last_error_category = category;
 }
 
-static void dbs_record_decode_stats(DBSDecoderHandle* handle, const dbs::DecodeResult& r, int64_t elapsed_ns, int threads, bool model_step) {
-    if (!handle) return;
+int fail(DBSDecoderHandle* handle, const std::string& message, int category, int status) {
+    set_error(handle, message);
+    mark_error(handle, category);
+    return status;
+}
+
+// Runs `body`, translating exceptions into the documented status codes. The
+// handle may be null (the error is then only recorded per thread).
+template <class Body>
+int guarded(DBSDecoderHandle* handle, Body&& body) {
+    try {
+        body();
+        clear_error(handle);
+        return DBS_OK;
+    } catch (const std::invalid_argument& e) {
+        return fail(handle, e.what(), 1, DBS_ERROR_INVALID_ARGUMENT);
+    } catch (const std::length_error& e) {
+        return fail(handle, e.what(), 4, DBS_ERROR_INVALID_ARGUMENT);
+    } catch (const std::overflow_error& e) {
+        return fail(handle, e.what(), 4, DBS_ERROR_INVALID_ARGUMENT);
+    } catch (const std::bad_alloc&) {
+        return fail(handle, "out of memory", 3, DBS_ERROR_RUNTIME);
+    } catch (const std::exception& e) {
+        return fail(handle, e.what(), 2, DBS_ERROR_RUNTIME);
+    } catch (...) {
+        return fail(handle, "unknown exception", 2, DBS_ERROR_UNKNOWN);
+    }
+}
+
+void require(bool ok, const char* message) {
+    if (!ok) throw std::invalid_argument(message);
+}
+
+const dbs::BeamSearchDecoder& decoder_of(DBSDecoderHandle* handle) {
+    require(handle != nullptr && handle->decoder != nullptr, "decoder handle cannot be null");
+    return *handle->decoder;
+}
+
+int64_t now_ns_since(const std::chrono::steady_clock::time_point& start) {
+    return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+}
+
+void record_decode_stats(DBSDecoderHandle* handle, const dbs::DecodeResult& r, int64_t elapsed_ns, int threads, bool model_step) {
     std::lock_guard<std::mutex> lock(handle->stats_mutex);
     handle->stats.abi_version = DBS_ABI_VERSION;
     handle->stats.last_kernel = static_cast<int>(dbs::selected_kernel_path());
@@ -92,16 +122,30 @@ static void dbs_record_decode_stats(DBSDecoderHandle* handle, const dbs::DecodeR
     handle->stats.last_selected_count = static_cast<int64_t>(r.steps) * r.beam_size;
     handle->stats.last_pool_count = static_cast<int64_t>(r.steps) * r.relaxed_pool_size;
     handle->stats.last_logprob_count = static_cast<int64_t>(r.steps) * r.beam_size * r.vocab_size;
-    handle->stats.last_allocation_bytes =
-        static_cast<int64_t>(r.tokens.size() * sizeof(int32_t) + r.parents.size() * sizeof(int32_t) +
-                             r.scores.size() * sizeof(float) + r.raw_scores.size() * sizeof(float) +
-                             r.pool_tokens.size() * sizeof(int32_t) + r.pool_scores.size() * sizeof(float) +
-                             r.relaxed_weights.size() * sizeof(float));
+    handle->stats.last_allocation_bytes = static_cast<int64_t>(
+        r.tokens.size() * sizeof(int32_t) + r.parents.size() * sizeof(int32_t) + r.lengths.size() * sizeof(int32_t) +
+        r.scores.size() * sizeof(float) + r.raw_scores.size() * sizeof(float) + r.weights.size() * sizeof(float) +
+        r.pool_tokens.size() * sizeof(int32_t) + r.pool_parents.size() * sizeof(int32_t) +
+        r.pool_lengths.size() * sizeof(int32_t) + r.pool_scores.size() * sizeof(float) +
+        r.pool_raw_scores.size() * sizeof(float) + r.relaxed_weights.size() * sizeof(float));
     handle->stats.last_error_category = 0;
 }
 
-static void dbs_record_backward_stats(DBSDecoderHandle* handle, const dbs::BackwardResult& r, int64_t elapsed_ns) {
-    if (!handle) return;
+void record_batch_stats(DBSDecoderHandle* handle, int64_t selected, int64_t logprobs, int64_t elapsed_ns, int threads) {
+    std::lock_guard<std::mutex> lock(handle->stats_mutex);
+    handle->stats.abi_version = DBS_ABI_VERSION;
+    handle->stats.last_kernel = static_cast<int>(dbs::selected_kernel_path());
+    handle->stats.used_batch_threads = threads;
+    handle->stats.used_model_step_callback = 0;
+    handle->stats.last_decode_ns = elapsed_ns;
+    handle->stats.last_selected_count = selected;
+    handle->stats.last_pool_count = 0;
+    handle->stats.last_logprob_count = logprobs;
+    handle->stats.last_allocation_bytes = 0;
+    handle->stats.last_error_category = 0;
+}
+
+void record_backward_stats(DBSDecoderHandle* handle, const dbs::BackwardResult& r, int64_t elapsed_ns) {
     std::lock_guard<std::mutex> lock(handle->stats_mutex);
     handle->stats.abi_version = DBS_ABI_VERSION;
     handle->stats.used_sparse_backward = r.sparse ? 1 : 0;
@@ -113,10 +157,7 @@ static void dbs_record_backward_stats(DBSDecoderHandle* handle, const dbs::Backw
 
 // Zero-initialised fields select the documented defaults (so `DBSOptionsC opt = {0}`
 // is valid); explicit out-of-range values are rejected rather than silently replaced.
-static dbs::BeamOptions from_c_options(const DBSOptionsC& c) {
-    auto require = [](bool ok, const char* message) {
-        if (!ok) throw std::invalid_argument(message);
-    };
+dbs::BeamOptions from_c_options(const DBSOptionsC& c) {
     auto finite_non_negative = [](float x) { return std::isfinite(x) && x >= 0.0f; };
 
     require(c.beam_size >= 0, "beam_size cannot be negative");
@@ -137,8 +178,7 @@ static dbs::BeamOptions from_c_options(const DBSOptionsC& c) {
     o.eos_token = c.eos_token;
     o.selected_temperature = c.selected_temperature > 0.0f ? c.selected_temperature : defaults.selected_temperature;
     o.soft_topk_temperature = c.soft_topk_temperature > 0.0f ? c.soft_topk_temperature : defaults.soft_topk_temperature;
-    o.relaxed_pool_multiplier = c.relaxed_pool_multiplier > 0 ? c.relaxed_pool_multiplier : defaults.relaxed_pool_multiplier;
-    o.vocab_block = c.vocab_block > 0 ? c.vocab_block : defaults.vocab_block;
+    o.relaxed_pool_multiplier = c.relaxed_pool_multiplier;
     o.length_penalty_alpha = c.length_penalty_alpha;
     o.soft_topk_tolerance = c.soft_topk_tolerance > 0.0f ? c.soft_topk_tolerance : defaults.soft_topk_tolerance;
     o.soft_topk_max_iters = c.soft_topk_max_iters > 0 ? c.soft_topk_max_iters : defaults.soft_topk_max_iters;
@@ -147,6 +187,160 @@ static dbs::BeamOptions from_c_options(const DBSOptionsC& c) {
     o.max_dense_gradient_elements = c.max_dense_gradient_elements > 0 ? c.max_dense_gradient_elements : defaults.max_dense_gradient_elements;
     return o;
 }
+
+dbs::DecodeConstraints from_c_constraints(const DBSAdvancedConstraintsC& c) {
+    dbs::DecodeConstraints out;
+    out.banned_tokens = c.banned_tokens;
+    out.forced_tokens = c.forced_tokens;
+    out.min_length = c.min_length;
+    // Zero-initialised structs leave the penalty at 0, which means "off".
+    out.repetition_penalty = c.repetition_penalty > 0.0f ? c.repetition_penalty : 1.0f;
+    out.no_repeat_ngram_size = c.no_repeat_ngram_size;
+    out.token_filter = c.token_filter;
+    out.token_filter_user_data = c.token_filter_user_data;
+    out.batch_index = c.batch_index;
+    return out;
+}
+
+float fp16_to_float(uint16_t h) noexcept {
+    const uint32_t sign = (static_cast<uint32_t>(h & 0x8000u)) << 16;
+    const uint32_t exp = (h >> 10) & 0x1fu;
+    const uint32_t mant = h & 0x03ffu;
+    uint32_t out = 0;
+    if (exp == 0) {
+        if (mant == 0) {
+            out = sign;
+        } else {
+            uint32_t m = mant;
+            uint32_t e = 113u;
+            while ((m & 0x0400u) == 0) {
+                m <<= 1;
+                --e;
+            }
+            m &= 0x03ffu;
+            out = sign | (e << 23) | (m << 13);
+        }
+    } else if (exp == 31) {
+        out = sign | 0x7f800000u | (mant << 13);
+    } else {
+        out = sign | ((exp + 112u) << 23) | (mant << 13);
+    }
+    float f;
+    std::memcpy(&f, &out, sizeof(f));
+    return f;
+}
+
+float bf16_to_float(uint16_t h) noexcept {
+    const uint32_t bits = static_cast<uint32_t>(h) << 16;
+    float f;
+    std::memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+std::vector<float> convert_to_f32(const void* data, int data_type, size_t count) {
+    require(data != nullptr, "log_probs cannot be null");
+    std::vector<float> out(count);
+    if (data_type == DBS_DTYPE_F16) {
+        const uint16_t* p = static_cast<const uint16_t*>(data);
+        for (size_t i = 0; i < count; ++i) out[i] = fp16_to_float(p[i]);
+    } else if (data_type == DBS_DTYPE_BF16) {
+        const uint16_t* p = static_cast<const uint16_t*>(data);
+        for (size_t i = 0; i < count; ++i) out[i] = bf16_to_float(p[i]);
+    } else {
+        throw std::invalid_argument("unsupported DBS data type");
+    }
+    return out;
+}
+
+int thread_count(int requested, int items) {
+    const int hardware = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
+    return std::max(1, std::min(items, requested > 0 ? requested : hardware));
+}
+
+// Runs fn(i) for i in [0, n) on `threads` threads, the calling thread included.
+// Workers inherit the caller's kernel override. The first exception is rethrown.
+template <class Fn>
+void parallel_for(int n, int threads, Fn&& fn) {
+    if (threads <= 1 || n <= 1) {
+        for (int i = 0; i < n; ++i) fn(i);
+        return;
+    }
+    std::atomic<int> next{0};
+    std::mutex error_mutex;
+    std::exception_ptr first_error;
+    const dbs::KernelOverride kernel_override = dbs::current_kernel_override();
+    auto work = [&]() {
+        for (;;) {
+            const int i = next.fetch_add(1);
+            if (i >= n) break;
+            try {
+                fn(i);
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(error_mutex);
+                if (!first_error) first_error = std::current_exception();
+            }
+        }
+    };
+    std::vector<std::thread> pool;
+    pool.reserve(static_cast<size_t>(threads - 1));
+    for (int t = 1; t < threads; ++t) {
+        pool.emplace_back([&, kernel_override]() {
+            dbs::set_kernel_override(kernel_override);
+            work();
+        });
+    }
+    work();
+    for (auto& th : pool) th.join();
+    if (first_error) std::rethrow_exception(first_error);
+}
+
+// Prefixes an input error with the example it came from.
+[[noreturn]] void rethrow_for_example(int b, const std::invalid_argument& e) {
+    throw std::invalid_argument("example " + std::to_string(b) + ": " + e.what());
+}
+
+std::vector<int32_t> steps_for(const int32_t* steps_per_example, int batch_size, int steps) {
+    std::vector<int32_t> out(static_cast<size_t>(batch_size), steps);
+    if (!steps_per_example) return out;
+    for (int b = 0; b < batch_size; ++b) {
+        if (steps_per_example[b] < 1 || steps_per_example[b] > steps) {
+            throw std::invalid_argument("steps_per_example[" + std::to_string(b) + "] must be in [1, steps]");
+        }
+        out[static_cast<size_t>(b)] = steps_per_example[b];
+    }
+    return out;
+}
+
+void decode_model_steps_impl(
+    DBSDecoderHandle* handle,
+    std::vector<float>* rows,
+    const dbs::ModelStepFunction& fn,
+    int steps,
+    int vocab_size,
+    const DBSAdvancedConstraintsC* constraints_c,
+    DBSResultHandle** out_result) {
+    require(out_result != nullptr, "out_result cannot be null");
+    *out_result = nullptr;
+    const dbs::BeamSearchDecoder& decoder = decoder_of(handle);
+    const auto start = std::chrono::steady_clock::now();
+    dbs::DecodeConstraints constraints;
+    if (constraints_c) constraints = from_c_constraints(*constraints_c);
+    auto r = std::make_unique<DBSResultHandle>();
+    r->result = decoder.decode_model_steps(steps, vocab_size, fn, constraints_c ? &constraints : nullptr, rows);
+    record_decode_stats(handle, r->result, now_ns_since(start), 1, true);
+    {
+        std::lock_guard<std::mutex> lock(handle->stats_mutex);
+        handle->stats.last_allocation_bytes += static_cast<int64_t>(rows->capacity() * sizeof(float));
+    }
+    *out_result = r.release();
+}
+
+template <class T, class A>
+const T* data_or_null(const std::vector<T, A>& v) {
+    return v.empty() ? nullptr : v.data();
+}
+
+} // namespace
 
 extern "C" DBS_EXPORT int dbs_abi_version() {
     return DBS_ABI_VERSION;
@@ -160,23 +354,15 @@ extern "C" DBS_EXPORT const char* dbs_version_string() {
 }
 
 extern "C" DBS_EXPORT const char* dbs_last_global_error() {
-    return g_dbs_last_error.empty() ? "" : g_dbs_last_error.c_str();
+    return g_last_error.c_str();
 }
-
 
 extern "C" DBS_EXPORT int dbs_workspace_create(DBSWorkspaceHandle** out_workspace) {
     if (out_workspace) *out_workspace = nullptr;
-    if (!out_workspace) {
-        dbs_set_error(nullptr, "out_workspace cannot be null");
-        return -1;
-    }
-    try {
+    return guarded(nullptr, [&] {
+        require(out_workspace != nullptr, "out_workspace cannot be null");
         *out_workspace = new DBSWorkspaceHandle;
-        return 0;
-    } catch (const std::exception& e) {
-        dbs_set_error(nullptr, e.what());
-        return -2;
-    }
+    });
 }
 
 extern "C" DBS_EXPORT void dbs_workspace_destroy(DBSWorkspaceHandle* workspace) {
@@ -184,15 +370,13 @@ extern "C" DBS_EXPORT void dbs_workspace_destroy(DBSWorkspaceHandle* workspace) 
 }
 
 extern "C" DBS_EXPORT int dbs_workspace_reserve(DBSWorkspaceHandle* workspace, int64_t float_count, int64_t int_count) {
-    if (!workspace || float_count < 0 || int_count < 0) return -1;
-    try {
+    return guarded(nullptr, [&] {
+        require(workspace != nullptr, "workspace cannot be null");
+        require(float_count >= 0 && int_count >= 0, "reserve counts cannot be negative");
         std::lock_guard<std::mutex> lock(workspace->mutex);
         workspace->f32.reserve(static_cast<size_t>(float_count));
         workspace->i32.reserve(static_cast<size_t>(int_count));
-        return 0;
-    } catch (...) {
-        return -2;
-    }
+    });
 }
 
 extern "C" DBS_EXPORT int64_t dbs_workspace_allocated_bytes(DBSWorkspaceHandle* workspace) {
@@ -203,37 +387,20 @@ extern "C" DBS_EXPORT int64_t dbs_workspace_allocated_bytes(DBSWorkspaceHandle* 
 
 extern "C" DBS_EXPORT int dbs_create_ex(DBSOptionsC options, DBSDecoderHandle** out_handle) {
     if (out_handle) *out_handle = nullptr;
-    if (!out_handle) {
-        dbs_set_error(nullptr, "out_handle cannot be null");
-        return -1;
-    }
-
-    try {
+    return guarded(nullptr, [&] {
+        require(out_handle != nullptr, "out_handle cannot be null");
         auto h = std::make_unique<DBSDecoderHandle>();
-        dbs::BeamOptions parsed = from_c_options(options);
-        h->options = parsed;
-        h->beam_size = parsed.beam_size;
+        h->options = from_c_options(options);
+        h->decoder = std::make_unique<dbs::BeamSearchDecoder>(h->options);
         h->stats.abi_version = DBS_ABI_VERSION;
         h->stats.last_kernel = static_cast<int>(dbs::selected_kernel_path());
-        h->decoder =
-            std::make_unique<dbs::BeamSearchDecoder>(parsed);
-
-        DBSDecoderHandle* raw = h.get();
         *out_handle = h.release();
-        dbs_clear_error(raw);
-        return 0;
-    } catch (const std::exception& e) {
-        dbs_set_error(nullptr, e.what());
-        return -2;
-    } catch (...) {
-        dbs_set_error(nullptr, "unknown exception");
-        return -3;
-    }
+    });
 }
 
 extern "C" DBS_EXPORT DBSDecoderHandle* dbs_create(DBSOptionsC options) {
     DBSDecoderHandle* h = nullptr;
-    return dbs_create_ex(options, &h) == 0 ? h : nullptr;
+    return dbs_create_ex(options, &h) == DBS_OK ? h : nullptr;
 }
 
 extern "C" DBS_EXPORT void dbs_destroy(DBSDecoderHandle* handle) {
@@ -252,58 +419,6 @@ extern "C" DBS_EXPORT const char* dbs_last_error(DBSDecoderHandle* handle) {
     return snapshot.c_str();
 }
 
-
-static float dbs_fp16_to_float(uint16_t h) noexcept {
-    const uint32_t sign = (static_cast<uint32_t>(h & 0x8000u)) << 16;
-    const uint32_t exp = (h >> 10) & 0x1fu;
-    const uint32_t mant = h & 0x03ffu;
-    uint32_t out = 0;
-    if (exp == 0) {
-        if (mant == 0) {
-            out = sign;
-        } else {
-            uint32_t m = mant;
-            uint32_t e = 113u;
-            while ((m & 0x0400u) == 0) { m <<= 1; --e; }
-            m &= 0x03ffu;
-            out = sign | (e << 23) | (m << 13);
-        }
-    } else if (exp == 31) {
-        out = sign | 0x7f800000u | (mant << 13);
-    } else {
-        out = sign | ((exp + 112u) << 23) | (mant << 13);
-    }
-    float f;
-    std::memcpy(&f, &out, sizeof(f));
-    return f;
-}
-
-static float dbs_bf16_to_float(uint16_t h) noexcept {
-    const uint32_t bits = static_cast<uint32_t>(h) << 16;
-    float f;
-    std::memcpy(&f, &bits, sizeof(f));
-    return f;
-}
-
-static std::vector<float> dbs_convert_to_f32_checked(const void* data, int data_type, int64_t count) {
-    if (!data) throw std::invalid_argument("typed log_probs cannot be null");
-    if (count < 0) throw std::overflow_error("negative element count");
-    std::vector<float> out(static_cast<size_t>(count));
-    if (data_type == DBS_DTYPE_F32) {
-        const float* p = static_cast<const float*>(data);
-        std::copy(p, p + count, out.begin());
-    } else if (data_type == DBS_DTYPE_F16) {
-        const uint16_t* p = static_cast<const uint16_t*>(data);
-        for (int64_t i = 0; i < count; ++i) out[static_cast<size_t>(i)] = dbs_fp16_to_float(p[i]);
-    } else if (data_type == DBS_DTYPE_BF16) {
-        const uint16_t* p = static_cast<const uint16_t*>(data);
-        for (int64_t i = 0; i < count; ++i) out[static_cast<size_t>(i)] = dbs_bf16_to_float(p[i]);
-    } else {
-        throw std::invalid_argument("unsupported DBS data type");
-    }
-    return out;
-}
-
 extern "C" DBS_EXPORT int dbs_decode(
     DBSDecoderHandle* handle,
     const float* log_probs,
@@ -311,31 +426,8 @@ extern "C" DBS_EXPORT int dbs_decode(
     int vocab_size,
     DBSResultHandle** out_result
 ) {
-    if (out_result) *out_result = nullptr;
-    if (!handle || !handle->decoder || !out_result) return -1;
-
-    try {
-        const auto start = std::chrono::steady_clock::now();
-        auto r = std::make_unique<DBSResultHandle>();
-
-        r->result = handle->decoder->decode(log_probs, steps, vocab_size);
-        dbs_record_decode_stats(handle, r->result, now_ns_since(start), 1, false);
-
-        *out_result = r.release();
-        dbs_clear_error(handle);
-
-        return 0;
-    } catch (const std::exception& e) {
-        dbs_set_error(handle, e.what());
-        dbs_mark_error(handle, classify_exception(e));
-        return -2;
-    } catch (...) {
-        dbs_set_error(handle, "unknown exception");
-        dbs_mark_error(handle, 2);
-        return -3;
-    }
+    return dbs_decode_constrained_ex(handle, log_probs, steps, vocab_size, nullptr, out_result);
 }
-
 
 extern "C" DBS_EXPORT int dbs_decode_typed(
     DBSDecoderHandle* handle,
@@ -346,26 +438,20 @@ extern "C" DBS_EXPORT int dbs_decode_typed(
     DBSResultHandle** out_result
 ) {
     if (out_result) *out_result = nullptr;
-    if (!handle || !handle->decoder || !out_result) return -1;
-    try {
-        if (steps <= 0 || vocab_size <= 0) throw std::invalid_argument("typed decode dimensions must be positive");
-        const int64_t count = static_cast<int64_t>(dbs::checked_mul_size(
-            dbs::checked_mul_size(static_cast<size_t>(steps), static_cast<size_t>(handle->beam_size), "typed decode size overflow"),
-            static_cast<size_t>(vocab_size), "typed decode size overflow"));
-        if (data_type == DBS_DTYPE_F32) {
-            return dbs_decode(handle, static_cast<const float*>(log_probs), steps, vocab_size, out_result);
-        }
-        std::vector<float> f32 = dbs_convert_to_f32_checked(log_probs, data_type, count);
-        return dbs_decode(handle, f32.data(), steps, vocab_size, out_result);
-    } catch (const std::exception& e) {
-        dbs_set_error(handle, e.what());
-        dbs_mark_error(handle, classify_exception(e));
-        return -2;
-    } catch (...) {
-        dbs_set_error(handle, "unknown exception");
-        dbs_mark_error(handle, 2);
-        return -3;
+    if (data_type == DBS_DTYPE_F32) {
+        return dbs_decode(handle, static_cast<const float*>(log_probs), steps, vocab_size, out_result);
     }
+    std::vector<float> f32;
+    const int rc = guarded(handle, [&] {
+        const dbs::BeamSearchDecoder& decoder = decoder_of(handle);
+        require(steps > 0 && vocab_size > 0, "steps and vocab_size must be positive");
+        const size_t count = dbs::checked_mul_size(
+            dbs::checked_mul_size(static_cast<size_t>(steps), static_cast<size_t>(decoder.options().beam_size), "typed decode size overflow"),
+            static_cast<size_t>(vocab_size), "typed decode size overflow");
+        f32 = convert_to_f32(log_probs, data_type, count);
+    });
+    if (rc != DBS_OK) return rc;
+    return dbs_decode(handle, f32.data(), steps, vocab_size, out_result);
 }
 
 extern "C" DBS_EXPORT int dbs_decode_batch_typed(
@@ -379,26 +465,20 @@ extern "C" DBS_EXPORT int dbs_decode_batch_typed(
     DBSBatchResultHandle** out_result
 ) {
     if (out_result) *out_result = nullptr;
-    if (!handle || !handle->decoder || !out_result) return -1;
-    try {
-        if (batch_size <= 0 || steps <= 0 || vocab_size <= 0) throw std::invalid_argument("typed batch decode dimensions must be positive");
-        size_t n = dbs::checked_mul_size(static_cast<size_t>(batch_size), static_cast<size_t>(steps), "typed batch decode size overflow");
-        n = dbs::checked_mul_size(n, static_cast<size_t>(handle->beam_size), "typed batch decode size overflow");
-        const int64_t count = static_cast<int64_t>(dbs::checked_mul_size(n, static_cast<size_t>(vocab_size), "typed batch decode size overflow"));
-        if (data_type == DBS_DTYPE_F32) {
-            return dbs_decode_batch(handle, static_cast<const float*>(log_probs), batch_size, steps, vocab_size, num_threads, out_result);
-        }
-        std::vector<float> f32 = dbs_convert_to_f32_checked(log_probs, data_type, count);
-        return dbs_decode_batch(handle, f32.data(), batch_size, steps, vocab_size, num_threads, out_result);
-    } catch (const std::exception& e) {
-        dbs_set_error(handle, e.what());
-        dbs_mark_error(handle, classify_exception(e));
-        return -2;
-    } catch (...) {
-        dbs_set_error(handle, "unknown exception");
-        dbs_mark_error(handle, 2);
-        return -3;
+    if (data_type == DBS_DTYPE_F32) {
+        return dbs_decode_batch(handle, static_cast<const float*>(log_probs), batch_size, steps, vocab_size, num_threads, out_result);
     }
+    std::vector<float> f32;
+    const int rc = guarded(handle, [&] {
+        const dbs::BeamSearchDecoder& decoder = decoder_of(handle);
+        require(batch_size > 0 && steps > 0 && vocab_size > 0, "batch_size, steps and vocab_size must be positive");
+        size_t n = dbs::checked_mul_size(static_cast<size_t>(batch_size), static_cast<size_t>(steps), "typed batch decode size overflow");
+        n = dbs::checked_mul_size(n, static_cast<size_t>(decoder.options().beam_size), "typed batch decode size overflow");
+        n = dbs::checked_mul_size(n, static_cast<size_t>(vocab_size), "typed batch decode size overflow");
+        f32 = convert_to_f32(log_probs, data_type, n);
+    });
+    if (rc != DBS_OK) return rc;
+    return dbs_decode_batch(handle, f32.data(), batch_size, steps, vocab_size, num_threads, out_result);
 }
 
 extern "C" DBS_EXPORT int dbs_decode_constrained(
@@ -416,7 +496,6 @@ extern "C" DBS_EXPORT int dbs_decode_constrained(
     c.forced_tokens = forced_tokens;
     c.min_length = min_length;
     c.repetition_penalty = 1.0f;
-    c.no_repeat_ngram_size = 0;
     return dbs_decode_constrained_ex(handle, log_probs, steps, vocab_size, &c, out_result);
 }
 
@@ -429,43 +508,18 @@ extern "C" DBS_EXPORT int dbs_decode_constrained_ex(
     DBSResultHandle** out_result
 ) {
     if (out_result) *out_result = nullptr;
-    if (!handle || !handle->decoder || !out_result) {
-        dbs_set_error(handle, "invalid decoder, result, or output pointer");
-        dbs_mark_error(handle, 1);
-        return -1;
-    }
-
-    try {
-        const auto start_time = std::chrono::steady_clock::now();
+    return guarded(handle, [&] {
+        require(out_result != nullptr, "out_result cannot be null");
+        const dbs::BeamSearchDecoder& decoder = decoder_of(handle);
+        const auto start = std::chrono::steady_clock::now();
         dbs::DecodeConstraints constraints;
-        if (constraints_c) {
-            constraints.banned_tokens = constraints_c->banned_tokens;
-            constraints.forced_tokens = constraints_c->forced_tokens;
-            constraints.min_length = constraints_c->min_length;
-            constraints.repetition_penalty = constraints_c->repetition_penalty > 0.0f ? constraints_c->repetition_penalty : 1.0f;
-            constraints.no_repeat_ngram_size = constraints_c->no_repeat_ngram_size;
-            constraints.token_filter = constraints_c->token_filter;
-            constraints.token_filter_user_data = constraints_c->token_filter_user_data;
-            constraints.batch_index = constraints_c->batch_index;
-        }
-
+        if (constraints_c) constraints = from_c_constraints(*constraints_c);
         auto r = std::make_unique<DBSResultHandle>();
-        r->result = handle->decoder->decode_constrained(log_probs, steps, vocab_size, &constraints);
-        dbs_record_decode_stats(handle, r->result, now_ns_since(start_time), 1, false);
+        r->result = decoder.decode_constrained(log_probs, steps, vocab_size, constraints_c ? &constraints : nullptr);
+        record_decode_stats(handle, r->result, now_ns_since(start), 1, false);
         *out_result = r.release();
-        dbs_clear_error(handle);
-        return 0;
-    } catch (const std::exception& e) {
-        dbs_set_error(handle, e.what());
-        dbs_mark_error(handle, classify_exception(e));
-        return -2;
-    } catch (...) {
-        dbs_set_error(handle, "unknown exception");
-        dbs_mark_error(handle, 2);
-        return -3;
-    }
+    });
 }
-
 
 extern "C" DBS_EXPORT int dbs_decode_model_steps(
     DBSDecoderHandle* handle,
@@ -477,15 +531,8 @@ extern "C" DBS_EXPORT int dbs_decode_model_steps(
     DBSResultHandle** out_result
 ) {
     DBSWorkspaceHandle local_workspace;
-    return dbs_decode_model_steps_with_workspace(
-        handle,
-        &local_workspace,
-        step_fn,
-        user_data,
-        batch_index,
-        steps,
-        vocab_size,
-        out_result);
+    return dbs_decode_model_steps_with_workspace(handle, &local_workspace, step_fn, user_data, batch_index, steps,
+                                                 vocab_size, out_result);
 }
 
 extern "C" DBS_EXPORT int dbs_decode_model_steps_with_workspace(
@@ -499,75 +546,65 @@ extern "C" DBS_EXPORT int dbs_decode_model_steps_with_workspace(
     DBSResultHandle** out_result
 ) {
     if (out_result) *out_result = nullptr;
-    if (!handle || !handle->decoder || !workspace || !step_fn || !out_result) {
-        dbs_set_error(handle, "invalid decoder, workspace, model step callback, or output pointer");
-        dbs_mark_error(handle, 1);
-        return -1;
-    }
-    if (steps <= 0 || vocab_size <= 0) {
-        dbs_set_error(handle, "steps and vocab_size must be positive");
-        dbs_mark_error(handle, 1);
-        return -1;
-    }
-
-    try {
-        const auto start_time = std::chrono::steady_clock::now();
-        const int K = handle->beam_size;
-        const size_t row_count = static_cast<size_t>(K) * static_cast<size_t>(vocab_size);
-        const size_t total = static_cast<size_t>(steps) * row_count;
-
-        std::lock_guard<std::mutex> workspace_lock(workspace->mutex);
-        workspace->f32.assign(total, -std::numeric_limits<float>::infinity());
-        workspace->i32.assign(static_cast<size_t>(K), -1);
-        std::vector<float> prev_scores(static_cast<size_t>(K), 0.0f);
-
-        for (int t = 0; t < steps; ++t) {
-            float* out_row = workspace->f32.data() + static_cast<size_t>(t) * row_count;
-            const int rc = step_fn(
-                user_data,
-                batch_index,
-                t,
-                workspace->i32.data(),
-                prev_scores.data(),
-                K,
-                vocab_size,
-                out_row);
-            if (rc != 0) {
+    return guarded(handle, [&] {
+        require(workspace != nullptr, "workspace cannot be null");
+        require(step_fn != nullptr, "model step callback cannot be null");
+        std::lock_guard<std::mutex> lock(workspace->mutex);
+        std::vector<float> zeros;
+        auto fn = [&](const dbs::ModelStepInfo& info, float* rows) {
+            // This callback only sees the previous tokens and scores, with
+            // scores of 0 at the first step.
+            const float* scores = info.scores;
+            if (info.step == 0) {
+                zeros.assign(static_cast<size_t>(info.beam_size), 0.0f);
+                scores = zeros.data();
+            }
+            if (step_fn(user_data, batch_index, info.step, info.tokens, scores, info.beam_size, info.vocab_size, rows) != 0) {
                 throw std::runtime_error("model step callback returned non-zero status");
             }
+        };
+        decode_model_steps_impl(handle, &workspace->f32, fn, steps, vocab_size, nullptr, out_result);
+    });
+}
 
-            if (t + 1 < steps) {
-                dbs::DecodeResult partial = handle->decoder->decode(workspace->f32.data(), t + 1, vocab_size);
-                const int32_t* tok = partial.tokens.data() + static_cast<size_t>(t) * K;
-                const float* scores = partial.final_scores.data();
-                for (int k = 0; k < K; ++k) {
-                    workspace->i32[static_cast<size_t>(k)] = tok[k];
-                    prev_scores[static_cast<size_t>(k)] = scores[k];
-                }
+extern "C" DBS_EXPORT int dbs_decode_model_steps_ex(
+    DBSDecoderHandle* handle,
+    DBSModelStepExFn step_fn,
+    void* user_data,
+    int batch_index,
+    int steps,
+    int vocab_size,
+    const DBSAdvancedConstraintsC* constraints,
+    DBSResultHandle** out_result
+) {
+    if (out_result) *out_result = nullptr;
+    return guarded(handle, [&] {
+        require(step_fn != nullptr, "model step callback cannot be null");
+        std::vector<float> rows;
+        auto fn = [&](const dbs::ModelStepInfo& info, float* out_rows) {
+            DBSModelStepInfoC c{};
+            c.batch_index = batch_index;
+            c.step = info.step;
+            c.beam_size = info.beam_size;
+            c.vocab_size = info.vocab_size;
+            c.parents = info.parents;
+            c.tokens = info.tokens;
+            c.lengths = info.lengths;
+            c.scores = info.scores;
+            c.raw_scores = info.raw_scores;
+            c.finished = info.finished;
+            c.prefixes = info.prefixes;
+            if (step_fn(user_data, &c, out_rows) != 0) {
+                throw std::runtime_error("model step callback returned non-zero status");
             }
+        };
+        DBSAdvancedConstraintsC with_index{};
+        if (constraints) {
+            with_index = *constraints;
+            with_index.batch_index = batch_index;
         }
-
-        auto r = std::make_unique<DBSResultHandle>();
-        r->result = handle->decoder->decode(workspace->f32.data(), steps, vocab_size);
-        dbs_record_decode_stats(handle, r->result, now_ns_since(start_time), 1, true);
-        {
-            const int64_t workspace_bytes = static_cast<int64_t>(
-                workspace->f32.capacity() * sizeof(float) + workspace->i32.capacity() * sizeof(int32_t));
-            std::lock_guard<std::mutex> lock(handle->stats_mutex);
-            handle->stats.last_allocation_bytes += workspace_bytes;
-        }
-        *out_result = r.release();
-        dbs_clear_error(handle);
-        return 0;
-    } catch (const std::exception& e) {
-        dbs_set_error(handle, e.what());
-        dbs_mark_error(handle, classify_exception(e));
-        return -2;
-    } catch (...) {
-        dbs_set_error(handle, "unknown exception");
-        dbs_mark_error(handle, 2);
-        return -3;
-    }
+        decode_model_steps_impl(handle, &rows, fn, steps, vocab_size, constraints ? &with_index : nullptr, out_result);
+    });
 }
 
 extern "C" DBS_EXPORT int dbs_decode_batch(
@@ -580,80 +617,32 @@ extern "C" DBS_EXPORT int dbs_decode_batch(
     DBSBatchResultHandle** out_result
 ) {
     if (out_result) *out_result = nullptr;
-    if (!handle || !handle->decoder || !out_result) {
-        dbs_set_error(handle, "invalid decoder, result, or output pointer");
-        dbs_mark_error(handle, 1);
-        return -1;
-    }
-    if (!log_probs || batch_size <= 0 || steps <= 0 || vocab_size <= 0) {
-        dbs_set_error(handle, "invalid batch decode arguments");
-        dbs_mark_error(handle, 1);
-        return -1;
-    }
+    return guarded(handle, [&] {
+        require(out_result != nullptr, "out_result cannot be null");
+        const dbs::BeamSearchDecoder& decoder = decoder_of(handle);
+        require(log_probs != nullptr, "log_probs cannot be null");
+        require(batch_size > 0 && steps > 0 && vocab_size > 0, "batch_size, steps and vocab_size must be positive");
+        const auto start = std::chrono::steady_clock::now();
+        const size_t stride = dbs::checked_mul_size(
+            dbs::checked_mul_size(static_cast<size_t>(steps), static_cast<size_t>(decoder.options().beam_size), "batch stride overflow"),
+            static_cast<size_t>(vocab_size), "batch stride overflow");
+        (void)dbs::checked_mul_size(stride, static_cast<size_t>(batch_size), "batch size overflow");
 
-    try {
-        const auto start_time = std::chrono::steady_clock::now();
         auto br = std::make_unique<DBSBatchResultHandle>();
         br->results.resize(static_cast<size_t>(batch_size));
-
-        const size_t step_beam = dbs::checked_mul_size(
-            static_cast<size_t>(steps),
-            static_cast<size_t>(handle->beam_size),
-            "batch stride overflow");
-        const size_t stride = dbs::checked_mul_size(
-            step_beam,
-            static_cast<size_t>(vocab_size),
-            "batch stride overflow");
-
-        const int hw_threads = static_cast<int>(std::thread::hardware_concurrency());
-        const int threads = std::max(1, std::min(batch_size, num_threads > 0 ? num_threads : std::max(1, hw_threads)));
-        std::atomic<int> index{0};
-        std::mutex error_mutex;
-        std::exception_ptr first_exception = nullptr;
-
-        // Worker threads inherit the calling thread's kernel override.
-        const dbs::KernelOverride captured_override = dbs::current_kernel_override();
-
-        auto worker = [&, captured_override]() {
-            dbs::set_kernel_override(captured_override);
-            for (;;) {
-                const int b = index.fetch_add(1);
-                if (b >= batch_size) break;
-                try {
-                    br->results[static_cast<size_t>(b)].result =
-                        handle->decoder->decode(log_probs + static_cast<size_t>(b) * stride, steps, vocab_size);
-                } catch (...) {
-                    std::lock_guard<std::mutex> lock(error_mutex);
-                    if (!first_exception) first_exception = std::current_exception();
-                }
+        const int threads = thread_count(num_threads, batch_size);
+        parallel_for(batch_size, threads, [&](int b) {
+            try {
+                br->results[static_cast<size_t>(b)].result =
+                    decoder.decode(log_probs + static_cast<size_t>(b) * stride, steps, vocab_size);
+            } catch (const std::invalid_argument& e) {
+                rethrow_for_example(b, e);
             }
-        };
-
-        std::vector<std::thread> pool;
-        pool.reserve(static_cast<size_t>(threads));
-        for (int i = 0; i < threads; ++i) pool.emplace_back(worker);
-        for (auto& th : pool) th.join();
-        if (first_exception) {
-            std::rethrow_exception(first_exception);
-        }
-
-        if (!br->results.empty()) {
-            dbs_record_decode_stats(handle, br->results.front().result, now_ns_since(start_time), threads, false);
-        }
+        });
+        record_decode_stats(handle, br->results.front().result, now_ns_since(start), threads, false);
         *out_result = br.release();
-        dbs_clear_error(handle);
-        return 0;
-    } catch (const std::exception& e) {
-        dbs_set_error(handle, e.what());
-        dbs_mark_error(handle, classify_exception(e));
-        return -2;
-    } catch (...) {
-        dbs_set_error(handle, "unknown exception");
-        dbs_mark_error(handle, 2);
-        return -3;
-    }
+    });
 }
-
 
 extern "C" DBS_EXPORT int dbs_decode_batch_variable(
     DBSDecoderHandle* handle,
@@ -672,94 +661,166 @@ extern "C" DBS_EXPORT int dbs_decode_batch_variable(
     DBSBatchResultHandle** out_result
 ) {
     if (out_result) *out_result = nullptr;
-    if (!handle || !log_probs || !out_result || batch_size <= 0 || max_steps <= 0 || max_beam_size <= 0 || vocab_size <= 0) {
-        dbs_set_error(handle, "invalid variable batch decode arguments");
-        dbs_mark_error(handle, 1);
-        return -1;
-    }
-
-    try {
-        const auto start_time = std::chrono::steady_clock::now();
-        auto br = std::make_unique<DBSBatchResultHandle>();
-        br->results.resize(static_cast<size_t>(batch_size));
-        const size_t input_stride = dbs::checked_mul_size(
-            dbs::checked_mul_size(static_cast<size_t>(max_steps), static_cast<size_t>(max_beam_size), "variable batch stride overflow"),
-            static_cast<size_t>(vocab_size), "variable batch stride overflow");
+    return guarded(handle, [&] {
+        require(out_result != nullptr, "out_result cannot be null");
+        decoder_of(handle);
+        require(log_probs != nullptr, "log_probs cannot be null");
+        require(batch_size > 0 && max_steps > 0 && max_beam_size > 0 && vocab_size > 0,
+                "batch_size, max_steps, max_beam_size and vocab_size must be positive");
+        const auto start = std::chrono::steady_clock::now();
+        const size_t step_stride = dbs::checked_mul_size(static_cast<size_t>(max_beam_size), static_cast<size_t>(vocab_size), "variable batch stride overflow");
+        const size_t input_stride = dbs::checked_mul_size(step_stride, static_cast<size_t>(max_steps), "variable batch stride overflow");
         (void)dbs::checked_mul_size(input_stride, static_cast<size_t>(batch_size), "variable batch size overflow");
 
-        const int hw_threads = static_cast<int>(std::thread::hardware_concurrency());
-        const int threads = std::max(1, std::min(batch_size, num_threads > 0 ? num_threads : std::max(1, hw_threads)));
-        std::atomic<int> index{0};
-        std::mutex error_mutex;
-        std::exception_ptr first_exception = nullptr;
+        auto br = std::make_unique<DBSBatchResultHandle>();
+        br->results.resize(static_cast<size_t>(batch_size));
+        const int threads = thread_count(num_threads, batch_size);
+        parallel_for(batch_size, threads, [&](int b) {
+            try {
+                const int steps = steps_per_example ? steps_per_example[b] : max_steps;
+                const int beam = beam_sizes_per_example ? beam_sizes_per_example[b] : handle->options.beam_size;
+                require(steps > 0 && steps <= max_steps, "per-example steps must be in [1, max_steps]");
+                require(beam > 0 && beam <= max_beam_size, "per-example beam size must be in [1, max_beam_size]");
 
-        // Worker threads inherit the calling thread's kernel override.
-        const dbs::KernelOverride captured_override = dbs::current_kernel_override();
+                dbs::BeamOptions opt = handle->options;
+                opt.beam_size = beam;
+                if (eos_tokens_per_example) opt.eos_token = eos_tokens_per_example[b];
+                if (min_lengths_per_example) opt.min_length = std::max(0, min_lengths_per_example[b]);
+                const dbs::BeamSearchDecoder local_decoder(opt);
 
-        auto worker = [&, captured_override]() {
-            dbs::set_kernel_override(captured_override);
-            for (;;) {
-                const int b = index.fetch_add(1);
-                if (b >= batch_size) break;
-                try {
-                    const int steps = steps_per_example ? steps_per_example[b] : max_steps;
-                    const int beam = beam_sizes_per_example ? beam_sizes_per_example[b] : handle->beam_size;
-                    if (steps <= 0 || steps > max_steps) throw std::invalid_argument("invalid per-example steps");
-                    if (beam <= 0 || beam > max_beam_size) throw std::invalid_argument("invalid per-example beam size");
-
-                    dbs::BeamOptions opt = handle->options;
-                    opt.beam_size = beam;
-                    if (eos_tokens_per_example) opt.eos_token = eos_tokens_per_example[b];
-                    if (min_lengths_per_example) opt.min_length = std::max(0, min_lengths_per_example[b]);
-                    dbs::BeamSearchDecoder local_decoder(opt);
-
-                    std::vector<float> local(static_cast<size_t>(steps) * static_cast<size_t>(beam) * static_cast<size_t>(vocab_size));
-                    const float* base = log_probs + static_cast<size_t>(b) * input_stride;
-                    for (int t = 0; t < steps; ++t) {
-                        for (int k = 0; k < beam; ++k) {
-                            const float* src = base + (static_cast<size_t>(t) * max_beam_size + static_cast<size_t>(k)) * static_cast<size_t>(vocab_size);
-                            float* dst = local.data() + (static_cast<size_t>(t) * beam + static_cast<size_t>(k)) * static_cast<size_t>(vocab_size);
-                            std::copy(src, src + vocab_size, dst);
-                        }
-                    }
-
-                    dbs::DecodeConstraints constraints;
-                    if (banned_tokens_per_example) constraints.banned_tokens = banned_tokens_per_example + static_cast<size_t>(b) * static_cast<size_t>(vocab_size);
-                    if (forced_tokens_per_example) constraints.forced_tokens = forced_tokens_per_example + static_cast<size_t>(b) * static_cast<size_t>(max_steps);
-                    constraints.min_length = min_lengths_per_example ? min_lengths_per_example[b] : -1;
-                    constraints.batch_index = b;
-
-                    br->results[static_cast<size_t>(b)].result =
-                        local_decoder.decode_constrained(local.data(), steps, vocab_size,
-                            (banned_tokens_per_example || forced_tokens_per_example || min_lengths_per_example) ? &constraints : nullptr);
-                } catch (...) {
-                    std::lock_guard<std::mutex> lock(error_mutex);
-                    if (!first_exception) first_exception = std::current_exception();
-                }
+                dbs::DecodeConstraints constraints;
+                if (banned_tokens_per_example) constraints.banned_tokens = banned_tokens_per_example + static_cast<size_t>(b) * static_cast<size_t>(vocab_size);
+                if (forced_tokens_per_example) constraints.forced_tokens = forced_tokens_per_example + static_cast<size_t>(b) * static_cast<size_t>(max_steps);
+                constraints.batch_index = b;
+                // Rows of a smaller beam are read in place (the first `beam`
+                // rows of each [max_beam_size, V] step).
+                br->results[static_cast<size_t>(b)].result = local_decoder.decode_constrained(
+                    log_probs + static_cast<size_t>(b) * input_stride, steps, vocab_size, &constraints,
+                    static_cast<int64_t>(step_stride));
+            } catch (const std::invalid_argument& e) {
+                rethrow_for_example(b, e);
             }
-        };
-
-        std::vector<std::thread> pool;
-        pool.reserve(static_cast<size_t>(threads));
-        for (int i = 0; i < threads; ++i) pool.emplace_back(worker);
-        for (auto& th : pool) th.join();
-        if (first_exception) {
-            std::rethrow_exception(first_exception);
-        }
-
-        if (!br->results.empty()) dbs_record_decode_stats(handle, br->results.front().result, now_ns_since(start_time), threads, false);
+        });
+        record_decode_stats(handle, br->results.front().result, now_ns_since(start), threads, false);
         *out_result = br.release();
-        dbs_clear_error(handle);
-        return 0;
-    } catch (const std::exception& e) {
-        dbs_set_error(handle, e.what());
-        dbs_mark_error(handle, classify_exception(e));
-        return -2;
-    } catch (...) {
-        dbs_set_error(handle, "unknown exception");
-        dbs_mark_error(handle, 2);
-        return -3;
-    }
+    });
+}
+
+extern "C" DBS_EXPORT int dbs_decode_batch_into(
+    DBSDecoderHandle* handle,
+    const float* log_probs,
+    int batch_size,
+    int steps,
+    int vocab_size,
+    const int32_t* steps_per_example,
+    const DBSAdvancedConstraintsC* constraints_c,
+    int num_threads,
+    const DBSDecodeOutputsC* outputs
+) {
+    return guarded(handle, [&] {
+        const dbs::BeamSearchDecoder& decoder = decoder_of(handle);
+        require(log_probs != nullptr, "log_probs cannot be null");
+        require(outputs != nullptr && outputs->final_scores != nullptr, "outputs and outputs->final_scores cannot be null");
+        require(batch_size > 0 && steps > 0 && vocab_size > 0, "batch_size, steps and vocab_size must be positive");
+        const auto start = std::chrono::steady_clock::now();
+        const int K = decoder.options().beam_size;
+        const size_t trace_stride = dbs::checked_mul_size(static_cast<size_t>(steps), static_cast<size_t>(K), "batch stride overflow");
+        const size_t input_stride = dbs::checked_mul_size(trace_stride, static_cast<size_t>(vocab_size), "batch stride overflow");
+        (void)dbs::checked_mul_size(input_stride, static_cast<size_t>(batch_size), "batch size overflow");
+        const std::vector<int32_t> steps_b = steps_for(steps_per_example, batch_size, steps);
+        const dbs::DecodeConstraints shared = constraints_c ? from_c_constraints(*constraints_c) : dbs::DecodeConstraints{};
+
+        const int threads = thread_count(num_threads, batch_size);
+        parallel_for(batch_size, threads, [&](int b) {
+            const size_t bs = static_cast<size_t>(b);
+            const size_t off = bs * trace_stride;
+            dbs::TraceOutputs trace;
+            trace.parents = outputs->parents ? outputs->parents + off : nullptr;
+            trace.tokens = outputs->tokens ? outputs->tokens + off : nullptr;
+            trace.lengths = outputs->lengths ? outputs->lengths + off : nullptr;
+            trace.scores = outputs->scores ? outputs->scores + off : nullptr;
+            trace.raw_scores = outputs->raw_scores ? outputs->raw_scores + off : nullptr;
+            trace.from_logprob = outputs->from_logprob ? outputs->from_logprob + off : nullptr;
+
+            // Padding for the steps this example does not decode.
+            const size_t used = static_cast<size_t>(steps_b[bs]) * static_cast<size_t>(K);
+            const float neg_inf = -std::numeric_limits<float>::infinity();
+            if (trace.parents) std::fill(trace.parents + used, trace.parents + trace_stride, -1);
+            if (trace.tokens) std::fill(trace.tokens + used, trace.tokens + trace_stride, -1);
+            if (trace.lengths) std::fill(trace.lengths + used, trace.lengths + trace_stride, 0);
+            if (trace.scores) std::fill(trace.scores + used, trace.scores + trace_stride, neg_inf);
+            if (trace.raw_scores) std::fill(trace.raw_scores + used, trace.raw_scores + trace_stride, neg_inf);
+            if (trace.from_logprob) std::fill(trace.from_logprob + used, trace.from_logprob + trace_stride, uint8_t{0});
+
+            dbs::DecodeConstraints constraints = shared;
+            constraints.batch_index = b;
+            const size_t final_off = bs * static_cast<size_t>(K);
+            try {
+                decoder.decode_into(
+                    log_probs + bs * input_stride, steps_b[bs], vocab_size, constraints_c ? &constraints : nullptr, trace,
+                    outputs->final_scores + final_off,
+                    outputs->final_raw_scores ? outputs->final_raw_scores + final_off : nullptr,
+                    outputs->final_lengths ? outputs->final_lengths + final_off : nullptr);
+            } catch (const std::invalid_argument& e) {
+                rethrow_for_example(b, e);
+            }
+        });
+        record_batch_stats(handle, static_cast<int64_t>(batch_size) * static_cast<int64_t>(trace_stride),
+                           static_cast<int64_t>(batch_size) * static_cast<int64_t>(input_stride),
+                           now_ns_since(start), threads);
+    });
+}
+
+extern "C" DBS_EXPORT int dbs_backward_batch_into(
+    DBSDecoderHandle* handle,
+    int batch_size,
+    int steps,
+    int vocab_size,
+    const int32_t* steps_per_example,
+    const int32_t* parents,
+    const int32_t* tokens,
+    const int32_t* lengths,
+    const uint8_t* from_logprob,
+    const float* grad_final_scores,
+    int num_threads,
+    float* grad_log_probs
+) {
+    return guarded(handle, [&] {
+        const dbs::BeamSearchDecoder& decoder = decoder_of(handle);
+        require(parents && tokens && lengths && from_logprob, "parents, tokens, lengths and from_logprob cannot be null");
+        require(grad_final_scores && grad_log_probs, "grad_final_scores and grad_log_probs cannot be null");
+        require(batch_size > 0 && steps > 0 && vocab_size > 0, "batch_size, steps and vocab_size must be positive");
+        const auto start = std::chrono::steady_clock::now();
+        const int K = decoder.options().beam_size;
+        const size_t trace_stride = dbs::checked_mul_size(static_cast<size_t>(steps), static_cast<size_t>(K), "batch stride overflow");
+        const size_t grad_stride = dbs::checked_mul_size(trace_stride, static_cast<size_t>(vocab_size), "batch stride overflow");
+        (void)dbs::checked_mul_size(grad_stride, static_cast<size_t>(batch_size), "batch size overflow");
+        const std::vector<int32_t> steps_b = steps_for(steps_per_example, batch_size, steps);
+
+        parallel_for(batch_size, thread_count(num_threads, batch_size), [&](int b) {
+            const size_t bs = static_cast<size_t>(b);
+            dbs::TraceView trace;
+            trace.steps = steps_b[bs];
+            trace.beam_size = K;
+            trace.vocab_size = vocab_size;
+            trace.length_penalty_alpha = decoder.options().length_penalty_alpha;
+            trace.parents = parents + bs * trace_stride;
+            trace.tokens = tokens + bs * trace_stride;
+            trace.lengths = lengths + bs * trace_stride;
+            trace.from_logprob = from_logprob + bs * trace_stride;
+            try {
+                dbs::final_scores_backward_into(trace, grad_final_scores + bs * static_cast<size_t>(K), grad_log_probs + bs * grad_stride);
+            } catch (const std::invalid_argument& e) {
+                rethrow_for_example(b, e);
+            }
+        });
+        std::lock_guard<std::mutex> lock(handle->stats_mutex);
+        handle->stats.used_sparse_backward = 0;
+        handle->stats.used_dense_backward = 1;
+        handle->stats.last_backward_ns = now_ns_since(start);
+        handle->stats.last_sparse_grad_count = 0;
+        handle->stats.last_error_category = 0;
+    });
 }
 
 extern "C" DBS_EXPORT int dbs_backward(
@@ -770,14 +831,7 @@ extern "C" DBS_EXPORT int dbs_backward(
     const float* grad_final_scores,
     DBSBackwardHandle** out_backward
 ) {
-    return dbs_backward_sparse(
-        handle,
-        result,
-        grad_selected_weights,
-        grad_relaxed_weights,
-        grad_final_scores,
-        out_backward
-    );
+    return dbs_backward_sparse(handle, result, grad_selected_weights, grad_relaxed_weights, grad_final_scores, out_backward);
 }
 
 extern "C" DBS_EXPORT int dbs_backward_dense(
@@ -789,33 +843,16 @@ extern "C" DBS_EXPORT int dbs_backward_dense(
     DBSBackwardHandle** out_backward
 ) {
     if (out_backward) *out_backward = nullptr;
-    if (!handle || !handle->decoder || !result || !out_backward) {
-        dbs_set_error(handle, "invalid decoder, result, or output pointer");
-        dbs_mark_error(handle, 1);
-        return -1;
-    }
-
-    try {
-        const auto start_time = std::chrono::steady_clock::now();
+    return guarded(handle, [&] {
+        require(out_backward != nullptr, "out_backward cannot be null");
+        require(result != nullptr, "result cannot be null");
+        const dbs::BeamSearchDecoder& decoder = decoder_of(handle);
+        const auto start = std::chrono::steady_clock::now();
         auto b = std::make_unique<DBSBackwardHandle>();
-        b->result = handle->decoder->backward(
-            result->result,
-            grad_selected_weights,
-            grad_relaxed_weights,
-            grad_final_scores);
-        dbs_record_backward_stats(handle, b->result, now_ns_since(start_time));
+        b->result = decoder.backward(result->result, grad_selected_weights, grad_relaxed_weights, grad_final_scores);
+        record_backward_stats(handle, b->result, now_ns_since(start));
         *out_backward = b.release();
-        dbs_clear_error(handle);
-        return 0;
-    } catch (const std::exception& e) {
-        dbs_set_error(handle, e.what());
-        dbs_mark_error(handle, classify_exception(e));
-        return -2;
-    } catch (...) {
-        dbs_set_error(handle, "unknown exception");
-        dbs_mark_error(handle, 2);
-        return -3;
-    }
+    });
 }
 
 extern "C" DBS_EXPORT int dbs_backward_sparse(
@@ -827,33 +864,16 @@ extern "C" DBS_EXPORT int dbs_backward_sparse(
     DBSBackwardHandle** out_backward
 ) {
     if (out_backward) *out_backward = nullptr;
-    if (!handle || !handle->decoder || !result || !out_backward) {
-        dbs_set_error(handle, "invalid decoder, result, or output pointer");
-        dbs_mark_error(handle, 1);
-        return -1;
-    }
-
-    try {
-        const auto start_time = std::chrono::steady_clock::now();
+    return guarded(handle, [&] {
+        require(out_backward != nullptr, "out_backward cannot be null");
+        require(result != nullptr, "result cannot be null");
+        const dbs::BeamSearchDecoder& decoder = decoder_of(handle);
+        const auto start = std::chrono::steady_clock::now();
         auto b = std::make_unique<DBSBackwardHandle>();
-        b->result = handle->decoder->backward_sparse(
-            result->result,
-            grad_selected_weights,
-            grad_relaxed_weights,
-            grad_final_scores);
-        dbs_record_backward_stats(handle, b->result, now_ns_since(start_time));
+        b->result = decoder.backward_sparse(result->result, grad_selected_weights, grad_relaxed_weights, grad_final_scores);
+        record_backward_stats(handle, b->result, now_ns_since(start));
         *out_backward = b.release();
-        dbs_clear_error(handle);
-        return 0;
-    } catch (const std::exception& e) {
-        dbs_set_error(handle, e.what());
-        dbs_mark_error(handle, classify_exception(e));
-        return -2;
-    } catch (...) {
-        dbs_set_error(handle, "unknown exception");
-        dbs_mark_error(handle, 2);
-        return -3;
-    }
+    });
 }
 
 extern "C" DBS_EXPORT int dbs_backward_default(
@@ -864,14 +884,7 @@ extern "C" DBS_EXPORT int dbs_backward_default(
     const float* grad_final_scores,
     DBSBackwardHandle** out_backward
 ) {
-    return dbs_backward_sparse(
-        handle,
-        result,
-        grad_selected_weights,
-        grad_relaxed_weights,
-        grad_final_scores,
-        out_backward
-    );
+    return dbs_backward_sparse(handle, result, grad_selected_weights, grad_relaxed_weights, grad_final_scores, out_backward);
 }
 
 extern "C" DBS_EXPORT void dbs_free_result(DBSResultHandle* result) {
@@ -882,6 +895,10 @@ extern "C" DBS_EXPORT void dbs_free_batch_result(DBSBatchResultHandle* result) {
     delete result;
 }
 
+extern "C" DBS_EXPORT void dbs_free_backward(DBSBackwardHandle* result) {
+    delete result;
+}
+
 extern "C" DBS_EXPORT int dbs_batch_result_size(const DBSBatchResultHandle* result) {
     return result ? static_cast<int>(result->results.size()) : 0;
 }
@@ -889,10 +906,6 @@ extern "C" DBS_EXPORT int dbs_batch_result_size(const DBSBatchResultHandle* resu
 extern "C" DBS_EXPORT const DBSResultHandle* dbs_batch_result_at(const DBSBatchResultHandle* result, int batch_index) {
     if (!result || batch_index < 0 || batch_index >= static_cast<int>(result->results.size())) return nullptr;
     return &result->results[static_cast<size_t>(batch_index)];
-}
-
-extern "C" DBS_EXPORT void dbs_free_backward(DBSBackwardHandle* result) {
-    delete result;
 }
 
 extern "C" DBS_EXPORT int dbs_result_steps(const DBSResultHandle* result) {
@@ -912,79 +925,83 @@ extern "C" DBS_EXPORT int dbs_result_pool_size(const DBSResultHandle* result) {
 }
 
 extern "C" DBS_EXPORT const int32_t* dbs_result_tokens(const DBSResultHandle* result) {
-    return result ? result->result.tokens.data() : nullptr;
+    return result ? data_or_null(result->result.tokens) : nullptr;
 }
 
 extern "C" DBS_EXPORT const int32_t* dbs_result_parents(const DBSResultHandle* result) {
-    return result ? result->result.parents.data() : nullptr;
+    return result ? data_or_null(result->result.parents) : nullptr;
+}
+
+extern "C" DBS_EXPORT const int32_t* dbs_result_lengths(const DBSResultHandle* result) {
+    return result ? data_or_null(result->result.lengths) : nullptr;
 }
 
 extern "C" DBS_EXPORT const float* dbs_result_scores(const DBSResultHandle* result) {
-    return result ? result->result.scores.data() : nullptr;
+    return result ? data_or_null(result->result.scores) : nullptr;
 }
 
 extern "C" DBS_EXPORT const float* dbs_result_raw_scores(const DBSResultHandle* result) {
-    return result ? result->result.raw_scores.data() : nullptr;
+    return result ? data_or_null(result->result.raw_scores) : nullptr;
+}
+
+extern "C" DBS_EXPORT const float* dbs_result_weights(const DBSResultHandle* result) {
+    return result ? data_or_null(result->result.weights) : nullptr;
+}
+
+extern "C" DBS_EXPORT const float* dbs_result_final_scores(const DBSResultHandle* result) {
+    return result ? data_or_null(result->result.final_scores) : nullptr;
+}
+
+extern "C" DBS_EXPORT const float* dbs_result_final_raw_scores(const DBSResultHandle* result) {
+    return result ? data_or_null(result->result.final_raw_scores) : nullptr;
 }
 
 extern "C" DBS_EXPORT const float* dbs_result_relaxed_weights(const DBSResultHandle* result) {
-    return result ? result->result.relaxed_weights.data() : nullptr;
+    return result ? data_or_null(result->result.relaxed_weights) : nullptr;
 }
 
 extern "C" DBS_EXPORT const int32_t* dbs_result_pool_tokens(const DBSResultHandle* result) {
-    return result ? result->result.pool_tokens.data() : nullptr;
+    return result ? data_or_null(result->result.pool_tokens) : nullptr;
 }
 
 extern "C" DBS_EXPORT const int32_t* dbs_result_pool_parents(const DBSResultHandle* result) {
-    return result ? result->result.pool_parents.data() : nullptr;
+    return result ? data_or_null(result->result.pool_parents) : nullptr;
+}
+
+extern "C" DBS_EXPORT const int32_t* dbs_result_pool_lengths(const DBSResultHandle* result) {
+    return result ? data_or_null(result->result.pool_lengths) : nullptr;
 }
 
 extern "C" DBS_EXPORT const float* dbs_result_pool_scores(const DBSResultHandle* result) {
-    return result ? result->result.pool_scores.data() : nullptr;
+    return result ? data_or_null(result->result.pool_scores) : nullptr;
+}
+
+extern "C" DBS_EXPORT const float* dbs_result_pool_raw_scores(const DBSResultHandle* result) {
+    return result ? data_or_null(result->result.pool_raw_scores) : nullptr;
 }
 
 extern "C" DBS_EXPORT const float* dbs_backward_grad_log_probs(const DBSBackwardHandle* result) {
-    return result ? result->result.grad_log_probs.data() : nullptr;
+    return result ? data_or_null(result->result.grad_log_probs) : nullptr;
 }
 
 extern "C" DBS_EXPORT const float* dbs_backward_grad_initial_scores(const DBSBackwardHandle* result) {
-    return result ? result->result.grad_initial_scores.data() : nullptr;
+    return result ? data_or_null(result->result.grad_initial_scores) : nullptr;
 }
 
 extern "C" DBS_EXPORT const int64_t* dbs_backward_sparse_logprob_indices(const DBSBackwardHandle* result) {
-    return result ? result->result.sparse_logprob_indices.data() : nullptr;
+    return result ? data_or_null(result->result.sparse_logprob_indices) : nullptr;
 }
 
 extern "C" DBS_EXPORT const float* dbs_backward_sparse_logprob_values(const DBSBackwardHandle* result) {
-    return result ? result->result.sparse_logprob_values.data() : nullptr;
+    return result ? data_or_null(result->result.sparse_logprob_values) : nullptr;
 }
 
 extern "C" DBS_EXPORT int64_t dbs_backward_sparse_logprob_count(const DBSBackwardHandle* result) {
     return result ? static_cast<int64_t>(result->result.sparse_logprob_values.size()) : 0;
 }
 
-extern "C" DBS_EXPORT const int32_t* dbs_result_lengths(const DBSResultHandle* result) {
-    return result ? result->result.lengths.data() : nullptr;
-}
-
-extern "C" DBS_EXPORT const int32_t* dbs_result_pool_lengths(const DBSResultHandle* result) {
-    return result ? result->result.pool_lengths.data() : nullptr;
-}
-
-extern "C" DBS_EXPORT const float* dbs_result_weights(const DBSResultHandle* result) {
-    return result ? result->result.weights.data() : nullptr;
-}
-
-extern "C" DBS_EXPORT const float* dbs_result_final_scores(const DBSResultHandle* result) {
-    return result ? result->result.final_scores.data() : nullptr;
-}
-
-extern "C" DBS_EXPORT const float* dbs_result_final_raw_scores(const DBSResultHandle* result) {
-    return result ? result->result.final_raw_scores.data() : nullptr;
-}
-
-extern "C" DBS_EXPORT const float* dbs_result_pool_raw_scores(const DBSResultHandle* result) {
-    return result ? result->result.pool_raw_scores.data() : nullptr;
+extern "C" DBS_EXPORT int dbs_backward_is_sparse(const DBSBackwardHandle* result) {
+    return result && result->result.sparse ? 1 : 0;
 }
 
 extern "C" DBS_EXPORT int64_t dbs_result_selected_count(const DBSResultHandle* result) {
@@ -996,9 +1013,7 @@ extern "C" DBS_EXPORT int64_t dbs_result_pool_count(const DBSResultHandle* resul
 }
 
 extern "C" DBS_EXPORT int64_t dbs_result_logprob_count(const DBSResultHandle* result) {
-    return result
-        ? static_cast<int64_t>(result->result.steps) * result->result.beam_size * result->result.vocab_size
-        : 0;
+    return result ? static_cast<int64_t>(result->result.steps) * result->result.beam_size * result->result.vocab_size : 0;
 }
 
 extern "C" DBS_EXPORT int64_t dbs_backward_grad_log_probs_count(const DBSResultHandle* result) {
@@ -1008,11 +1023,6 @@ extern "C" DBS_EXPORT int64_t dbs_backward_grad_log_probs_count(const DBSResultH
 extern "C" DBS_EXPORT int64_t dbs_backward_grad_initial_scores_count(const DBSResultHandle* result) {
     return result ? result->result.beam_size : 0;
 }
-
-extern "C" DBS_EXPORT int dbs_backward_is_sparse(const DBSBackwardHandle* result) {
-    return result && result->result.sparse ? 1 : 0;
-}
-
 
 extern "C" DBS_EXPORT int64_t dbs_result_eos_count(const DBSResultHandle* result, int eos_token) {
     if (!result || eos_token < 0) return 0;
@@ -1025,43 +1035,38 @@ extern "C" DBS_EXPORT int64_t dbs_result_eos_count(const DBSResultHandle* result
 
 extern "C" DBS_EXPORT int dbs_result_validate_deterministic_order(const DBSResultHandle* result) {
     if (!result) return -1;
-    const int T = result->result.steps;
-    const int K = result->result.beam_size;
-    if (T < 0 || K < 0) return -2;
+    const dbs::DecodeResult& r = result->result;
+    const int T = r.steps;
+    const int K = r.beam_size;
     for (int t = 0; t < T; ++t) {
         for (int k = 1; k < K; ++k) {
-            const size_t prev = static_cast<size_t>(t) * K + (k - 1);
-            const size_t cur = static_cast<size_t>(t) * K + k;
-            const float a = result->result.scores[prev];
-            const float b = result->result.scores[cur];
-            if (std::isfinite(a) && std::isfinite(b) && b > a) return -3;
-            if (a == b) {
-                const int32_t pa = result->result.parents[prev];
-                const int32_t pb = result->result.parents[cur];
-                const int32_t ta = result->result.tokens[prev];
-                const int32_t tb = result->result.tokens[cur];
-                if (pb < pa || (pb == pa && tb < ta)) return -4;
-            }
+            const size_t prev = static_cast<size_t>(t) * static_cast<size_t>(K) + static_cast<size_t>(k - 1);
+            const size_t cur = prev + 1;
+            const dbs::Candidate a{r.scores[prev], r.raw_scores[prev], r.parents[prev], r.tokens[prev], r.lengths[prev], r.from_logprob[prev]};
+            const dbs::Candidate b{r.scores[cur], r.raw_scores[cur], r.parents[cur], r.tokens[cur], r.lengths[cur], r.from_logprob[cur]};
+            if (!dbs::candidate_better(b, a)) continue;  // a precedes (or equals) b
+            return b.score > a.score ? -3 : -4;
         }
     }
     return 0;
 }
 
 extern "C" DBS_EXPORT int dbs_result_summary_json(const DBSResultHandle* result, int eos_token, char* out_json, int64_t out_json_capacity) {
-    if (!result || !out_json || out_json_capacity <= 0) return -1;
+    if (!result || !out_json || out_json_capacity <= 0) {
+        return fail(nullptr, "result and out_json cannot be null, and the capacity must be positive", 1, DBS_ERROR_INVALID_ARGUMENT);
+    }
     const auto& r = result->result;
     int min_len = r.lengths.empty() ? 0 : std::numeric_limits<int>::max();
     int max_len = 0;
     for (int32_t len : r.lengths) {
-        if (len < min_len) min_len = len;
-        if (len > max_len) max_len = len;
+        min_len = std::min(min_len, static_cast<int>(len));
+        max_len = std::max(max_len, static_cast<int>(len));
     }
-    if (r.lengths.empty()) min_len = 0;
     float min_final = r.final_scores.empty() ? 0.0f : r.final_scores[0];
-    float max_final = r.final_scores.empty() ? 0.0f : r.final_scores[0];
+    float max_final = min_final;
     for (float score : r.final_scores) {
-        if (score < min_final) min_final = score;
-        if (score > max_final) max_final = score;
+        min_final = std::min(min_final, score);
+        max_final = std::max(max_final, score);
     }
     const int64_t eos_count = dbs_result_eos_count(result, eos_token);
     const int order_ok = dbs_result_validate_deterministic_order(result) == 0 ? 1 : 0;
@@ -1080,20 +1085,8 @@ extern "C" DBS_EXPORT int dbs_result_summary_json(const DBSResultHandle* result,
         static_cast<double>(min_final),
         static_cast<double>(max_final),
         order_ok);
-    if (n < 0) return -2;
+    if (n < 0) return fail(nullptr, "formatting the summary failed", 2, DBS_ERROR_RUNTIME);
     return n < out_json_capacity ? 0 : 1;
-}
-
-extern "C" DBS_EXPORT int dbs_validate_production_gate_manifest(const char* manifest_json, char* out_error, int64_t out_error_capacity) {
-    (void)manifest_json;
-    if (out_error && out_error_capacity > 0) {
-        std::snprintf(
-            out_error,
-            static_cast<size_t>(out_error_capacity),
-            "%s",
-            "deprecated: release evidence cannot be validated by the C ABI; run tests and attach raw benchmark/artifact logs");
-    }
-    return -1;
 }
 
 extern "C" DBS_EXPORT int dbs_has_avx512() {
@@ -1117,19 +1110,22 @@ extern "C" DBS_EXPORT const char* dbs_selected_kernel_name() {
 }
 
 extern "C" DBS_EXPORT int dbs_get_stats(DBSDecoderHandle* handle, DBSStatsC* out_stats) {
-    if (!handle || !out_stats) return -1;
-    std::lock_guard<std::mutex> lock(handle->stats_mutex);
-    *out_stats = handle->stats;
-    out_stats->total_allocator_calls = dbs::g_allocator_calls.load(std::memory_order_relaxed);
-    out_stats->total_allocator_bytes = dbs::g_allocator_bytes.load(std::memory_order_relaxed);
-    return 0;
+    return guarded(nullptr, [&] {
+        require(handle != nullptr && out_stats != nullptr, "handle and out_stats cannot be null");
+        std::lock_guard<std::mutex> lock(handle->stats_mutex);
+        *out_stats = handle->stats;
+        out_stats->total_allocator_calls = dbs::g_allocator_calls.load(std::memory_order_relaxed);
+        out_stats->total_allocator_bytes = dbs::g_allocator_bytes.load(std::memory_order_relaxed);
+    });
 }
 
-
 extern "C" DBS_EXPORT int dbs_get_stats_json(DBSDecoderHandle* handle, char* out_json, int64_t out_json_capacity) {
-    if (!handle || !out_json || out_json_capacity <= 0) return -1;
+    if (!handle || !out_json || out_json_capacity <= 0) {
+        return fail(nullptr, "handle and out_json cannot be null, and the capacity must be positive", 1, DBS_ERROR_INVALID_ARGUMENT);
+    }
     DBSStatsC s{};
-    if (dbs_get_stats(handle, &s) != 0) return -1;
+    const int rc = dbs_get_stats(handle, &s);
+    if (rc != DBS_OK) return rc;
     const int n = std::snprintf(
         out_json,
         static_cast<size_t>(out_json_capacity),
@@ -1150,30 +1146,29 @@ extern "C" DBS_EXPORT int dbs_get_stats_json(DBSDecoderHandle* handle, char* out
         static_cast<long long>(s.last_sparse_grad_count),
         static_cast<long long>(s.total_allocator_calls),
         static_cast<long long>(s.total_allocator_bytes));
-    if (n < 0) return -2;
+    if (n < 0) return fail(nullptr, "formatting stats failed", 2, DBS_ERROR_RUNTIME);
     return n < out_json_capacity ? 0 : 1;
 }
 
 extern "C" DBS_EXPORT int dbs_is_deterministic() {
-    // Reports the implementation contract: hard decode uses deterministic
-    // score/raw-score/parent/token/length/from-logprob ordering and no RNG.
-    // This is not a runtime proof over arbitrary caller-provided inputs.
     return 1;
 }
 
 extern "C" DBS_EXPORT int dbs_set_deterministic_seed(DBSDecoderHandle* handle, uint64_t seed) {
-    if (!handle) return -1;
-    handle->deterministic_seed = seed;
-    return 0;
+    return guarded(nullptr, [&] {
+        require(handle != nullptr, "handle cannot be null");
+        handle->deterministic_seed.store(seed, std::memory_order_relaxed);
+    });
 }
 
 extern "C" DBS_EXPORT uint64_t dbs_get_deterministic_seed(DBSDecoderHandle* handle) {
-    return handle ? handle->deterministic_seed : 0;
+    return handle ? handle->deterministic_seed.load(std::memory_order_relaxed) : 0;
 }
 
 extern "C" DBS_EXPORT void dbs_allocator_counters_reset() {
+    // The byte count is a gauge of live allocations: resetting it would make it
+    // go negative as those allocations are freed.
     dbs::g_allocator_calls.store(0, std::memory_order_relaxed);
-    dbs::g_allocator_bytes.store(0, std::memory_order_relaxed);
 }
 
 extern "C" DBS_EXPORT int64_t dbs_allocator_call_count() {

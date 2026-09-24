@@ -1,8 +1,9 @@
 [build-system]
 # PyTorch is needed at build time for the extension headers. Build without
 # isolation (`pip install --no-build-isolation .`) so the extension is compiled
-# against the torch you will import at runtime.
-requires = ["setuptools>=77", "wheel", "torch>=2.1"]
+# against the torch you will import at runtime; beamgrad checks at import time
+# that the two match.
+requires = ["setuptools>=77", "wheel", "torch>=2.4"]
 build-backend = "setuptools.build_meta"
 
 [project]
@@ -14,7 +15,7 @@ license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Maged Amr" }]
 requires-python = ">=3.10"
-dependencies = ["torch>=2.1"]
+dependencies = ["torch>=2.4"]
 keywords = ["beam search", "differentiable", "pytorch", "cuda", "sequence generation", "surrogate gradients"]
 classifiers = [
     "Development Status :: 4 - Beta",

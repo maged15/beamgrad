@@ -3,6 +3,7 @@ dbs_allocator_byte_count
 dbs_allocator_call_count
 dbs_allocator_counters_reset
 dbs_backward
+dbs_backward_batch_into
 dbs_backward_default
 dbs_backward_dense
 dbs_backward_grad_initial_scores
@@ -20,11 +21,13 @@ dbs_create
 dbs_create_ex
 dbs_decode
 dbs_decode_batch
+dbs_decode_batch_into
 dbs_decode_batch_typed
 dbs_decode_batch_variable
 dbs_decode_constrained
 dbs_decode_constrained_ex
 dbs_decode_model_steps
+dbs_decode_model_steps_ex
 dbs_decode_model_steps_with_workspace
 dbs_decode_typed
 dbs_destroy
@@ -68,7 +71,6 @@ dbs_result_vocab_size
 dbs_result_weights
 dbs_selected_kernel_name
 dbs_set_deterministic_seed
-dbs_validate_production_gate_manifest
 dbs_version_string
 dbs_workspace_allocated_bytes
 dbs_workspace_create

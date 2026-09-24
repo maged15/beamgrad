@@ -6,7 +6,7 @@ surrogate gradients backward, native on CPU and CUDA.
 [![CI](https://github.com/maged15/beamgrad/actions/workflows/ci.yml/badge.svg)](https://github.com/maged15/beamgrad/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 ![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue)
-![PyTorch 2.1+](https://img.shields.io/badge/PyTorch-2.1%2B-ee4c2c)
+![PyTorch 2.4+](https://img.shields.io/badge/PyTorch-2.4%2B-ee4c2c)
 
 Beam search is how sequence models decode, but it is discrete: top-k selection
 has no useful gradient. So models are usually trained with teacher forcing,
@@ -34,8 +34,9 @@ best = beamgrad.backtrack(trace)[:, 0]                  # [B, T] best sequence p
 ## Features
 
 - **Exact beam search.** GNMT length penalty, EOS handling (finished beams are
-  carried forward and keep competing), minimum length, and variable-length
-  batches. A strict total order on candidates makes results deterministic.
+  carried forward and keep competing), minimum length, variable-length
+  batches, banned tokens, n-gram blocking and a repetition penalty. A strict
+  total order on candidates makes results deterministic.
 - **Gradients through the search.** Each final score is differentiated along
   the path that produced it (see [how it works](docs/algorithm.md)). The
   gradients match the C reference bit for bit and agree with finite
@@ -43,12 +44,18 @@ best = beamgrad.backtrack(trace)[:, 0]                  # [B, T] best sequence p
 - **Native everywhere.** CPU kernels are multi-threaded across the batch and
   pick AVX-512, AVX2, SSE4.2 or NEON at runtime. A CUDA engine runs forward
   and backward on the GPU for beams up to 1024, on PyTorch's stream and
-  allocator. Every backend selects the same beams.
-- **A stable C ABI.** `libdbs` works from C, C++ or any FFI. It adds
-  constraints (banned and forced tokens, repetition penalty, n-gram blocking,
-  callbacks), fp16/bf16 input, model-callback decoding, and two extra smooth
-  surrogates: selected-beam softmax weights and a relaxed top-k pool.
-- **Also in JAX**, through a custom VJP (`beamgrad.jax.final_scores`).
+  allocator. Every backend selects the same beams with the same scores, bit
+  for bit.
+- **A good PyTorch citizen.** The operators are registered with
+  `torch.library`, with fake-tensor, autograd and vmap rules: `torch.compile`
+  (even `fullgraph=True`), `torch.export` and `torch.vmap` work.
+- **A stable C ABI.** `libdbs` works from C, C++ or any FFI. It adds forced
+  tokens and token-filter callbacks, fp16/bf16 input, incremental
+  model-callback decoding (with each beam's parent, for KV-cache reordering),
+  and two extra smooth surrogates: selected-beam softmax weights and a
+  relaxed top-k pool.
+- **Also in JAX**, through a custom VJP (`beamgrad.jax.final_scores`), with
+  `jit`, `grad` and `vmap`.
 
 ## Installation
 
@@ -59,10 +66,12 @@ pip install torch
 pip install --no-build-isolation "git+https://github.com/maged15/beamgrad"
 ```
 
-If a CUDA toolkit (`nvcc`) is available, the CUDA operators are built
-automatically; `BEAMGRAD_CUDA=1` makes them required and `BEAMGRAD_CUDA=0`
-skips them. `beamgrad.cuda_available()` reports what you got. For the C
-library alone, use CMake (see [the C API](docs/c-api.md)).
+`--no-build-isolation` matters: the compiled operators only work with the
+PyTorch they were built against, and `import beamgrad` says so (with the fix)
+if the two differ. If a CUDA toolkit (`nvcc`) is available, the CUDA operators
+are built automatically; `BEAMGRAD_CUDA=1` makes them required and
+`BEAMGRAD_CUDA=0` skips them. `beamgrad.cuda_available()` reports what you
+got. For the C library alone, use CMake (see [the C API](docs/c-api.md)).
 
 ## How it works
 
@@ -145,8 +154,8 @@ The complete version, with error handling, is
   selection and do not model how the selection itself would change.
 - `final_scores` consumes a precomputed `[T, K, V]` tensor. When each row
   depends on its beam's prefix, the model has to produce those rows during
-  decoding. The C ABI's callback decoder does this by re-running the prefix
-  each step, which suits experiments more than serving.
+  decoding: the C ABI's `dbs_decode_model_steps_ex` asks a callback for each
+  step's rows and tells it which beam each row continues.
 - CUDA supports beams up to 1024 and about 268M candidates (`K × V`) per step.
 
 ## Contributing

@@ -34,12 +34,9 @@ CASES = [
 
 
 def assert_same_decode(cuda_out, cpu_out):
-    for name in ("tokens", "parents", "lengths", "from_logprob", "final_lengths", "steps"):
+    # Bit for bit: the backends share the length penalty and use no fused multiply-add.
+    for name in cuda_out._fields:
         assert torch.equal(getattr(cuda_out, name).cpu(), getattr(cpu_out, name)), name
-    for name in ("final_scores", "final_raw_scores", "scores", "raw_scores"):
-        torch.testing.assert_close(
-            getattr(cuda_out, name).cpu(), getattr(cpu_out, name), rtol=1e-6, atol=1e-6, msg=name
-        )
 
 
 @pytest.mark.parametrize("shape,options", CASES)
@@ -60,7 +57,7 @@ def test_gradients_match_cpu(shape, options):
     assert y.is_cuda
     (y * weights.cuda()).sum().backward()
     assert gpu.grad.is_cuda
-    torch.testing.assert_close(gpu.grad.cpu(), cpu.grad, rtol=1e-6, atol=1e-6)
+    assert torch.equal(gpu.grad.cpu(), cpu.grad)
 
 
 def test_variable_steps_match_cpu():
@@ -72,13 +69,13 @@ def test_variable_steps_match_cpu():
     final_scores(cpu, options, steps=steps).sum().backward()
     gpu = x.cuda().requires_grad_(True)
     final_scores(gpu, options, steps=torch.tensor(steps, device="cuda")).sum().backward()
-    torch.testing.assert_close(gpu.grad.cpu(), cpu.grad, rtol=1e-6, atol=1e-6)
+    assert torch.equal(gpu.grad.cpu(), cpu.grad)
 
 
 def test_unbatched_and_half_precision():
     x = random_log_probs(5, 3, 257, seed=4)
     options = BeamOptions(beam_size=3)
-    torch.testing.assert_close(final_scores(x.cuda(), options).cpu(), final_scores(x, options), rtol=1e-6, atol=1e-6)
+    assert torch.equal(final_scores(x.cuda(), options).cpu(), final_scores(x, options))
     for dtype in (torch.float16, torch.bfloat16):
         xh = x.cuda().to(dtype).requires_grad_(True)
         final_scores(xh, options).sum().backward()
@@ -94,13 +91,13 @@ def test_runs_on_the_current_stream():
     with torch.cuda.stream(stream):
         y = final_scores(x, options)
     torch.cuda.current_stream().wait_stream(stream)
-    torch.testing.assert_close(y, expected, rtol=0, atol=0)
+    assert torch.equal(y, expected)
 
 
 def test_debug_synchronization(monkeypatch):
     monkeypatch.setenv("DBS_CUDA_SYNC_CHECK", "1")
     x = random_log_probs(2, 3, 2, 64, seed=6)
-    torch.testing.assert_close(
+    assert torch.equal(
         final_scores(x.cuda(), BeamOptions(beam_size=2)).cpu(), final_scores(x, BeamOptions(beam_size=2))
     )
 
@@ -110,7 +107,7 @@ def test_second_device():
     x = random_log_probs(2, 4, 3, 100, seed=8)
     y = final_scores(x.to("cuda:1"), BeamOptions(beam_size=3))
     assert y.device == torch.device("cuda:1")
-    torch.testing.assert_close(y.cpu(), final_scores(x, BeamOptions(beam_size=3)), rtol=1e-6, atol=1e-6)
+    assert torch.equal(y.cpu(), final_scores(x, BeamOptions(beam_size=3)))
 
 
 def test_errors():
@@ -120,3 +117,42 @@ def test_errors():
     x[0, 0, 0] = float("nan")
     with pytest.raises(ValueError, match="NaN"):
         final_scores(x, BeamOptions(beam_size=2))
+
+
+@pytest.mark.parametrize("K", [3, 16, 17, 40])
+def test_constraints_match_cpu(K):
+    x = random_log_probs(2, 9, K, 12, seed=K, ties=True)
+    options = BeamOptions(
+        beam_size=K,
+        eos_token=11,
+        length_penalty_alpha=0.5,
+        banned_tokens=[2, 7],
+        no_repeat_ngram_size=2,
+        repetition_penalty=1.5,
+    )
+    assert_same_decode(decode(x.cuda(), options), decode(x, options))
+    cpu = x.clone().requires_grad_(True)
+    final_scores(cpu, options).sum().backward()
+    gpu = x.cuda().requires_grad_(True)
+    final_scores(gpu, options).sum().backward()
+    assert torch.equal(gpu.grad.cpu(), cpu.grad)
+
+
+def test_validation_on_device():
+    x = random_log_probs(2, 3, 2, 16).cuda()
+    x[0, 0, 1, 4] = float("nan")  # beam 1 is not live at step 0: never read
+    final_scores(x, BeamOptions(beam_size=2))
+    x[1, 1, 0, 3] = float("inf")
+    with pytest.raises(ValueError, match="example 1"):
+        final_scores(x, BeamOptions(beam_size=2))
+
+
+def test_torch_compile():
+    options = BeamOptions(beam_size=4, eos_token=3)
+    x = random_log_probs(2, 6, 4, 300, seed=9).cuda()
+    compiled = torch.compile(lambda y: final_scores(y, options), fullgraph=True)
+    a = x.clone().requires_grad_(True)
+    b = x.clone().requires_grad_(True)
+    final_scores(a, options).sum().backward()
+    compiled(b).sum().backward()
+    assert torch.equal(a.grad, b.grad)

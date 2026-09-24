@@ -4,8 +4,8 @@
 
 The project is renamed **beamgrad** (previously `differentiable-beam-search-cuda`
 and the `dbs-torch` Python package). The C library keeps its name, `libdbs`,
-and its binary interface: C ABI version 10 and the exported symbol set are
-unchanged.
+and C ABI version 10. Every symbol of the 0.5 baseline is still exported;
+three functions are added and one no-op stub is removed (see below).
 
 ### Highlights
 
@@ -21,13 +21,34 @@ unchanged.
   compile out, so CI had been running empty test bodies. They now always run.
   The CUDA kernels are verified without a GPU by running the unmodified kernel
   source through a CPU emulation layer, checked bit for bit against the CPU
-  decoder.
+  decoder under several thread schedules.
+- **Constraints everywhere.** Banned tokens, n-gram blocking and a repetition
+  penalty are available from Python on CPU, CUDA and JAX. Their per-beam token
+  sets are computed once per step instead of scanning the prefix for every
+  candidate (n-gram blocking at T=32, K=4, V=32k: 57 ms to 0.7 ms on CPU).
+- **PyTorch integration.** The operators are registered with `torch.library`
+  (fake tensors, autograd, vmap), so `torch.compile`, `torch.export` and
+  `torch.vmap` work. Input validation runs inside the decode kernels.
 
 ### Added
 
 - `dbs_cuda_decode` / `dbs_cuda_backward` with workspace-size queries,
-  per-example metadata, optional trace outputs, and asynchronous execution
-  (`DBS_CUDA_SYNC_CHECK=1` synchronizes for debugging).
+  per-example metadata, constraints, NaN/`+inf` flags, optional trace outputs,
+  and asynchronous execution (`DBS_CUDA_SYNC_CHECK=1` synchronizes for
+  debugging).
+- `dbs_decode_model_steps_ex`: incremental model-step decoding whose callback
+  learns each beam's parent slot, length, finished flag and token prefix (so a
+  model can reorder per-beam state), with optional constraints. The original
+  `dbs_decode_model_steps` also runs incrementally now (`T` callbacks instead
+  of re-decoding every prefix).
+- `dbs_decode_batch_into` / `dbs_backward_batch_into`: batch decoding and the
+  final-score backward on caller-owned arrays, with per-example steps and
+  constraints, used by the PyTorch CPU operators and by JAX.
+- `DBS_OK` / `DBS_ERROR_*` status constants.
+- `BeamOptions.banned_tokens`, `no_repeat_ngram_size`, `repetition_penalty`;
+  `steps=` and `vmap` in `beamgrad.jax.final_scores`.
+- An import-time check that beamgrad was compiled against the installed
+  PyTorch, with the command that fixes a mismatch.
 - `beamgrad.BeamOptions`, `final_scores`, `decode`, `backtrack`,
   `BeamSearchOutput`, `cuda_available`, `CUDA_MAX_BEAM`;
   `beamgrad.jax.final_scores`.
@@ -50,21 +71,56 @@ unchanged.
 - `dbs_create_ex` rejects negative or non-finite options instead of silently
   replacing them with defaults. Zero-initialised fields still select
   defaults.
-- The GNMT length penalty is evaluated in double precision and rounded once,
-  so CPU and GPU agree bit for bit. Scores with `length_penalty_alpha != 0`
+- The GNMT length penalty is evaluated in double precision from basic IEEE
+  operations (no `pow`) and rounded once, in a header the CPU and CUDA code
+  share, so the two agree bit for bit. Scores with `length_penalty_alpha != 0`
   can differ from 1.x in the last bit.
+- The softmax, dot product and sigmoid of the C-level surrogates are scalar on
+  every kernel path (the AVX-512 path used a different `exp`), and the core is
+  compiled without floating-point contraction, so results do not depend on
+  the SIMD path. The row scan keeps its SIMD paths, now for banned tokens and
+  EOS masking too, and a NEON path.
+- Input validation (`validate_inputs`) checks every element of every row the
+  search reads, during the scan, in C, PyTorch (CPU and CUDA) and JAX.
+  Previously the C library sampled 1000 entries, JAX did not check at all, and
+  PyTorch made three extra passes over the tensor.
+- The relaxed top-k pool is opt-in (`relaxed_pool_multiplier` defaults to 0):
+  keeping `8 * K` candidates per step made every decode pay for it
+  (K=64: 3.4 ms to 0.9 ms; K=256: 24 ms to 4 ms). `vocab_block` is ignored.
+- Invalid arguments and inputs return `-1` as the header documents (they
+  returned `-2`), and every failing call records its own error message.
+- CUDA: beams up to 16 use a register top-k scan instead of sorting every
+  4096-candidate tile, and the backward processes the beams of a step in
+  parallel (deterministically) instead of one thread per example.
+- `dbs_decode_batch*` run on the calling thread as well and do not start
+  threads for a single example; variable batches read smaller beams in place
+  instead of copying them.
+- PyTorch 2.4 or newer is required (for `torch.library.register_fake` and
+  `register_autograd`).
 - SIMD scans pass candidates tied with the pool threshold to the exact
   comparator, so every ISA path matches the scalar reference in all tie cases.
 - `dbs_last_error` returns a thread-local copy, so the pointer stays valid if
   another thread records an error on the same decoder.
 - The CUDA API is reduced to `dbs_cuda_decode` / `dbs_cuda_backward` and is
   asynchronous by default; its header carries export macros.
-- Python `validate_inputs` checks every element on both devices (CPU used to
-  sample 1000).
 - Python 3.10 or newer is required.
+- The C ABI's relaxed pool, `vocab_block` and status-code changes are listed
+  above; code that sets `relaxed_pool_multiplier` explicitly, or only checks
+  for a non-zero status, is unaffected.
 
 ### Fixed
 
+- Backward rejected results whose beam size differed from the decoder's, so
+  examples of `dbs_decode_batch_variable` with their own beam sizes could not
+  be differentiated.
+- `dbs_result_validate_deterministic_order` skipped the raw-score tie-break
+  and reported the decoder's own output as out of order (with a length
+  penalty and EOS).
+- `dbs_allocator_counters_reset` zeroed the live byte count, which then went
+  negative as allocations were freed; it now resets only the call count.
+- Early failures (null handle or output pointer) returned without recording
+  an error, so `dbs_last_global_error()` showed the previous call's message.
+- `dbs_set_deterministic_seed` wrote the seed without synchronization.
 - The CPU-only `libdbs_cuda` stub exported no symbols (hidden visibility and
   no export macros) and lacked five declared functions, so linking against it
   failed.
@@ -77,6 +133,9 @@ unchanged.
 
 ### Removed
 
+- `dbs_validate_production_gate_manifest`, a stub that always failed.
+- The test-only SIMD parity hooks, which were compiled into every build of the
+  library; the parity tests now live in `tests/internal_tests.cpp`.
 - The `torch_dbs_extension`, `torch_dbs` and `jax_dbs` modules (use
   `beamgrad`, `beamgrad._ctypes` and `beamgrad.jax`).
 - `dbs_cuda_decode_forward*`, `dbs_cuda_decode_forward_variable`,

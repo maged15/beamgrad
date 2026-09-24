@@ -431,6 +431,7 @@ static void test_golden_output() {
 static void test_allocator_counters_and_seed() {
     dbs_allocator_counters_reset();
     CHECK(dbs_allocator_call_count() == 0);
+    CHECK(dbs_allocator_byte_count() >= 0);
     auto* h = make_decoder();
     CHECK(dbs_set_deterministic_seed(h, 123456789ULL) == 0);
     CHECK(dbs_get_deterministic_seed(h) == 123456789ULL);
@@ -528,7 +529,13 @@ static void test_zero_initialized_options_select_defaults() {
     DBSResultHandle* r = nullptr;
     CHECK(dbs_decode(h, x.data(), T, V, &r) == 0);
     CHECK(dbs_result_beam_size(r) == K);
-    CHECK(dbs_result_pool_size(r) == K * 8);
+    CHECK(dbs_result_pool_size(r) == 0);  // the relaxed pool is opt-in
+    CHECK(dbs_result_relaxed_weights(r) == nullptr);
+    float grad_relaxed[1] = {1.0f};
+    DBSBackwardHandle* b = nullptr;
+    CHECK(dbs_backward(h, r, nullptr, grad_relaxed, nullptr, &b) == DBS_ERROR_INVALID_ARGUMENT);
+    CHECK(b == nullptr);
+    CHECK(std::strstr(dbs_last_error(h), "relaxed_pool_multiplier") != nullptr);
     dbs_free_result(r);
     dbs_destroy(h);
 }
@@ -536,7 +543,7 @@ static void test_zero_initialized_options_select_defaults() {
 static void test_invalid_options_are_rejected() {
     const auto rejects = [](DBSOptionsC opt, const char* fragment) {
         DBSDecoderHandle* h = nullptr;
-        CHECK(dbs_create_ex(opt, &h) != 0);
+        CHECK(dbs_create_ex(opt, &h) == DBS_ERROR_INVALID_ARGUMENT);
         CHECK(h == nullptr);
         CHECK(std::strstr(dbs_last_global_error(), fragment) != nullptr);
     };
@@ -576,11 +583,308 @@ static void test_last_error_is_reported_per_handle() {
     dbs_destroy(h);
 }
 
-static void test_deprecated_production_manifest_api_fails_closed() {
-    char err[256];
-    const char* manifest = "{\"cuda_parity\":true}";
-    CHECK(dbs_validate_production_gate_manifest(manifest, err, sizeof(err)) != 0);
-    CHECK(std::strstr(err, "deprecated") != nullptr);
+static void test_error_codes_match_the_header() {
+    auto* h = make_decoder();
+    DBSResultHandle* r = nullptr;
+    std::vector<float> x(2 * 2 * 4, -1.0f);
+    CHECK(dbs_decode(h, nullptr, 2, 4, &r) == DBS_ERROR_INVALID_ARGUMENT);
+    CHECK(dbs_decode(h, x.data(), 0, 4, &r) == DBS_ERROR_INVALID_ARGUMENT);
+    CHECK(dbs_decode(h, x.data(), 2, -3, &r) == DBS_ERROR_INVALID_ARGUMENT);
+    CHECK(dbs_decode(h, x.data(), 2, 4, nullptr) == DBS_ERROR_INVALID_ARGUMENT);
+    CHECK(dbs_decode(nullptr, x.data(), 2, 4, &r) == DBS_ERROR_INVALID_ARGUMENT);
+    x[1] = std::numeric_limits<float>::quiet_NaN();
+    CHECK(dbs_decode(h, x.data(), 2, 4, &r) == DBS_ERROR_INVALID_ARGUMENT);
+    DBSStatsC stats{};
+    CHECK(dbs_get_stats(h, &stats) == DBS_OK);
+    CHECK(stats.last_error_category == 1);
+    // A callback failure is a runtime error.
+    const DBSModelStepExFn failing = [](void*, const DBSModelStepInfoC*, float*) { return 7; };
+    CHECK(dbs_decode_model_steps_ex(h, failing, nullptr, 0, 2, 4, nullptr, &r) == DBS_ERROR_RUNTIME);
+    CHECK(r == nullptr);
+    CHECK(std::strstr(dbs_last_error(h), "callback") != nullptr);
+    dbs_destroy(h);
+}
+
+static void test_every_failure_reports_its_own_error() {
+    auto* h = make_decoder();
+    DBSResultHandle* r = nullptr;
+    CHECK(dbs_decode(h, nullptr, 1, 4, &r) != 0);
+    CHECK(std::strstr(dbs_last_global_error(), "log_probs") != nullptr);
+    // Early failures (null handle, null output) replace the previous message.
+    CHECK(dbs_decode(nullptr, nullptr, 1, 4, &r) != 0);
+    CHECK(std::strstr(dbs_last_global_error(), "handle") != nullptr);
+    CHECK(dbs_backward(h, nullptr, nullptr, nullptr, nullptr, nullptr) != 0);
+    CHECK(std::strstr(dbs_last_global_error(), "out_backward") != nullptr);
+    CHECK(dbs_get_stats(nullptr, nullptr) != 0);
+    CHECK(std::strstr(dbs_last_global_error(), "out_stats") != nullptr);
+    CHECK(dbs_workspace_reserve(nullptr, 1, 1) != 0);
+    CHECK(std::strstr(dbs_last_global_error(), "workspace") != nullptr);
+    // Success clears the thread's message.
+    std::vector<float> x(2 * 4, -1.0f);
+    CHECK(dbs_decode(h, x.data(), 1, 4, &r) == 0);
+    CHECK(dbs_last_global_error()[0] == '\0');
+    dbs_free_result(r);
+    dbs_destroy(h);
+}
+
+static void test_deterministic_order_accepts_decoder_output() {
+    // Length penalty plus EOS carry-forward produce score ties broken by the raw score.
+    uint32_t seed = 12345u;
+    auto next = [&seed]() { seed = seed * 1664525u + 1013904223u; return seed >> 8; };
+    for (int trial = 0; trial < 300; ++trial) {
+        DBSOptionsC opt = test_options();
+        opt.beam_size = 1 + static_cast<int>(next() % 6);
+        opt.eos_token = static_cast<int>(next() % 3);
+        opt.length_penalty_alpha = (next() % 2) ? 0.6f : 1.0f;
+        opt.min_length = static_cast<int>(next() % 3);
+        DBSDecoderHandle* h = nullptr;
+        CHECK(dbs_create_ex(opt, &h) == 0);
+        const int T = 1 + static_cast<int>(next() % 6), V = 3 + static_cast<int>(next() % 6);
+        std::vector<float> x(static_cast<size_t>(T) * opt.beam_size * V);
+        for (float& v : x) v = -0.5f * static_cast<float>(next() % 5);
+        DBSResultHandle* r = nullptr;
+        CHECK(dbs_decode(h, x.data(), T, V, &r) == 0);
+        CHECK(dbs_result_validate_deterministic_order(r) == 0);
+        dbs_free_result(r);
+        dbs_destroy(h);
+    }
+}
+
+static void test_allocator_gauge_survives_reset() {
+    auto* h = make_decoder();
+    std::vector<float> x(3 * 2 * 8, -1.0f);
+    DBSResultHandle* r = nullptr;
+    CHECK(dbs_decode(h, x.data(), 3, 8, &r) == 0);
+    const int64_t live = dbs_allocator_byte_count();
+    CHECK(live > 0);
+    dbs_allocator_counters_reset();
+    CHECK(dbs_allocator_call_count() == 0);
+    CHECK(dbs_allocator_byte_count() == live);
+    dbs_free_result(r);
+    CHECK(dbs_allocator_byte_count() >= 0);
+    CHECK(dbs_allocator_byte_count() < live);
+    dbs_destroy(h);
+}
+
+static void test_variable_beam_batch_backward() {
+    // Examples decoded with their own beam sizes go through backward on the
+    // batch's handle, and match a handle created for that beam size.
+    DBSOptionsC opt = test_options();
+    opt.beam_size = 4;
+    DBSDecoderHandle* h = nullptr;
+    CHECK(dbs_create_ex(opt, &h) == 0);
+    constexpr int B = 2, maxT = 3, maxK = 4, V = 6;
+    std::vector<float> x(static_cast<size_t>(B) * maxT * maxK * V);
+    for (size_t i = 0; i < x.size(); ++i) x[i] = -0.1f * static_cast<float>((i * 7) % 13);
+    int32_t steps[B] = {3, 2};
+    int32_t beams[B] = {2, 4};
+    DBSBatchResultHandle* br = nullptr;
+    CHECK(dbs_decode_batch_variable(h, x.data(), B, maxT, maxK, V, steps, beams, nullptr, nullptr, nullptr, nullptr, 1, &br) == 0);
+    const DBSResultHandle* r0 = dbs_batch_result_at(br, 0);
+    CHECK(dbs_result_beam_size(r0) == 2);
+
+    float grad_final[2] = {1.0f, -0.5f};
+    DBSBackwardHandle* b = nullptr;
+    CHECK(dbs_backward(h, r0, nullptr, nullptr, grad_final, &b) == 0);
+    DBSBackwardHandle* dense = nullptr;
+    CHECK(dbs_backward_dense(h, r0, nullptr, nullptr, grad_final, &dense) == 0);
+
+    // The same example decoded on its own with a beam-2 handle.
+    DBSOptionsC opt2 = test_options();
+    opt2.beam_size = 2;
+    DBSDecoderHandle* h2 = nullptr;
+    CHECK(dbs_create_ex(opt2, &h2) == 0);
+    std::vector<float> x0;
+    for (int t = 0; t < 3; ++t) {
+        for (int k = 0; k < 2; ++k) {
+            const float* row = x.data() + (static_cast<size_t>(t) * maxK + static_cast<size_t>(k)) * V;
+            x0.insert(x0.end(), row, row + V);
+        }
+    }
+    DBSResultHandle* r2 = nullptr;
+    CHECK(dbs_decode(h2, x0.data(), 3, V, &r2) == 0);
+    for (int i = 0; i < 3 * 2; ++i) CHECK(dbs_result_tokens(r2)[i] == dbs_result_tokens(r0)[i]);
+    DBSBackwardHandle* b2 = nullptr;
+    CHECK(dbs_backward(h2, r2, nullptr, nullptr, grad_final, &b2) == 0);
+    CHECK(dbs_backward_sparse_logprob_count(b) == dbs_backward_sparse_logprob_count(b2));
+    for (int64_t i = 0; i < dbs_backward_sparse_logprob_count(b); ++i) {
+        CHECK(dbs_backward_sparse_logprob_indices(b)[i] == dbs_backward_sparse_logprob_indices(b2)[i]);
+        CHECK(dbs_backward_sparse_logprob_values(b)[i] == dbs_backward_sparse_logprob_values(b2)[i]);
+        CHECK(dbs_backward_grad_log_probs(dense)[dbs_backward_sparse_logprob_indices(b)[i]] == dbs_backward_sparse_logprob_values(b)[i]);
+    }
+    dbs_free_backward(b);
+    dbs_free_backward(b2);
+    dbs_free_backward(dense);
+    dbs_free_result(r2);
+    dbs_free_batch_result(br);
+    dbs_destroy(h2);
+    dbs_destroy(h);
+}
+
+struct RecordingModel {
+    int K = 0;
+    int V = 0;
+    std::vector<float> rows;  // every step's rows, as produced
+    bool consistent = true;
+};
+
+// Next-token scores that depend on the whole prefix of each beam.
+static int prefix_model(void* user_data, const DBSModelStepInfoC* info, float* out) {
+    auto* m = static_cast<RecordingModel*>(user_data);
+    for (int k = 0; k < info->beam_size; ++k) {
+        uint32_t h = 2166136261u;
+        for (int s = 0; s < info->step; ++s) {
+            h = (h ^ static_cast<uint32_t>(info->prefixes[static_cast<size_t>(k) * info->step + s] + 3)) * 16777619u;
+        }
+        if (info->step > 0 && info->parents[k] >= 0) {
+            m->consistent = m->consistent && info->prefixes[static_cast<size_t>(k) * info->step + info->step - 1] == info->tokens[k];
+        }
+        for (int v = 0; v < info->vocab_size; ++v) {
+            h = (h ^ static_cast<uint32_t>(v)) * 16777619u;
+            out[static_cast<size_t>(k) * info->vocab_size + v] = -static_cast<float>(h % 89u) / 8.0f;
+        }
+    }
+    m->rows.insert(m->rows.end(), out, out + static_cast<size_t>(info->beam_size) * info->vocab_size);
+    return 0;
+}
+
+static void test_model_steps_ex_tracks_beam_prefixes() {
+    DBSOptionsC opt = test_options();
+    opt.beam_size = 3;
+    opt.eos_token = 2;
+    opt.length_penalty_alpha = 0.6f;
+    DBSDecoderHandle* h = nullptr;
+    CHECK(dbs_create_ex(opt, &h) == 0);
+    constexpr int T = 6, V = 7;
+    RecordingModel model;
+    DBSResultHandle* r = nullptr;
+    CHECK(dbs_decode_model_steps_ex(h, prefix_model, &model, 0, T, V, nullptr, &r) == 0);
+    CHECK(model.consistent);
+    CHECK(model.rows.size() == static_cast<size_t>(T) * 3 * V);
+    // Decoding the rows the model produced gives the same beams.
+    DBSResultHandle* r2 = nullptr;
+    CHECK(dbs_decode(h, model.rows.data(), T, V, &r2) == 0);
+    for (int i = 0; i < T * 3; ++i) {
+        CHECK(dbs_result_tokens(r)[i] == dbs_result_tokens(r2)[i]);
+        CHECK(dbs_result_parents(r)[i] == dbs_result_parents(r2)[i]);
+    }
+    for (int k = 0; k < 3; ++k) CHECK(dbs_result_final_scores(r)[k] == dbs_result_final_scores(r2)[k]);
+    // Constraints apply to model-driven decoding too.
+    DBSAdvancedConstraintsC c{};
+    c.min_length = -1;
+    c.no_repeat_ngram_size = 1;
+    RecordingModel constrained;
+    DBSResultHandle* r3 = nullptr;
+    CHECK(dbs_decode_model_steps_ex(h, prefix_model, &constrained, 0, T, V, &c, &r3) == 0);
+    const int32_t* tok = dbs_result_tokens(r3);
+    const int32_t* par = dbs_result_parents(r3);
+    for (int k = 0; k < 3; ++k) {
+        // Walk back the final beam: no token may repeat (EOS carry-forward aside).
+        std::vector<int> seen(V, 0);
+        int beam = k;
+        for (int t = T - 1; t >= 0 && beam >= 0; --t) {
+            const int token = tok[t * 3 + beam];
+            const int parent = par[t * 3 + beam];
+            const bool carried = t > 0 && parent >= 0 && tok[(t - 1) * 3 + parent] == 2 && token == 2;
+            if (!carried && token >= 0) CHECK(++seen[token] == 1);
+            beam = parent;
+        }
+    }
+    dbs_free_result(r);
+    dbs_free_result(r2);
+    dbs_free_result(r3);
+    dbs_destroy(h);
+}
+
+static void test_batch_into_matches_result_handles() {
+    DBSOptionsC opt = test_options();
+    opt.beam_size = 3;
+    opt.eos_token = 1;
+    opt.min_length = 2;
+    opt.length_penalty_alpha = 0.8f;
+    DBSDecoderHandle* h = nullptr;
+    CHECK(dbs_create_ex(opt, &h) == 0);
+    constexpr int B = 4, T = 5, K = 3, V = 9;
+    std::vector<float> x(static_cast<size_t>(B) * T * K * V);
+    for (size_t i = 0; i < x.size(); ++i) x[i] = -0.05f * static_cast<float>((i * 31) % 17);
+    int32_t steps[B] = {5, 1, 3, 5};
+
+    std::vector<float> final_scores(B * K), final_raw(B * K), scores(B * T * K), raw(B * T * K);
+    std::vector<int32_t> final_lengths(B * K), tokens(B * T * K), parents(B * T * K), lengths(B * T * K);
+    std::vector<uint8_t> from_logprob(B * T * K);
+    DBSDecodeOutputsC out{};
+    out.final_scores = final_scores.data();
+    out.final_raw_scores = final_raw.data();
+    out.final_lengths = final_lengths.data();
+    out.tokens = tokens.data();
+    out.parents = parents.data();
+    out.lengths = lengths.data();
+    out.scores = scores.data();
+    out.raw_scores = raw.data();
+    out.from_logprob = from_logprob.data();
+    CHECK(dbs_decode_batch_into(h, x.data(), B, T, V, steps, nullptr, 3, &out) == 0);
+
+    std::vector<float> grad_final(B * K);
+    for (size_t i = 0; i < grad_final.size(); ++i) grad_final[i] = 0.25f * static_cast<float>(i % 5) - 0.5f;
+    std::vector<float> grad(x.size(), 0.0f);
+    CHECK(dbs_backward_batch_into(h, B, T, V, steps, parents.data(), tokens.data(), lengths.data(), from_logprob.data(),
+                                  grad_final.data(), 2, grad.data()) == 0);
+
+    for (int b = 0; b < B; ++b) {
+        DBSResultHandle* r = nullptr;
+        CHECK(dbs_decode(h, x.data() + static_cast<size_t>(b) * T * K * V, steps[b], V, &r) == 0);
+        for (int i = 0; i < T * K; ++i) {
+            const size_t o = static_cast<size_t>(b) * T * K + static_cast<size_t>(i);
+            if (i < steps[b] * K) {
+                CHECK(tokens[o] == dbs_result_tokens(r)[i] && parents[o] == dbs_result_parents(r)[i]);
+                CHECK(lengths[o] == dbs_result_lengths(r)[i] && scores[o] == dbs_result_scores(r)[i]);
+                CHECK(raw[o] == dbs_result_raw_scores(r)[i]);
+            } else {
+                CHECK(tokens[o] == -1 && parents[o] == -1 && lengths[o] == 0 && from_logprob[o] == 0);
+                CHECK(std::isinf(scores[o]) && scores[o] < 0);
+            }
+        }
+        for (int k = 0; k < K; ++k) {
+            CHECK(final_scores[b * K + k] == dbs_result_final_scores(r)[k]);
+            CHECK(final_raw[b * K + k] == dbs_result_final_raw_scores(r)[k]);
+        }
+        DBSBackwardHandle* bw = nullptr;
+        CHECK(dbs_backward_dense(h, r, nullptr, nullptr, grad_final.data() + b * K, &bw) == 0);
+        const float* dense = dbs_backward_grad_log_probs(bw);
+        for (int i = 0; i < steps[b] * K * V; ++i) CHECK(grad[static_cast<size_t>(b) * T * K * V + i] == dense[i]);
+        for (int i = steps[b] * K * V; i < T * K * V; ++i) CHECK(grad[static_cast<size_t>(b) * T * K * V + i] == 0.0f);
+        dbs_free_backward(bw);
+        dbs_free_result(r);
+    }
+
+    // Malformed traces and steps are rejected before any memory is touched.
+    parents[0] = 7;
+    CHECK(dbs_backward_batch_into(h, B, T, V, steps, parents.data(), tokens.data(), lengths.data(), from_logprob.data(),
+                                  grad_final.data(), 1, grad.data()) == DBS_ERROR_INVALID_ARGUMENT);
+    CHECK(std::strstr(dbs_last_error(h), "example 0") != nullptr);
+    steps[2] = T + 1;
+    CHECK(dbs_decode_batch_into(h, x.data(), B, T, V, steps, nullptr, 1, &out) == DBS_ERROR_INVALID_ARGUMENT);
+    dbs_destroy(h);
+}
+
+static void test_validation_checks_every_element() {
+    // The old implementation sampled 1000 entries; now every element of every
+    // row the search reads is checked.
+    auto* h = make_decoder();
+    constexpr int T = 2, K = 2, V = 5003;
+    std::vector<float> x(static_cast<size_t>(T) * K * V, -2.0f);
+    DBSResultHandle* r = nullptr;
+    for (size_t pos : {size_t{1}, size_t{4999}, static_cast<size_t>(K) * V + 17, static_cast<size_t>(K) * V + V + 4242}) {
+        std::vector<float> y = x;
+        y[pos] = std::numeric_limits<float>::infinity();
+        CHECK(dbs_decode(h, y.data(), T, V, &r) == DBS_ERROR_INVALID_ARGUMENT);
+        CHECK(std::strstr(dbs_last_error(h), "NaN or +inf") != nullptr);
+    }
+    // Row 1 at step 0 is never read (only beam 0 is live), so it is not checked.
+    x[static_cast<size_t>(V) + 3] = std::numeric_limits<float>::quiet_NaN();
+    CHECK(dbs_decode(h, x.data(), T, V, &r) == 0);
+    dbs_free_result(r);
+    dbs_destroy(h);
 }
 
 int main() {
@@ -613,7 +917,14 @@ int main() {
     test_zero_initialized_options_select_defaults();
     test_invalid_options_are_rejected();
     test_last_error_is_reported_per_handle();
-    test_deprecated_production_manifest_api_fails_closed();
+    test_error_codes_match_the_header();
+    test_every_failure_reports_its_own_error();
+    test_deterministic_order_accepts_decoder_output();
+    test_allocator_gauge_survives_reset();
+    test_variable_beam_batch_backward();
+    test_model_steps_ex_tracks_beam_prefixes();
+    test_batch_into_matches_result_handles();
+    test_validation_checks_every_element();
     std::cout << "dbs_tests passed\n";
     return 0;
 }

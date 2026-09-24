@@ -1,21 +1,67 @@
 # SPDX-License-Identifier: MIT
-"""PyTorch front end: autograd-aware beam search on CPU and CUDA."""
+"""PyTorch front end: autograd-aware beam search on CPU and CUDA.
+
+The work is done by two operators registered with ``torch.library``:
+``torch.ops.beamgrad.decode`` and ``torch.ops.beamgrad.final_scores_backward``.
+They have fake (meta) implementations, an autograd formula and a vmap rule, so
+they work under ``torch.compile`` (without graph breaks), ``torch.export``,
+fake-tensor tracing and ``torch.vmap``.
+"""
 
 from __future__ import annotations
 
+import importlib.util
+import re
+import warnings
 from collections.abc import Sequence
 from typing import NamedTuple
 
 import torch
-from torch.autograd.function import once_differentiable
 
-from . import _C  # CPU operators; always built.
 from ._options import CUDA_MAX_BEAM, BeamOptions
 
-try:  # CUDA operators; built when a CUDA toolkit is available at install time.
-    from . import _C_cuda
-except ImportError:  # pragma: no cover - depends on the build
-    _C_cuda = None
+
+def _major_minor(version: str) -> tuple[int, int] | None:
+    match = re.match(r"(\d+)\.(\d+)", version)
+    return (int(match.group(1)), int(match.group(2))) if match else None
+
+
+def _check_build() -> None:
+    """Fail early, with instructions, if the extensions target another PyTorch."""
+    try:
+        from ._build_info import TORCH_VERSION as built
+    except ImportError:  # pragma: no cover - source checkouts without a build
+        return
+    if _major_minor(built) != _major_minor(torch.__version__):
+        raise ImportError(
+            f"beamgrad was compiled against PyTorch {built}, but PyTorch {torch.__version__} is installed. "
+            "Its compiled operators only work with the PyTorch they were built with (this usually happens when "
+            "pip builds beamgrad in an isolated environment with a different torch). Rebuild it against the "
+            "installed PyTorch:\n    pip install --no-build-isolation --no-deps --force-reinstall beamgrad"
+        )
+
+
+_check_build()
+
+try:
+    from . import _C  # noqa: F401  defines the operators and their CPU kernels
+except ImportError as exc:  # pragma: no cover - broken installs
+    raise ImportError(
+        f"beamgrad's compiled operators failed to load ({exc}). If PyTorch was upgraded or changed after "
+        "beamgrad was installed, rebuild beamgrad against it:\n"
+        "    pip install --no-build-isolation --no-deps --force-reinstall beamgrad"
+    ) from exc
+
+_C_cuda = None
+if importlib.util.find_spec(f"{__package__}._C_cuda") is not None:  # built with a CUDA toolkit
+    try:
+        from . import _C_cuda  # registers the CUDA kernels
+    except ImportError as exc:  # pragma: no cover - depends on the machine
+        warnings.warn(
+            f"beamgrad's CUDA operators failed to load ({exc}); CUDA tensors are not supported.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 StepsLike = torch.Tensor | Sequence[int] | None
 
@@ -45,24 +91,118 @@ def cuda_available() -> bool:
     return _C_cuda is not None and torch.cuda.is_available() and bool(_C_cuda.device_available())
 
 
-def _ops_for(x: torch.Tensor):
-    if x.device.type == "cpu":
-        return _C
-    if x.device.type == "cuda":
-        if _C_cuda is None:
-            raise RuntimeError(
-                "beamgrad was installed without its CUDA operators, so CUDA tensors are not supported. "
-                "Reinstall on a machine with the CUDA toolkit (nvcc) available, e.g. "
-                "`BEAMGRAD_CUDA=1 pip install --no-build-isolation beamgrad`."
-            )
-        return _C_cuda
-    raise RuntimeError(f"beamgrad supports CPU and CUDA tensors, got device {x.device}")
+# ---------------------------------------------------------------------------
+# Operator registrations: fake implementations, autograd, vmap
+# ---------------------------------------------------------------------------
+
+
+@torch.library.register_fake("beamgrad::decode")
+def _decode_fake(
+    log_probs,
+    steps,
+    eos_token,
+    min_length,
+    length_penalty_alpha,
+    banned_tokens,
+    no_repeat_ngram_size,
+    repetition_penalty,
+    validate,
+):
+    B, T, K, _ = log_probs.shape
+    return (
+        log_probs.new_empty((B, K), dtype=torch.float32),
+        log_probs.new_empty((B, K), dtype=torch.float32),
+        log_probs.new_empty((B, K), dtype=torch.int32),
+        log_probs.new_empty((B, T, K), dtype=torch.int32),
+        log_probs.new_empty((B, T, K), dtype=torch.int32),
+        log_probs.new_empty((B, T, K), dtype=torch.int32),
+        log_probs.new_empty((B, T, K), dtype=torch.float32),
+        log_probs.new_empty((B, T, K), dtype=torch.float32),
+        log_probs.new_empty((B, T, K), dtype=torch.uint8),
+    )
+
+
+@torch.library.register_fake("beamgrad::final_scores_backward")
+def _final_scores_backward_fake(
+    grad_final, parents, tokens, lengths, from_logprob, steps, vocab_size, length_penalty_alpha
+):
+    B, T, K = parents.shape
+    return grad_final.new_empty((B, T, K, vocab_size), dtype=torch.float32)
+
+
+def _decode_setup_context(ctx, inputs, output):
+    log_probs, steps, _, _, length_penalty_alpha = inputs[:5]
+    _, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob = output
+    # Only the final scores carry gradients.
+    ctx.mark_non_differentiable(final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob)
+    ctx.save_for_backward(parents, tokens, lengths, from_logprob, steps)
+    ctx.vocab_size = log_probs.shape[-1]
+    ctx.length_penalty_alpha = length_penalty_alpha
+
+
+def _decode_backward(ctx, grad_final_scores, *unused_grads):
+    parents, tokens, lengths, from_logprob, steps = ctx.saved_tensors
+    grad = torch.ops.beamgrad.final_scores_backward(
+        grad_final_scores.to(torch.float32).contiguous(),
+        parents,
+        tokens,
+        lengths,
+        from_logprob,
+        steps,
+        ctx.vocab_size,
+        ctx.length_penalty_alpha,
+    )
+    return grad, None, None, None, None, None, None, None, None
+
+
+torch.library.register_autograd("beamgrad::decode", _decode_backward, setup_context=_decode_setup_context)
+
+
+def _merge_vmap_dim(tensor, dim, size):
+    """Moves (or adds) the vmapped dimension to the front and folds it into the batch."""
+    tensor = tensor.movedim(dim, 0) if dim is not None else tensor.expand(size, *tensor.shape)
+    return tensor.reshape(size * tensor.shape[1], *tensor.shape[2:])
+
+
+def _decode_vmap(info, in_dims, log_probs, steps, *options):
+    if any(dim is not None for dim in in_dims[2:]):
+        raise NotImplementedError("beamgrad: vmap over banned_tokens is not supported")
+    n = info.batch_size
+    x = _merge_vmap_dim(log_probs, in_dims[0], n)
+    s = None if steps is None else _merge_vmap_dim(steps, in_dims[1], n)
+    outputs = torch.ops.beamgrad.decode(x, s, *options)
+    return tuple(o.reshape(n, o.shape[0] // n, *o.shape[1:]) for o in outputs), (0,) * len(outputs)
+
+
+def _final_scores_backward_vmap(
+    info, in_dims, grad_final, parents, tokens, lengths, from_logprob, steps, vocab_size, length_penalty_alpha
+):
+    n = info.batch_size
+    tensors = [grad_final, parents, tokens, lengths, from_logprob]
+    merged = [_merge_vmap_dim(t, d, n) for t, d in zip(tensors, in_dims[:5], strict=True)]
+    s = None if steps is None else _merge_vmap_dim(steps, in_dims[5], n)
+    grad = torch.ops.beamgrad.final_scores_backward(*merged, s, vocab_size, length_penalty_alpha)
+    return grad.reshape(n, grad.shape[0] // n, *grad.shape[1:]), 0
+
+
+if hasattr(torch.library, "register_vmap"):  # PyTorch 2.5+
+    torch.library.register_vmap("beamgrad::decode", _decode_vmap)
+    torch.library.register_vmap("beamgrad::final_scores_backward", _final_scores_backward_vmap)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 def _prepare(
     log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike
-) -> tuple[torch.Tensor, torch.Tensor | None, bool]:
-    """Validate and return (x [B,T,K,V] float32 contiguous, steps [B] int32 | None, unbatched)."""
+) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, bool]:
+    """Check shapes and return (x [B,T,K,V] float32, steps [B] | None, banned [V] | None, unbatched).
+
+    Only static properties are checked here; values (NaN/+inf, the range of
+    steps) are checked inside the operators, which keeps this traceable.
+    """
     if not isinstance(options, BeamOptions):
         raise TypeError(f"options must be a beamgrad.BeamOptions, got {type(options).__name__}")
     if not isinstance(log_probs, torch.Tensor):
@@ -87,52 +227,44 @@ def _prepare(
         raise ValueError(f"log_probs has {K} beams but options.beam_size is {options.beam_size}")
     if options.eos_token >= V:
         raise ValueError(f"eos_token {options.eos_token} is outside the vocabulary (size {V})")
-    if x.device.type == "cuda" and K > CUDA_MAX_BEAM:
-        raise ValueError(f"beam_size {K} exceeds the CUDA backend maximum of {CUDA_MAX_BEAM}")
+    device = x.device.type
+    if device == "cuda":
+        if _C_cuda is None:
+            raise RuntimeError(
+                "beamgrad was installed without its CUDA operators, so CUDA tensors are not supported. "
+                "Reinstall on a machine with the CUDA toolkit (nvcc) available, e.g. "
+                "`BEAMGRAD_CUDA=1 pip install --no-build-isolation beamgrad`."
+            )
+        if K > CUDA_MAX_BEAM:
+            raise ValueError(f"beam_size {K} exceeds the CUDA backend maximum of {CUDA_MAX_BEAM}")
+    elif device != "cpu":
+        raise RuntimeError(f"beamgrad supports CPU and CUDA tensors, got device {x.device}")
 
-    x = x.detach().to(torch.float32).contiguous()
-    if options.validate_inputs and bool(((x != x) | (x == float("inf"))).any()):
-        raise ValueError("log_probs contains NaN or +inf (pass validate_inputs=False to skip this check)")
+    x = x.to(torch.float32).contiguous()
 
     steps_t: torch.Tensor | None = None
     if steps is not None:
-        steps_t = torch.as_tensor(steps, device=x.device).to(torch.int32).contiguous()
-        if steps_t.dim() != 1 or steps_t.numel() != B:
+        steps_t = torch.as_tensor(steps, device=x.device).to(torch.int32)
+        if steps_t.dim() != 1 or steps_t.shape[0] != B:
             raise ValueError(f"steps must have shape [B] = [{B}], got {tuple(steps_t.shape)}")
-        if bool((steps_t < 1).any()) or bool((steps_t > T).any()):
-            raise ValueError(f"steps entries must be in [1, T] = [1, {T}], got {steps_t.tolist()}")
-    return x, steps_t, unbatched
+
+    mask = options.banned_mask(V)
+    banned = None if mask is None else torch.tensor(mask, dtype=torch.uint8, device=x.device)
+    return x, steps_t, banned, unbatched
 
 
-class _FinalScores(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike):
-        x, steps_t, unbatched = _prepare(log_probs, options, steps)
-        ops = _ops_for(x)
-        alpha = float(options.length_penalty_alpha)
-        out = ops.decode(x, steps_t, options.eos_token, options.min_length, alpha)
-        final_scores, _, _, tokens, parents, lengths, _, _, from_logprob = out
-        ctx.ops = ops
-        ctx.alpha = alpha
-        ctx.vocab_size = x.size(3)
-        ctx.unbatched = unbatched
-        ctx.input_dtype = log_probs.dtype
-        ctx.save_for_backward(parents, tokens, lengths, from_logprob, steps_t)
-        return final_scores.squeeze(0) if unbatched else final_scores
-
-    @staticmethod
-    @once_differentiable
-    def backward(ctx, grad_output: torch.Tensor):
-        parents, tokens, lengths, from_logprob, steps_t = ctx.saved_tensors
-        g = grad_output.to(torch.float32)
-        if ctx.unbatched:
-            g = g.unsqueeze(0)
-        grad = ctx.ops.backward(
-            g.contiguous(), parents, tokens, lengths, from_logprob, steps_t, ctx.vocab_size, ctx.alpha
-        )
-        if ctx.unbatched:
-            grad = grad.squeeze(0)
-        return grad.to(ctx.input_dtype), None, None
+def _decode_op(x: torch.Tensor, steps_t: torch.Tensor | None, banned: torch.Tensor | None, options: BeamOptions):
+    return torch.ops.beamgrad.decode(
+        x,
+        steps_t,
+        options.eos_token,
+        options.min_length,
+        float(options.length_penalty_alpha),
+        banned,
+        options.no_repeat_ngram_size,
+        float(options.repetition_penalty),
+        options.validate_inputs,
+    )
 
 
 def final_scores(log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike = None) -> torch.Tensor:
@@ -146,16 +278,18 @@ def final_scores(log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike
             prefix. At ``t = 0`` only beam 0 is live.
         options: :class:`BeamOptions`; ``beam_size`` must equal ``K``.
         steps: Optional ``[B]`` number of steps to decode per example (batched
-            input only). Defaults to ``T`` for every example.
+            input only), each in ``[1, T]``. Defaults to ``T`` for every example.
 
     Returns:
-        ``[K]`` or ``[B, K]`` final scores, best beam first.
+        ``[K]`` or ``[B, K]`` final scores (float32), best beam first.
 
     The forward pass is exact, hard beam search. The backward pass returns the
     gradient of each final score along the path of tokens that produced it,
     holding the beam selection fixed.
     """
-    return _FinalScores.apply(log_probs, options, steps)
+    x, steps_t, banned, unbatched = _prepare(log_probs, options, steps)
+    scores = _decode_op(x, steps_t, banned, options)[0]
+    return scores.squeeze(0) if unbatched else scores
 
 
 @torch.no_grad()
@@ -166,11 +300,11 @@ def decode(log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike = Non
     :class:`BeamSearchOutput` for the returned fields and
     :func:`backtrack` to recover each final beam's token sequence.
     """
-    x, steps_t, unbatched = _prepare(log_probs, options, steps)
+    x, steps_t, banned, unbatched = _prepare(log_probs, options, steps)
     B, T = x.shape[:2]
-    decoded_steps = torch.full((B,), T, dtype=torch.long, device=x.device) if steps_t is None else steps_t.long()
-    out = _ops_for(x).decode(x, steps_t, options.eos_token, options.min_length, float(options.length_penalty_alpha))
+    out = _decode_op(x, steps_t, banned, options)
     final_scores_, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob = out
+    decoded_steps = torch.full((B,), T, dtype=torch.long, device=x.device) if steps_t is None else steps_t.long()
     result = BeamSearchOutput(
         final_scores=final_scores_,
         final_raw_scores=final_raw,

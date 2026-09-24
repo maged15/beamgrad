@@ -18,8 +18,7 @@ extern "C" int LLVMFuzzerTestOneInput(const uint8_t* data, size_t size) {
     opt.eos_token = eos == V ? -1 : eos;
     opt.selected_temperature = 0.1f + static_cast<float>(data[4] % 20) / 10.0f;
     opt.soft_topk_temperature = 0.1f + static_cast<float>(data[5] % 20) / 10.0f;
-    opt.relaxed_pool_multiplier = 1 + (data[6] % 4);
-    opt.vocab_block = 16;
+    opt.relaxed_pool_multiplier = data[6] % 4;  // 0 disables the relaxed pool
     opt.length_penalty_alpha = static_cast<float>(data[7] % 20) / 10.0f;
     opt.soft_topk_tolerance = 1.0e-4f;
     opt.soft_topk_max_iters = 16;

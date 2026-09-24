@@ -3,10 +3,17 @@
 // libdbs: the C ABI of beamgrad (differentiable beam search).
 //
 // Conventions
-//   * Every function returning int returns 0 on success and a negative value on
-//     failure: -1 invalid argument, -2 error raised during the computation,
-//     -3 unknown internal error. Details are available from dbs_last_error()
-//     (per decoder handle) or dbs_last_global_error() (per thread).
+//   * Functions returning an int status return DBS_OK (0) on success and a
+//     negative code on failure: DBS_ERROR_INVALID_ARGUMENT (-1) for invalid
+//     arguments or inputs (null pointers, bad shapes or options, NaN/+inf
+//     log-probs when validate_inputs is set, sizes that overflow),
+//     DBS_ERROR_RUNTIME (-2) for failures during the computation (out of memory,
+//     a callback that reported an error), and DBS_ERROR_UNKNOWN (-3).
+//     Every failing call records a message: dbs_last_global_error() returns the
+//     calling thread's latest one, and dbs_last_error(handle) the latest one on a
+//     decoder handle. When threads share a handle, a call on one thread can
+//     replace the handle's message before another reads it; the thread-local
+//     dbs_last_global_error() is the reliable source there.
 //   * Every handle returned through an out-parameter is owned by the caller and
 //     must be released with its matching dbs_free_* / dbs_destroy function.
 //     Pointers returned by dbs_result_* / dbs_backward_* accessors are borrowed
@@ -46,6 +53,11 @@ extern "C" {
 #define DBS_VERSION_MINOR 0
 #define DBS_VERSION_PATCH 0
 
+#define DBS_OK 0
+#define DBS_ERROR_INVALID_ARGUMENT (-1)
+#define DBS_ERROR_RUNTIME (-2)
+#define DBS_ERROR_UNKNOWN (-3)
+
 /* Decoder options. A zero-initialised field selects its default (shown in
  * brackets); negative or non-finite values are rejected by dbs_create_ex().
  * Note that eos_token and validate_inputs have no "zero = default" rule. */
@@ -54,13 +66,13 @@ typedef struct DBSOptionsC {
     int eos_token;                      /* -1 disables EOS handling; 0 is token 0 */
     float selected_temperature;         /* softmax temperature for selected-beam weights [1.0] */
     float soft_topk_temperature;        /* sigmoid temperature of the relaxed pool [0.25] */
-    int relaxed_pool_multiplier;        /* relaxed pool size P = K * multiplier [8] */
-    int vocab_block;                    /* vocabulary scan block (a tuning knob; results do not depend on it) [4096] */
+    int relaxed_pool_multiplier;        /* relaxed pool size P = K * multiplier; 0 disables the pool [0] */
+    int vocab_block;                    /* ignored; kept for source compatibility */
     float length_penalty_alpha;         /* GNMT length penalty ((5 + len) / 6)^alpha; 0 disables [0] */
     float soft_topk_tolerance;          /* bisection tolerance for the relaxed pool [1e-4] */
     int soft_topk_max_iters;            /* bisection iteration cap [48] */
     int min_length;                     /* EOS is masked until a hypothesis reaches this length [0] */
-    int validate_inputs;                /* non-zero: reject NaN/+Inf log-probs (samples up to 1000 entries) */
+    int validate_inputs;                /* non-zero: fail when a row the search reads contains NaN or +inf */
     int64_t max_dense_gradient_elements;/* cap on T*K*V for dbs_backward_dense() [1e8] */
     int reserved0;
     int reserved1;
@@ -73,6 +85,11 @@ typedef struct DBSBatchResultHandle DBSBatchResultHandle;
 typedef struct DBSWorkspaceHandle DBSWorkspaceHandle;
 
 
+/* Model-step callback of dbs_decode_model_steps (superseded by DBSModelStepExFn,
+ * which also reports each beam's parent). Fills out_log_probs [K, V] for `step`:
+ * row k scores the next token of beam k. prev_tokens [K] holds the token each
+ * beam emitted at step - 1 and prev_scores [K] its length-penalised score (at
+ * step 0: -1 and 0). Returns 0 on success. */
 typedef int (*DBSModelStepFn)(
     void* user_data,
     int batch_index,
@@ -83,6 +100,31 @@ typedef int (*DBSModelStepFn)(
     int vocab_size,
     float* out_log_probs
 );
+
+/* The beams entering a model step. Slot k is the k-th best hypothesis after
+ * step - 1; beams are re-ranked every step, so slot k usually extends a
+ * different hypothesis than slot k did one step earlier: parents[k] names the
+ * slot it came from. At step 0 only beam 0 is live. Dead slots have parent and
+ * token -1 and score -inf. All pointers are valid during the callback only. */
+typedef struct DBSModelStepInfoC {
+    int batch_index;
+    int step;                     /* t: the rows requested extend the beams after step t - 1 */
+    int beam_size;                /* K */
+    int vocab_size;               /* V */
+    const int32_t* parents;       /* [K] slot at step t - 1 that beam k extends (-1 at step 0) */
+    const int32_t* tokens;        /* [K] token beam k emitted at step t - 1 (-1 at step 0) */
+    const int32_t* lengths;       /* [K] hypothesis lengths */
+    const float* scores;          /* [K] length-penalised scores */
+    const float* raw_scores;      /* [K] cumulative log-probabilities */
+    const uint8_t* finished;      /* [K] non-zero once the beam emitted EOS; its row is not read */
+    const int32_t* prefixes;      /* [K * t] row k: the tokens of beam k's path at steps 0..t-1 */
+    const void* reserved[4];
+} DBSModelStepInfoC;
+
+/* Fills out_log_probs [K, V] (pre-filled with -inf) with the next-token
+ * log-probabilities of every beam described by `info`. Returns 0 on success;
+ * any other value aborts the decode with DBS_ERROR_RUNTIME. */
+typedef int (*DBSModelStepExFn)(void* user_data, const DBSModelStepInfoC* info, float* out_log_probs);
 
 typedef int (*DBSTokenFilterFn)(
     void* user_data,
@@ -95,15 +137,30 @@ typedef int (*DBSTokenFilterFn)(
 );
 
 typedef struct DBSAdvancedConstraintsC {
-    const uint8_t* banned_tokens;      /* [V], optional */
+    const uint8_t* banned_tokens;      /* [V], optional; non-zero bans the token */
     const int32_t* forced_tokens;      /* [T], optional, -1 = not forced */
     int min_length;                    /* negative = decoder default */
-    float repetition_penalty;          /* <=1 disables; repeated tokens subtract log(penalty) */
-    int no_repeat_ngram_size;          /* <=0 disables */
+    float repetition_penalty;          /* <=1 disables; tokens already in the beam's prefix subtract log(penalty) */
+    int no_repeat_ngram_size;          /* <=0 disables; n blocks every n-gram already in the beam's prefix */
     DBSTokenFilterFn token_filter;     /* optional; return non-zero to allow token */
     void* token_filter_user_data;
-    int batch_index;
+    int batch_index;                   /* passed to token_filter; batch functions pass the example index */
 } DBSAdvancedConstraintsC;
+
+/* Caller-owned output arrays of dbs_decode_batch_into(). final_scores is
+ * required; any other pointer may be NULL. Steps past an example's own step
+ * count hold token/parent -1, length 0, -inf scores and from_logprob 0. */
+typedef struct DBSDecodeOutputsC {
+    float* final_scores;          /* [B, K] length-penalised final scores, best first */
+    float* final_raw_scores;      /* [B, K] cumulative log-probabilities */
+    int32_t* final_lengths;       /* [B, K] */
+    int32_t* tokens;              /* [B, T, K] token chosen at each step */
+    int32_t* parents;             /* [B, T, K] parent beam at the previous step */
+    int32_t* lengths;             /* [B, T, K] hypothesis length after each step */
+    float* scores;                /* [B, T, K] length-penalised ranking scores */
+    float* raw_scores;            /* [B, T, K] cumulative log-probabilities */
+    uint8_t* from_logprob;        /* [B, T, K] 0 for EOS carry-forward and padding slots */
+} DBSDecodeOutputsC;
 
 typedef struct DBSStatsC {
     int abi_version;
@@ -215,6 +272,56 @@ DBS_EXPORT int dbs_decode_model_steps_with_workspace(
     DBSResultHandle** out_result
 );
 
+/* Like dbs_decode_model_steps, with the richer DBSModelStepInfoC (parent
+ * slots, lengths, finished flags and token prefixes) and optional constraints.
+ * The search runs incrementally: step_fn is called once per step. */
+DBS_EXPORT int dbs_decode_model_steps_ex(
+    DBSDecoderHandle* handle,
+    DBSModelStepExFn step_fn,
+    void* user_data,
+    int batch_index,
+    int steps,
+    int vocab_size,
+    const DBSAdvancedConstraintsC* constraints,
+    DBSResultHandle** out_result
+);
+
+/* Decodes a batch [B, T, K, V] straight into caller-owned arrays (no result
+ * handles). steps_per_example [B] (values in [1, T]) may be NULL for T steps
+ * each; constraints (may be NULL) apply to every example. num_threads <= 0 uses
+ * one thread per hardware thread; the calling thread takes part. */
+DBS_EXPORT int dbs_decode_batch_into(
+    DBSDecoderHandle* handle,
+    const float* log_probs,
+    int batch_size,
+    int steps,
+    int vocab_size,
+    const int32_t* steps_per_example,
+    const DBSAdvancedConstraintsC* constraints,
+    int num_threads,
+    const DBSDecodeOutputsC* outputs
+);
+
+/* Final-score surrogate gradient for a batch decoded by dbs_decode_batch_into
+ * with the same handle, batch_size, steps and steps_per_example. parents,
+ * tokens, lengths and from_logprob are its [B, T, K] outputs, grad_final_scores
+ * is [B, K]. The gradient is accumulated (+=) into grad_log_probs
+ * [B, T, K, V], which the caller normally zero-fills first. */
+DBS_EXPORT int dbs_backward_batch_into(
+    DBSDecoderHandle* handle,
+    int batch_size,
+    int steps,
+    int vocab_size,
+    const int32_t* steps_per_example,
+    const int32_t* parents,
+    const int32_t* tokens,
+    const int32_t* lengths,
+    const uint8_t* from_logprob,
+    const float* grad_final_scores,
+    int num_threads,
+    float* grad_log_probs
+);
+
 DBS_EXPORT int dbs_decode_batch(
     DBSDecoderHandle* handle,
     const float* log_probs,
@@ -320,9 +427,11 @@ DBS_EXPORT int64_t dbs_backward_grad_log_probs_count(const DBSResultHandle* resu
 DBS_EXPORT int64_t dbs_backward_grad_initial_scores_count(const DBSResultHandle* result);
 
 DBS_EXPORT int64_t dbs_result_eos_count(const DBSResultHandle* result, int eos_token);
+/* 0 if every step's beams follow the decoder's candidate order (score, raw
+ * score, parent, token, length, origin); -3 if scores are out of order, -4 if
+ * a tie is broken out of order, -1 for a NULL result. */
 DBS_EXPORT int dbs_result_validate_deterministic_order(const DBSResultHandle* result);
 DBS_EXPORT int dbs_result_summary_json(const DBSResultHandle* result, int eos_token, char* out_json, int64_t out_json_capacity);
-DBS_EXPORT int dbs_validate_production_gate_manifest(const char* manifest_json, char* out_error, int64_t out_error_capacity); /* deprecated compatibility stub; always returns non-zero */
 
 DBS_EXPORT int dbs_has_avx512(void);
 DBS_EXPORT int dbs_has_avx2(void);
@@ -331,9 +440,16 @@ DBS_EXPORT int dbs_has_neon(void);
 DBS_EXPORT const char* dbs_selected_kernel_name(void);
 DBS_EXPORT int dbs_get_stats(DBSDecoderHandle* handle, DBSStatsC* out_stats);
 DBS_EXPORT int dbs_get_stats_json(DBSDecoderHandle* handle, char* out_json, int64_t out_json_capacity);
-DBS_EXPORT int dbs_is_deterministic(void); /* reports deterministic hard-decode contract; not a runtime proof */
+/* Always 1: decoding uses no randomness and a total order over candidates, so
+ * equal inputs give equal outputs. */
+DBS_EXPORT int dbs_is_deterministic(void);
+/* Store and read back a per-handle seed. Nothing in libdbs is random, so the
+ * seed has no effect; the functions remain for ABI compatibility. */
 DBS_EXPORT int dbs_set_deterministic_seed(DBSDecoderHandle* handle, uint64_t seed);
 DBS_EXPORT uint64_t dbs_get_deterministic_seed(DBSDecoderHandle* handle);
+/* Process-wide statistics of libdbs' aligned allocator: the number of
+ * allocations since the last reset, and the bytes currently allocated (a gauge
+ * that dbs_allocator_counters_reset leaves unchanged). */
 DBS_EXPORT void dbs_allocator_counters_reset(void);
 DBS_EXPORT int64_t dbs_allocator_call_count(void);
 DBS_EXPORT int64_t dbs_allocator_byte_count(void);
