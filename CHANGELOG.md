@@ -28,7 +28,9 @@ three functions are added and one no-op stub is removed (see below).
   candidate (n-gram blocking at T=32, K=4, V=32k: 57 ms to 0.7 ms on CPU).
 - **PyTorch integration.** The operators are registered with `torch.library`
   (fake tensors, autograd, vmap), so `torch.compile`, `torch.export` and
-  `torch.vmap` work. Input validation runs inside the decode kernels.
+  `torch.vmap` work, and `final_scores` works under the `torch.func`
+  transforms (`grad`, `vjp`, `jacrev`, per-example gradients). Input
+  validation runs inside the decode kernels.
 
 ### Added
 
@@ -89,9 +91,14 @@ three functions are added and one no-op stub is removed (see below).
   (K=64: 3.4 ms to 0.9 ms; K=256: 24 ms to 4 ms). `vocab_block` is ignored.
 - Invalid arguments and inputs return `-1` as the header documents (they
   returned `-2`), and every failing call records its own error message.
-- CUDA: beams up to 16 use a register top-k scan instead of sorting every
-  4096-candidate tile, and the backward processes the beams of a step in
-  parallel (deterministically) instead of one thread per example.
+- CUDA: no kernel sorts a whole tile of candidates any more. Beams up to 16
+  use a register top-k scan, sized so that a single example still fills the
+  GPU; every scan, reduction and selection finds a block's best `K` keys with
+  a radix select and only the step's `K` winners are sorted. On an RTX 4080
+  SUPER a decode of B=8, T=16, V=32k takes 4.3 ms instead of 28.7 ms at K=64
+  (0.26 ms instead of 0.59 ms for B=1, K=4); results are unchanged, bit for
+  bit. The backward processes the beams of a step in parallel
+  (deterministically) instead of one thread per example.
 - `dbs_decode_batch*` run on the calling thread as well and do not start
   threads for a single example; variable batches read smaller beams in place
   instead of copying them.
@@ -110,6 +117,15 @@ three functions are added and one no-op stub is removed (see below).
 
 ### Fixed
 
+- `torch.func.grad`, `vjp` and `jacrev` (and `vmap` of them) failed on
+  `final_scores`: the autograd formula registered with `torch.library` is an
+  `autograd.Function` without a separate `setup_context`, which `torch.func`
+  requires.
+- The length penalty converted `length_penalty_alpha` to `int` before checking
+  its range, which is undefined behaviour for exponents beyond `INT_MAX`.
+- `banned_tokens` cost a `[V]` Python list and its conversion to a tensor on
+  every PyTorch call (4 ms at V=128k); the mask is now scattered on the
+  target device.
 - Backward rejected results whose beam size differed from the decoder's, so
   examples of `dbs_decode_batch_variable` with their own beam sizes could not
   be differentiated.
