@@ -1,0 +1,4 @@
+DBS_0.6 {
+    global: dbs_*;
+    local: *;
+};

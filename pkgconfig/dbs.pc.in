@@ -1,0 +1,11 @@
+prefix=${pcfiledir}/../..
+exec_prefix=${prefix}
+libdir=${prefix}/@CMAKE_INSTALL_LIBDIR@
+includedir=${prefix}/@CMAKE_INSTALL_INCLUDEDIR@
+
+Name: dbs
+Description: beamgrad C ABI - differentiable beam search with surrogate gradients
+URL: https://github.com/maged15/beamgrad
+Version: @PROJECT_VERSION@
+Libs: -L${libdir} -ldbs
+Cflags: -I${includedir}

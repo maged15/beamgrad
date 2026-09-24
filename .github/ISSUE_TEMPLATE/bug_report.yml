@@ -1,0 +1,26 @@
+name: Bug report
+description: Something produces a wrong result, crashes, or fails to build
+labels: [bug]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: What happened?
+      description: What you expected, and what you got instead.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Minimal reproducer
+      description: Code or commands, with their output.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: beamgrad version, OS, Python and PyTorch versions, CUDA version and GPU, compiler.
+    validations:
+      required: true

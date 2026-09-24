@@ -1,0 +1,299 @@
+// SPDX-License-Identifier: MIT
+//
+// Runs the real CUDA backend source (cuda/dbs_cuda.cu) on the CPU through the
+// emulation layer and checks it against the CPU decoder in libdbs:
+//   * every per-step output (tokens, parents, lengths, scores, raw scores,
+//     carry-forward flags) and every final score must be bitwise identical;
+//   * the CUDA backward must reproduce dbs_backward_sparse() exactly.
+// Cases are randomized but seeded, and cover ties, -inf entries, EOS
+// carry-forward, min_length, length penalty, variable batches, multi-level
+// tile reduction, and the maximum beam size.
+#define DBS_CUDA_EMULATION 1
+#include "../cuda/dbs_cuda.cu"
+
+#include "check.hpp"
+#include "dbs.h"
+
+#include <cinttypes>
+#include <cstring>
+#include <random>
+#include <vector>
+
+namespace {
+
+struct Case {
+    int B, T, K, V;
+    int eos;
+    int min_length;
+    float alpha;
+    bool variable;
+    int value_mode;  // 0 continuous, 1 heavy ties, 2 sparse -inf
+};
+
+bool same_bits(float a, float b) { return std::memcmp(&a, &b, sizeof(float)) == 0; }
+
+struct GpuResult {
+    std::vector<float> final_scores, final_raw;
+    std::vector<int32_t> final_len, tokens, parents, lengths;
+    std::vector<float> scores, raw_scores;
+    std::vector<uint8_t> from_logprob;
+};
+
+std::vector<float> make_log_probs(const Case& c, std::mt19937& rng) {
+    std::vector<float> x(static_cast<size_t>(c.B) * c.T * c.K * c.V);
+    std::uniform_real_distribution<float> u(-9.0f, 0.0f);
+    std::uniform_int_distribution<int> q(0, 3);
+    std::uniform_int_distribution<int> coin(0, 9);
+    for (float& v : x) {
+        switch (c.value_mode) {
+            case 1: v = -0.5f * static_cast<float>(q(rng)); break;
+            case 2: v = coin(rng) < 3 ? -std::numeric_limits<float>::infinity() : u(rng); break;
+            default: v = u(rng); break;
+        }
+    }
+    return x;
+}
+
+int run_case(const Case& c, uint32_t seed) {
+    std::mt19937 rng(seed);
+    const std::vector<float> x = make_log_probs(c, rng);
+    const size_t BK = static_cast<size_t>(c.B) * c.K;
+    const size_t BTK = static_cast<size_t>(c.B) * c.T * c.K;
+
+    std::vector<int32_t> steps(c.B, c.T), beams(c.B, c.K), eos(c.B, c.eos), min_len(c.B, c.min_length);
+    if (c.variable) {
+        for (int b = 0; b < c.B; ++b) {
+            steps[b] = 1 + static_cast<int>(rng() % c.T);
+            beams[b] = 1 + static_cast<int>(rng() % c.K);
+            eos[b] = (rng() % 3 == 0) ? -1 : static_cast<int>(rng() % c.V);
+            min_len[b] = static_cast<int>(rng() % 3);
+        }
+    }
+
+    DBSCudaDecodeArgs args{};
+    args.batch_size = c.B;
+    args.steps = c.T;
+    args.beam_size = c.K;
+    args.vocab_size = c.V;
+    args.eos_token = c.eos;
+    args.min_length = c.min_length;
+    args.length_penalty_alpha = c.alpha;
+    if (c.variable) {
+        args.steps_per_example = steps.data();
+        args.beam_sizes_per_example = beams.data();
+        args.eos_tokens_per_example = eos.data();
+        args.min_lengths_per_example = min_len.data();
+    }
+
+    GpuResult g;
+    g.final_scores.assign(BK, 1.0f);
+    g.final_raw.assign(BK, 1.0f);
+    g.final_len.assign(BK, 7);
+    g.tokens.assign(BTK, 7);
+    g.parents.assign(BTK, 7);
+    g.lengths.assign(BTK, 7);
+    g.scores.assign(BTK, 1.0f);
+    g.raw_scores.assign(BTK, 1.0f);
+    g.from_logprob.assign(BTK, 7);
+    DBSCudaDecodeOutputs out{};
+    out.final_scores = g.final_scores.data();
+    out.final_raw_scores = g.final_raw.data();
+    out.final_lengths = g.final_len.data();
+    out.tokens = g.tokens.data();
+    out.parents = g.parents.data();
+    out.lengths = g.lengths.data();
+    out.scores = g.scores.data();
+    out.raw_scores = g.raw_scores.data();
+    out.from_logprob = g.from_logprob.data();
+    CHECK(dbs_cuda_decode(x.data(), &args, &out, nullptr, 0, nullptr) == DBS_CUDA_STATUS_OK);
+
+    std::vector<float> grad_final(BK);
+    std::uniform_real_distribution<float> gd(-2.0f, 2.0f);
+    for (float& v : grad_final) v = gd(rng);
+    std::vector<float> grad(x.size(), 0.0f);
+    CHECK(dbs_cuda_backward(&args, g.parents.data(), g.tokens.data(), g.lengths.data(), g.from_logprob.data(),
+                            grad_final.data(), grad.data(), nullptr, 0, nullptr) == DBS_CUDA_STATUS_OK);
+
+    int mismatches = 0;
+    auto report = [&](const char* what, int b, int t, int k) {
+        if (mismatches++ < 5) {
+            std::fprintf(stderr, "  mismatch %s b=%d t=%d k=%d (B=%d T=%d K=%d V=%d eos=%d minlen=%d alpha=%g var=%d mode=%d)\n",
+                         what, b, t, k, c.B, c.T, c.K, c.V, c.eos, c.min_length, c.alpha, c.variable, c.value_mode);
+        }
+    };
+
+    for (int b = 0; b < c.B; ++b) {
+        const int Tb = steps[b], Kb = beams[b];
+        DBSOptionsC opt{};
+        opt.beam_size = Kb;
+        opt.eos_token = eos[b];
+        opt.min_length = min_len[b];
+        opt.length_penalty_alpha = c.alpha;
+        opt.validate_inputs = 0;
+        DBSDecoderHandle* h = nullptr;
+        CHECK(dbs_create_ex(opt, &h) == 0);
+
+        // CPU decodes a dense [Tb, Kb, V] copy of this example.
+        std::vector<float> local(static_cast<size_t>(Tb) * Kb * c.V);
+        for (int t = 0; t < Tb; ++t)
+            for (int k = 0; k < Kb; ++k)
+                std::memcpy(&local[(static_cast<size_t>(t) * Kb + k) * c.V],
+                            &x[((static_cast<size_t>(b) * c.T + t) * c.K + k) * c.V], sizeof(float) * c.V);
+        DBSResultHandle* r = nullptr;
+        CHECK(dbs_decode(h, local.data(), Tb, c.V, &r) == 0);
+
+        const int32_t* tok = dbs_result_tokens(r);
+        const int32_t* par = dbs_result_parents(r);
+        const int32_t* len = dbs_result_lengths(r);
+        const float* sc = dbs_result_scores(r);
+        const float* raw = dbs_result_raw_scores(r);
+        const float* fs = dbs_result_final_scores(r);
+        const float* fr = dbs_result_final_raw_scores(r);
+
+        for (int t = 0; t < c.T; ++t) {
+            for (int k = 0; k < c.K; ++k) {
+                const size_t gs = (static_cast<size_t>(b) * c.T + t) * c.K + k;
+                if (t >= Tb || k >= Kb) {
+                    if (g.tokens[gs] != -1 || g.parents[gs] != -1 || g.lengths[gs] != 0 || g.from_logprob[gs] != 0 ||
+                        !std::isinf(g.scores[gs]) || !std::isinf(g.raw_scores[gs])) report("padding", b, t, k);
+                    continue;
+                }
+                const size_t cs = static_cast<size_t>(t) * Kb + k;
+                if (g.tokens[gs] != tok[cs]) report("token", b, t, k);
+                if (g.parents[gs] != par[cs]) report("parent", b, t, k);
+                if (g.lengths[gs] != len[cs]) report("length", b, t, k);
+                if (!same_bits(g.scores[gs], sc[cs])) report("score", b, t, k);
+                if (!same_bits(g.raw_scores[gs], raw[cs])) report("raw_score", b, t, k);
+                // A selected slot is a carry-forward iff its parent had already emitted EOS.
+                const bool carry = t > 0 && par[cs] >= 0 && eos[b] >= 0 &&
+                                   tok[static_cast<size_t>(t - 1) * Kb + par[cs]] == eos[b];
+                const uint8_t expected_flp = par[cs] >= 0 && !carry ? 1 : 0;
+                if (g.from_logprob[gs] != expected_flp) report("from_logprob", b, t, k);
+            }
+        }
+        for (int k = 0; k < c.K; ++k) {
+            const size_t gs = static_cast<size_t>(b) * c.K + k;
+            if (k >= Kb) {
+                if (!std::isinf(g.final_scores[gs]) || g.final_len[gs] != 0) report("final padding", b, -1, k);
+                continue;
+            }
+            if (!same_bits(g.final_scores[gs], fs[k])) report("final_score", b, -1, k);
+            if (!same_bits(g.final_raw[gs], fr[k])) report("final_raw", b, -1, k);
+            if (g.final_len[gs] != len[static_cast<size_t>(Tb - 1) * Kb + k]) report("final_length", b, -1, k);
+        }
+
+        // Backward parity.
+        DBSBackwardHandle* bw = nullptr;
+        CHECK(dbs_backward_sparse(h, r, nullptr, nullptr, &grad_final[static_cast<size_t>(b) * c.K], &bw) == 0);
+        std::vector<float> expected(static_cast<size_t>(c.T) * c.K * c.V, 0.0f);
+        const int64_t nnz = dbs_backward_sparse_logprob_count(bw);
+        const int64_t* idx = dbs_backward_sparse_logprob_indices(bw);
+        const float* val = dbs_backward_sparse_logprob_values(bw);
+        for (int64_t i = 0; i < nnz; ++i) {
+            const int64_t flat = idx[i];
+            const int64_t v = flat % c.V;
+            const int64_t kk = (flat / c.V) % Kb;
+            const int64_t t = flat / (static_cast<int64_t>(c.V) * Kb);
+            expected[(static_cast<size_t>(t) * c.K + kk) * c.V + v] += val[i];
+        }
+        const float* got = &grad[static_cast<size_t>(b) * c.T * c.K * c.V];
+        for (size_t i = 0; i < expected.size(); ++i) {
+            if (!same_bits(got[i], expected[i])) {
+                report("grad", b, static_cast<int>(i / (static_cast<size_t>(c.K) * c.V)), static_cast<int>((i / c.V) % c.K));
+                break;
+            }
+        }
+        dbs_free_backward(bw);
+        dbs_free_result(r);
+        dbs_destroy(h);
+    }
+    return mismatches;
+}
+
+void test_randomized_parity() {
+    std::mt19937 rng(20240917);
+    int cases = 0;
+    int failures = 0;
+    for (int i = 0; i < 160; ++i) {
+        Case c{};
+        c.B = 1 + static_cast<int>(rng() % 3);
+        c.T = 1 + static_cast<int>(rng() % 6);
+        c.K = 1 + static_cast<int>(rng() % 9);
+        c.V = 1 + static_cast<int>(rng() % 60);
+        c.eos = (rng() % 3 == 0) ? -1 : static_cast<int>(rng() % c.V);
+        c.min_length = static_cast<int>(rng() % 3);
+        c.alpha = (rng() % 3) * 0.35f;
+        c.variable = rng() % 3 == 0;
+        c.value_mode = static_cast<int>(rng() % 3);
+        failures += run_case(c, static_cast<uint32_t>(rng())) != 0 ? 1 : 0;
+        ++cases;
+    }
+    // Multi-tile scans with a reduction level (K*V spans many 4096-candidate tiles).
+    failures += run_case(Case{2, 3, 64, 5000, 7, 1, 0.6f, false, 0}, 1) != 0 ? 1 : 0;
+    failures += run_case(Case{1, 2, 64, 4200, -1, 0, 0.0f, false, 1}, 2) != 0 ? 1 : 0;
+    // Maximum beam size.
+    failures += run_case(Case{1, 3, DBS_CUDA_MAX_BEAM, 9, 2, 0, 0.8f, false, 1}, 3) != 0 ? 1 : 0;
+    failures += run_case(Case{2, 2, DBS_CUDA_MAX_BEAM, 5, -1, 0, 0.0f, true, 0}, 4) != 0 ? 1 : 0;
+    cases += 4;
+    std::printf("cuda emulation parity: %d cases, %d failing\n", cases, failures);
+    CHECK(failures == 0);
+}
+
+void test_argument_validation() {
+    std::vector<float> x(2 * 3 * 4, -1.0f);
+    std::vector<float> scores(2 * 4);
+    DBSCudaDecodeOutputs out{};
+    out.final_scores = scores.data();
+    DBSCudaDecodeArgs a{};
+    a.batch_size = 2;
+    a.steps = 1;
+    a.beam_size = 4;
+    a.vocab_size = 3;
+    a.eos_token = -1;
+    CHECK(dbs_cuda_decode(x.data(), &a, &out, nullptr, 0, nullptr) == DBS_CUDA_STATUS_OK);
+
+    DBSCudaDecodeArgs bad = a;
+    bad.eos_token = 3;
+    CHECK(dbs_cuda_decode(x.data(), &bad, &out, nullptr, 0, nullptr) == DBS_CUDA_STATUS_INVALID_ARGUMENT);
+    bad = a;
+    bad.beam_size = DBS_CUDA_MAX_BEAM + 1;
+    CHECK(dbs_cuda_decode_workspace_size(&bad) < 0);
+    bad = a;
+    bad.length_penalty_alpha = -1.0f;
+    CHECK(dbs_cuda_decode(x.data(), &bad, &out, nullptr, 0, nullptr) == DBS_CUDA_STATUS_INVALID_ARGUMENT);
+    CHECK(dbs_cuda_decode(x.data(), &a, nullptr, nullptr, 0, nullptr) == DBS_CUDA_STATUS_INVALID_ARGUMENT);
+
+    // Too-small caller workspace is rejected; an adequate one works.
+    const int64_t need = dbs_cuda_decode_workspace_size(&a);
+    CHECK(need > 0);
+    std::vector<unsigned char> ws(static_cast<size_t>(need));
+    CHECK(dbs_cuda_decode(x.data(), &a, &out, ws.data(), need - 1, nullptr) == DBS_CUDA_STATUS_INVALID_ARGUMENT);
+    CHECK(dbs_cuda_decode(x.data(), &a, &out, ws.data(), need, nullptr) == DBS_CUDA_STATUS_OK);
+
+    // Invalid per-example metadata is detected on the device.
+    std::vector<int32_t> steps = {1, 2};  // 2 > T
+    DBSCudaDecodeArgs var = a;
+    var.steps_per_example = steps.data();
+    CHECK(dbs_cuda_decode(x.data(), &var, &out, nullptr, 0, nullptr) == DBS_CUDA_STATUS_INVALID_ARGUMENT);
+    std::vector<int32_t> eos = {-1, 3};  // 3 >= V
+    var = a;
+    var.eos_tokens_per_example = eos.data();
+    CHECK(dbs_cuda_decode(x.data(), &var, &out, nullptr, 0, nullptr) == DBS_CUDA_STATUS_INVALID_ARGUMENT);
+
+    CHECK(dbs_cuda_set_synchronization(2) == DBS_CUDA_STATUS_INVALID_ARGUMENT);
+    CHECK(dbs_cuda_set_synchronization(1) == DBS_CUDA_STATUS_OK);
+    CHECK(dbs_cuda_get_synchronization() == 1);
+    CHECK(dbs_cuda_decode(x.data(), &a, &out, nullptr, 0, nullptr) == DBS_CUDA_STATUS_OK);
+    CHECK(dbs_cuda_set_synchronization(0) == DBS_CUDA_STATUS_OK);
+    CHECK(std::strcmp(dbs_cuda_status_string(DBS_CUDA_STATUS_INVALID_ARGUMENT), "invalid argument") == 0);
+}
+
+}  // namespace
+
+int main() {
+    CHECK(dbs_cuda_available() == 1);
+    test_argument_validation();
+    test_randomized_parity();
+    std::printf("cuda_emulation_tests passed\n");
+    return 0;
+}

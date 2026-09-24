@@ -1,0 +1,144 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cpp:
+    name: C++ / ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { name: Linux GCC, os: ubuntu-latest, flags: "-DCMAKE_CXX_COMPILER=g++ -DCMAKE_C_COMPILER=gcc -DDBS_WARNINGS_AS_ERRORS=ON" }
+          - { name: Linux Clang, os: ubuntu-latest, flags: "-DCMAKE_CXX_COMPILER=clang++ -DCMAKE_C_COMPILER=clang -DDBS_WARNINGS_AS_ERRORS=ON" }
+          - { name: Linux static, os: ubuntu-latest, flags: "-DDBS_BUILD_SHARED=OFF" }
+          - { name: macOS, os: macos-latest, flags: "" }
+          - { name: Windows MSVC, os: windows-latest, flags: "" }
+    steps:
+      - uses: actions/checkout@v5
+      - name: Configure
+        run: cmake -S . -B build -DCMAKE_BUILD_TYPE=Release ${{ matrix.flags }}
+      - name: Build
+        run: cmake --build build --config Release --parallel
+      - name: Test
+        run: ctest --test-dir build -C Release --output-on-failure
+      - name: Install
+        run: cmake --install build --config Release --prefix install
+
+  sanitizers:
+    name: C++ / sanitizers and fuzz smoke
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: AddressSanitizer + UndefinedBehaviorSanitizer
+        run: |
+          cmake -S . -B build-asan -DCMAKE_BUILD_TYPE=Debug -DDBS_ENABLE_SANITIZERS=ON \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          cmake --build build-asan --parallel
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+            ctest --test-dir build-asan --output-on-failure
+      - name: ThreadSanitizer
+        run: |
+          cmake -S . -B build-tsan -DCMAKE_BUILD_TYPE=Debug -DDBS_ENABLE_TSAN=ON -DDBS_BUILD_BENCHMARKS=OFF \
+            -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          cmake --build build-tsan --parallel --target dbs_tests
+          TSAN_OPTIONS=halt_on_error=1 ./build-tsan/dbs_tests
+      - name: libFuzzer smoke (60 s)
+        run: |
+          cmake -S . -B build-fuzz -DCMAKE_BUILD_TYPE=Debug -DDBS_BUILD_FUZZER=ON -DDBS_ENABLE_SANITIZERS=ON \
+            -DDBS_BUILD_TESTS=OFF -DDBS_BUILD_BENCHMARKS=OFF -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+          cmake --build build-fuzz --parallel
+          ./build-fuzz/dbs_fuzz -max_total_time=60
+
+  cuda:
+    name: CUDA / nvcc build (CUDA 12.6)
+    runs-on: ubuntu-latest
+    container: nvidia/cuda:12.6.3-devel-ubuntu24.04
+    steps:
+      - name: Toolchain
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends ca-certificates cmake ninja-build python3-venv python3-dev git
+      - uses: actions/checkout@v5
+      - name: libdbs_cuda (sm_75, sm_80, sm_90)
+        run: |
+          cmake -S . -B build -G Ninja -DDBS_ENABLE_CUDA=ON -DDBS_WARNINGS_AS_ERRORS=ON \
+            -DCMAKE_CUDA_ARCHITECTURES="75;80;90"
+          cmake --build build
+          ctest --test-dir build --output-on-failure
+      - name: Python package with CUDA operators
+        run: |
+          python3 -m venv /opt/venv
+          . /opt/venv/bin/activate
+          pip install --upgrade pip "setuptools>=77" wheel ninja
+          pip install torch --index-url https://download.pytorch.org/whl/cu126
+          BEAMGRAD_CUDA=1 TORCH_CUDA_ARCH_LIST="8.0" pip install --no-build-isolation ".[test]"
+          python -c "import beamgrad._C_cuda as m; print('CUDA operators built, max beam', m.max_beam_size())"
+          cd /tmp && python -m pytest "$GITHUB_WORKSPACE/python/tests" -q
+
+  python:
+    name: Python ${{ matrix.python }} / ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+        python: ["3.10", "3.13"]
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: ${{ matrix.python }}
+      - uses: ilammy/msvc-dev-cmd@v1
+        if: runner.os == 'Windows'
+      - name: Install PyTorch (CPU)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip "setuptools>=77" wheel ninja
+          if [ "$RUNNER_OS" = "macOS" ]; then
+            python -m pip install torch
+          else
+            python -m pip install torch --index-url https://download.pytorch.org/whl/cpu
+          fi
+      # Default shell (PowerShell on Windows): Git Bash would put its own
+      # `link` ahead of MSVC's link.exe on PATH.
+      - name: Build and install beamgrad
+        env:
+          DISTUTILS_USE_SDK: "1"  # use the MSVC environment set up above (Windows)
+        run: python -m pip install --no-build-isolation ".[test]"
+      - name: Install JAX
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
+        run: python -m pip install "jax[cpu]"
+      - name: Test
+        shell: bash
+        run: cd "$RUNNER_TEMP" && python -m pytest "$GITHUB_WORKSPACE/python/tests" -q
+      - name: Examples
+        shell: bash
+        run: |
+          python examples/quickstart.py
+          python examples/train.py
+
+  lint:
+    name: Lint and metadata
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-python@v6
+        with:
+          python-version: "3.12"
+      - run: python -m pip install ruff
+      - run: ruff check python setup.py benchmarks examples
+      - run: ruff format --check python setup.py benchmarks examples
+      - run: python scripts/check_version_metadata.py

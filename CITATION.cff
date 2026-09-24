@@ -1,0 +1,16 @@
+cff-version: 1.2.0
+message: "If you use beamgrad in your research, please cite it as below."
+title: "beamgrad: differentiable beam search for PyTorch"
+type: software
+authors:
+  - family-names: Amr
+    given-names: Maged
+version: 2.0.0
+license: MIT
+repository-code: "https://github.com/maged15/beamgrad"
+keywords:
+  - beam search
+  - differentiable programming
+  - sequence generation
+  - pytorch
+  - cuda

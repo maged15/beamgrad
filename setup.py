@@ -1,0 +1,75 @@
+# SPDX-License-Identifier: MIT
+"""Build script for the beamgrad Python package (metadata lives in pyproject.toml).
+
+Extensions:
+  beamgrad._C       CPU operators (always built)
+  beamgrad._C_cuda  CUDA operators; BEAMGRAD_CUDA=auto (default) builds them
+                    when a CUDA toolkit and a CUDA-enabled PyTorch are present,
+                    1 requires them, 0 skips them. TORCH_CUDA_ARCH_LIST selects
+                    GPU architectures.
+  beamgrad._libdbs  the plain C library, loaded with ctypes (JAX integration)
+"""
+
+import os
+import sys
+from pathlib import Path
+
+import torch
+from setuptools import Extension, setup
+from torch.utils.cpp_extension import CUDA_HOME, BuildExtension, CppExtension, CUDAExtension
+
+ROOT = Path(__file__).resolve().parent
+CORE_SOURCES = sorted(p.relative_to(ROOT).as_posix() for p in (ROOT / "src").glob("*.cpp"))
+INCLUDE_DIRS = [str(ROOT / "include"), str(ROOT / "src")]
+WINDOWS = sys.platform == "win32"
+# The torch extensions use whatever C++ standard PyTorch requires (added by
+# BuildExtension); the core itself is C++17 and builds under C++17 or later.
+CXX_FLAGS = ["/O2"] if WINDOWS else ["-O3"]
+CXX17_FLAGS = CXX_FLAGS + (["/std:c++17"] if WINDOWS else ["-std=c++17", "-fvisibility=hidden"])
+
+
+def build_cuda() -> bool:
+    mode = os.environ.get("BEAMGRAD_CUDA", "auto").strip().lower()
+    if mode in {"0", "off", "false", "no"}:
+        return False
+    toolkit = CUDA_HOME is not None and torch.version.cuda is not None
+    if mode in {"1", "on", "true", "yes"}:
+        if not toolkit:
+            raise RuntimeError(
+                "BEAMGRAD_CUDA=1 requires a CUDA-enabled PyTorch and a CUDA toolkit (nvcc); "
+                "set CUDA_HOME if it is not found."
+            )
+        return True
+    if mode != "auto":
+        raise RuntimeError(f"BEAMGRAD_CUDA must be auto, 0 or 1, got {mode!r}")
+    return toolkit
+
+
+ext_modules = [
+    CppExtension(
+        "beamgrad._C",
+        ["python/csrc/cpu_ops.cpp", *CORE_SOURCES],
+        include_dirs=INCLUDE_DIRS,
+        extra_compile_args={"cxx": CXX_FLAGS},
+    ),
+    Extension(
+        "beamgrad._libdbs",
+        ["python/csrc/libdbs_module.cpp", *CORE_SOURCES],
+        include_dirs=INCLUDE_DIRS,
+        define_macros=[("DBS_BUILD_SHARED", "1"), ("DBS_COMPILING_LIBRARY", "1")],
+        extra_compile_args=CXX17_FLAGS,
+        language="c++",
+    ),
+]
+
+if build_cuda():
+    ext_modules.append(
+        CUDAExtension(
+            "beamgrad._C_cuda",
+            ["python/csrc/cuda_ops.cpp", "cuda/dbs_cuda.cu"],
+            include_dirs=INCLUDE_DIRS,
+            extra_compile_args={"cxx": CXX_FLAGS, "nvcc": ["-O3"]},
+        )
+    )
+
+setup(ext_modules=ext_modules, cmdclass={"build_ext": BuildExtension})

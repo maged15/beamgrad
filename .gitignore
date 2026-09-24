@@ -1,0 +1,33 @@
+# Build trees
+build/
+build-*/
+cmake-build-*/
+dist/
+*.egg-info/
+
+# Compiled artifacts
+*.o
+*.obj
+*.a
+*.lib
+*.so
+*.so.*
+*.dylib
+*.dll
+*.exe
+*.pyd
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+.venv/
+
+# Tooling output
+benchmarks/results/
+crash-*
+leak-*
+timeout-*
+.vscode/
+.idea/

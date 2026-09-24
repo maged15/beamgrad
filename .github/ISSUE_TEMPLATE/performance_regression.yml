@@ -1,0 +1,19 @@
+name: Performance issue
+description: Something is slower than expected or than a previous version
+labels: [performance]
+body:
+  - type: textarea
+    id: benchmark
+    attributes:
+      label: Benchmark output
+      description: Output of `python benchmarks/benchmark.py` (or a minimal timing script), before and after if this is a regression.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: environment
+    attributes:
+      label: Environment
+      description: beamgrad version, CPU or GPU model, PyTorch and CUDA versions, thread settings.
+    validations:
+      required: true

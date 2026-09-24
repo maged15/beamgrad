@@ -1,0 +1,50 @@
+# Runs the CUDA test suite and benchmark on real NVIDIA hardware.
+# GitHub-hosted runners have no GPU, so this needs a self-hosted runner labelled
+# `gpu` and the repository variable BEAMGRAD_GPU_RUNNER=true.
+name: GPU
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+  schedule:
+    - cron: "17 3 * * 1"
+
+permissions:
+  contents: read
+
+jobs:
+  gpu:
+    if: vars.BEAMGRAD_GPU_RUNNER == 'true'
+    runs-on: [self-hosted, linux, x64, gpu]
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v5
+      - name: Environment
+        run: |
+          nvidia-smi
+          nvcc --version
+      - name: C/C++/CUDA libraries
+        run: |
+          cmake -S . -B build-cuda -DDBS_ENABLE_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=native
+          cmake --build build-cuda --parallel
+          ctest --test-dir build-cuda --output-on-failure
+      - name: Python package
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --upgrade pip "setuptools>=77" wheel ninja torch
+          BEAMGRAD_CUDA=1 pip install --no-build-isolation ".[test]"
+          python -c "import beamgrad; assert beamgrad.cuda_available()"
+      - name: CUDA tests
+        run: |
+          . .venv/bin/activate
+          DBS_CUDA_SYNC_CHECK=1 python -m pytest python/tests -q
+      - name: Benchmark
+        run: |
+          . .venv/bin/activate
+          python benchmarks/benchmark.py --repeats 20 --csv benchmark-gpu.csv
+      - uses: actions/upload-artifact@v4
+        with:
+          name: benchmark-gpu
+          path: benchmark-gpu.csv

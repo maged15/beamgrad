@@ -1,0 +1,66 @@
+[build-system]
+# PyTorch is needed at build time for the extension headers. Build without
+# isolation (`pip install --no-build-isolation .`) so the extension is compiled
+# against the torch you will import at runtime.
+requires = ["setuptools>=77", "wheel", "torch>=2.1"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "beamgrad"
+dynamic = ["version"]
+description = "Differentiable beam search for PyTorch: exact beam search forward, surrogate gradients backward, native on CPU and CUDA."
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "Maged Amr" }]
+requires-python = ">=3.10"
+dependencies = ["torch>=2.1"]
+keywords = ["beam search", "differentiable", "pytorch", "cuda", "sequence generation", "surrogate gradients"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "Intended Audience :: Developers",
+    "Operating System :: POSIX :: Linux",
+    "Operating System :: MacOS",
+    "Operating System :: Microsoft :: Windows",
+    "Programming Language :: C",
+    "Programming Language :: C++",
+    "Programming Language :: Python :: 3",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
+[project.optional-dependencies]
+jax = ["jax>=0.4.20", "numpy>=1.23"]
+test = ["pytest>=7", "numpy>=1.23"]
+
+[project.urls]
+Homepage = "https://github.com/maged15/beamgrad"
+Documentation = "https://github.com/maged15/beamgrad/tree/main/docs"
+Issues = "https://github.com/maged15/beamgrad/issues"
+Changelog = "https://github.com/maged15/beamgrad/blob/main/CHANGELOG.md"
+
+[tool.setuptools]
+package-dir = { "" = "python" }
+packages = ["beamgrad"]
+
+[tool.setuptools.package-data]
+beamgrad = ["py.typed"]
+
+[tool.setuptools.dynamic]
+version = { file = ["VERSION"] }
+
+[tool.pytest.ini_options]
+testpaths = ["python/tests"]
+addopts = "-ra"
+
+[tool.ruff]
+line-length = 120
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "B", "UP"]
+
+[tool.ruff.lint.isort]
+known-first-party = ["beamgrad"]

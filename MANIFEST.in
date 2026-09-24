@@ -1,0 +1,8 @@
+include VERSION LICENSE README.md CHANGELOG.md CMakeLists.txt
+recursive-include include *.h
+recursive-include src *.cpp *.hpp
+recursive-include cuda *.cu *.cpp *.hpp
+recursive-include python/csrc *.cpp
+recursive-include cmake *.in *.map
+recursive-include pkgconfig *.in
+recursive-include abi *.symbols
