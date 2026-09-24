@@ -103,8 +103,10 @@ DBS_HOST_DEVICE inline float gnmt_length_penalty(int length, float alpha) {
     const int l = length > 1 ? length : 1;
     const double base = penalty_detail::div(5.0 + static_cast<double>(l), 6.0);
     // Small integer exponents by repeated squaring, which is exact whenever the
-    // result fits in a double (e.g. alpha = 1, 2, 3 on short hypotheses).
-    if (alpha == static_cast<float>(static_cast<int>(alpha)) && alpha <= 64.0f) {
+    // result fits in a double (e.g. alpha = 1, 2, 3 on short hypotheses). The
+    // range check comes first: converting a float beyond INT_MAX to int is
+    // undefined behaviour.
+    if (alpha <= 64.0f && alpha == static_cast<float>(static_cast<int>(alpha))) {
         int n = static_cast<int>(alpha);
         double result = 1.0;
         double b = base;

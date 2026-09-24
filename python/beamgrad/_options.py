@@ -80,15 +80,22 @@ class BeamOptions:
         if not math.isfinite(penalty) or penalty <= 0.0:
             raise ValueError(f"repetition_penalty must be finite and positive, got {self.repetition_penalty!r}")
 
-    def banned_mask(self, vocab_size: int) -> list[int] | None:
-        """The banned tokens as a ``[vocab_size]`` 0/1 list, or ``None``."""
+    def banned_ids(self, vocab_size: int) -> tuple[int, ...] | None:
+        """The banned token ids, checked against ``vocab_size``, or ``None``."""
         if not self.banned_tokens:
             return None
         if max(self.banned_tokens) >= vocab_size:
             raise ValueError(
                 f"banned_tokens {self.banned_tokens} include ids outside the vocabulary (size {vocab_size})"
             )
+        return self.banned_tokens
+
+    def banned_mask(self, vocab_size: int) -> list[int] | None:
+        """The banned tokens as a ``[vocab_size]`` 0/1 list, or ``None``."""
+        ids = self.banned_ids(vocab_size)
+        if ids is None:
+            return None
         mask = [0] * vocab_size
-        for token in self.banned_tokens:
+        for token in ids:
             mask[token] = 1
         return mask

@@ -194,6 +194,18 @@ if(DBS_BUILD_TESTS)
     endif()
   endif()
 
+  # The native CUDA backend on a real GPU against libdbs, bit for bit. Skipped
+  # (exit code 77) when no device is present.
+  if(DBS_ENABLE_CUDA)
+    find_package(CUDAToolkit REQUIRED)
+    add_executable(dbs_cuda_device_tests tests/cuda_device_tests.cpp)
+    target_include_directories(dbs_cuda_device_tests PRIVATE tests)
+    target_link_libraries(dbs_cuda_device_tests PRIVATE dbs dbs_cuda CUDA::cudart)
+    dbs_set_warnings(dbs_cuda_device_tests)
+    add_test(NAME dbs_cuda_device_tests COMMAND dbs_cuda_device_tests)
+    set_tests_properties(dbs_cuda_device_tests PROPERTIES SKIP_RETURN_CODE 77)
+  endif()
+
   if(UNIX AND NOT APPLE AND DBS_BUILD_SHARED)
     add_test(NAME dbs_abi_symbols
       COMMAND bash ${PROJECT_SOURCE_DIR}/scripts/check_abi.sh $<TARGET_FILE:dbs>)

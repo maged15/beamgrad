@@ -65,6 +65,7 @@ selects GPU architectures, for example `"8.0;9.0"`.
 | `dbs_tests` | the C ABI: decoding, constraints, EOS, batching, typed input, backward vs finite differences, options validation, error reporting |
 | `dbs_internal_tests` | every SIMD row scan the host supports against the scalar reference, bit for bit, on random rows (ties, `-inf`, NaN/`+inf`, banned and masked tokens); full decode + backward on every path; constrained decoding against a direct reference implementation; input validation; model-step decoding |
 | `dbs_cuda_emulation_tests` | the CUDA engine, run through the emulation layer under three thread schedules, against libdbs, bit for bit (Linux) |
+| `dbs_cuda_device_tests` | with `DBS_ENABLE_CUDA=ON`: the compiled CUDA engine on a real GPU against libdbs, bit for bit (decode trace, final scores, gradient) on randomized cases, and the NaN/`+inf` flags; skipped without a GPU |
 | `dbs_c_api_test` | both headers compile as C and both libraries export their API |
 | `dbs_example_c_api` | `examples/c_api.c` builds and runs |
 | `dbs_abi_symbols` | exported symbols match `abi/libdbs.symbols` and keep the baseline (Linux, shared builds) |
@@ -75,7 +76,7 @@ Release and Debug builds.
 `pytest python/tests` covers the Python API (exact parity with the C ABI,
 finite-difference gradients, path/score consistency, EOS/min-length/length
 penalty, constraints, variable steps, validation, `torch.compile`, fake
-tensors, `torch.vmap`), the ctypes bindings, JAX (values, gradients, `jit`,
+tensors, `torch.vmap`, `torch.func`), the ctypes bindings, JAX (values, gradients, `jit`,
 `vmap`, validation), and exact CUDA-vs-CPU parity (when a GPU is available).
 
 Sanitizers and fuzzing:

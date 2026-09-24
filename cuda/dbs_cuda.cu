@@ -9,16 +9,23 @@
 //      and penalises.
 //   1. A scan kernel turns the K*V candidates of every example into 64-bit keys
 //          ordered(raw score) << 32 | ~(p * V + v)
-//      and keeps the K largest per block: for K <= 16, every thread keeps its
-//      own top K in registers over a chunk of kChunk candidates and the block
-//      sorts only those (scan_small_kernel); for larger beams each block sorts
-//      a tile of kTile candidates (scan_tiles_kernel). Both check every element
-//      of the rows they read for NaN and +inf.
+//      and keeps the K largest per block, in no particular order: for K <= 16,
+//      every thread keeps its own top K in registers over a chunk of
+//      candidates (scan_small_kernel, with chunks sized so that even a single
+//      example fills the GPU); for larger beams every thread holds kTile /
+//      kThreads candidates (scan_tiles_kernel). The block then finds its K
+//      largest keys with a radix select (block_top_k), which sorts nothing.
+//      Both scans check every element of the rows they read for NaN and +inf.
 //   2. reduce_tiles_kernel: block winners are reduced the same way until at
 //      most kTile keys per example remain.
-//   3. select_step_kernel: one block per example sorts the survivors, merges
-//      them with the EOS carry-forward candidates, writes the step's beams and
-//      advances the beam state (and the beams' token prefixes).
+//   3. select_step_kernel: one block per example selects the K best survivors
+//      the same way and sorts only those, merges them with the EOS
+//      carry-forward candidates, writes the step's beams and advances the beam
+//      state (and the beams' token prefixes).
+//
+// Keys are unique, so "the K largest keys" is a set that does not depend on
+// how candidates are split into blocks or in which order a block emits them;
+// sorting the K winners in step 3 makes the result deterministic.
 //
 // Why a 64-bit key reproduces the CPU order exactly: the CPU ranks candidates
 // by (score, raw, parent, token, length, origin). Every scanned candidate of a
@@ -59,17 +66,21 @@
 namespace {
 
 constexpr int kThreads = 256;                 // threads per block for scan/select kernels
-constexpr int kTile = 4096;                   // candidates sorted per block (large beams)
+constexpr int kTile = 4096;                   // candidates per block (large beams) and per reduction slice
+constexpr int kTileItems = kTile / kThreads;  // keys per thread in the tile scan and the reduction
 constexpr int kSmallBeam = 16;                // largest beam handled by the register top-k scan
-constexpr int kSmallItems = 32;               // candidates per thread in the register top-k scan
-constexpr int kChunk = kThreads * kSmallItems;
+constexpr int kSmallItemsMin = 4;             // candidates per thread in the register top-k scan ...
+constexpr int kSmallItemsMax = 32;            // ... chosen in this range from the problem size
+constexpr int kTargetBlocks = 512;            // scan blocks worth launching to fill a large GPU
+constexpr int kMaxGridY = 65535;
 constexpr int kMaxBeam = DBS_CUDA_MAX_BEAM;
 constexpr int kBackwardThreads = 256;
 constexpr int64_t kAlign = 256;               // workspace sub-buffer alignment
 
 static_assert(kTile % kThreads == 0, "tile must be a multiple of the block size");
 static_assert(2 * kMaxBeam <= kTile, "tile reduction must shrink the candidate set");
-static_assert(kThreads * kSmallBeam <= kTile, "the register scan's merge must fit a tile");
+static_assert(kThreads >= 16, "block_top_k clears its 16-bin histogram with the first 16 threads");
+static_assert((kMaxBeam & (kMaxBeam - 1)) == 0, "select_step_kernel sorts next_pow2(beam) <= kMaxBeam keys");
 
 std::atomic<int> g_synchronize{0};
 
@@ -147,6 +158,100 @@ __device__ void bitonic_sort(Key* keys, int n) {
             __syncthreads();
         }
     }
+}
+
+// Shared state of block_top_k.
+struct TopKShared {
+    int hist[16];
+    int count;
+    int remaining;
+    int done;
+    uint64_t prefix;
+    uint64_t mask;
+};
+
+// Writes the k largest keys held by the block to out[0, k), in no particular
+// order, padded with 0 (no candidate) when fewer than k keys are non-zero.
+// Every thread holds ITEMS keys; non-zero keys must be unique (candidate keys
+// are), so the k largest form one well-defined set. A radix select over 4-bit
+// digits, most significant first, narrows down the k-th largest key until the
+// keys above it plus its digit bucket are exactly k; nothing is sorted. Must
+// be called by every thread of the block.
+template <int ITEMS>
+__device__ void block_top_k(const uint64_t (&keys)[ITEMS], int k, uint64_t* __restrict__ out, TopKShared& s) {
+    const int tid = static_cast<int>(threadIdx.x);
+    if (tid == 0) s.count = 0;
+    __syncthreads();
+    int nonzero = 0;
+#pragma unroll
+    for (int j = 0; j < ITEMS; ++j) nonzero += keys[j] != 0 ? 1 : 0;
+    if (nonzero) atomicAdd(&s.count, nonzero);
+    __syncthreads();
+    const bool take_all = s.count <= k;
+    __syncthreads();  // every thread has read the count before it is reused below
+
+    uint64_t prefix = 0;
+    uint64_t mask = 0;
+    if (!take_all) {
+        if (tid == 0) {
+            s.prefix = 0;
+            s.mask = 0;
+            s.remaining = k;
+        }
+        for (int shift = 60; shift >= 0; shift -= 4) {
+            if (tid < 16) s.hist[tid] = 0;
+            __syncthreads();
+            prefix = s.prefix;
+            mask = s.mask;
+            // Count the digits of the keys still in the running; neighbouring
+            // keys of a thread often share a digit, so runs are added at once.
+            int digit = -1;
+            int run = 0;
+#pragma unroll
+            for (int j = 0; j < ITEMS; ++j) {
+                if ((keys[j] & mask) != prefix) continue;
+                const int d = static_cast<int>((keys[j] >> shift) & 15u);
+                if (d != digit) {
+                    if (run) atomicAdd(&s.hist[digit], run);
+                    digit = d;
+                    run = 0;
+                }
+                ++run;
+            }
+            if (run) atomicAdd(&s.hist[digit], run);
+            __syncthreads();
+            if (tid == 0) {
+                // The digit of the k-th largest key, and its rank within that digit's bucket.
+                int remaining = s.remaining;
+                int d = 15;
+                while (d > 0 && s.hist[d] < remaining) remaining -= s.hist[d--];
+                s.prefix |= static_cast<uint64_t>(d) << shift;
+                s.mask |= static_cast<uint64_t>(15) << shift;
+                s.remaining = remaining;
+                s.done = s.hist[d] == remaining;  // the whole bucket belongs to the top k
+            }
+            __syncthreads();
+            if (s.done) break;
+        }
+        prefix = s.prefix;
+        mask = s.mask;
+    }
+
+    // Keys above the k-th largest key's bucket, and that bucket: exactly k keys.
+    if (tid == 0) s.count = 0;
+    __syncthreads();
+    int take = 0;
+#pragma unroll
+    for (int j = 0; j < ITEMS; ++j) take += (take_all ? keys[j] != 0 : (keys[j] & mask) >= prefix) ? 1 : 0;
+    int pos = take ? atomicAdd(&s.count, take) : 0;
+#pragma unroll
+    for (int j = 0; j < ITEMS; ++j) {
+        const bool selected = take_all ? keys[j] != 0 : (keys[j] & mask) >= prefix;
+        if (selected && pos < k) out[pos++] = keys[j];
+    }
+    __syncthreads();
+    const int written = s.count < k ? s.count : k;
+    for (int i = written + tid; i < k; i += static_cast<int>(blockDim.x)) out[i] = 0;
 }
 
 // Candidate as ranked by the CPU decoder (dbs::candidate_better).
@@ -302,7 +407,7 @@ __global__ void constraint_kernel(DBSCudaDecodeArgs a, int t, ConstraintState c,
 }
 
 // grid = (B, chunks), for beam_size <= KMAX <= kSmallBeam. Every thread keeps
-// its KMAX best keys in registers; the block then sorts K keys per thread and
+// the KMAX best keys of its `items` candidates in registers, and the block
 // writes the K best keys of its chunk (0 = no candidate).
 template <int KMAX>
 __global__ void scan_small_kernel(
@@ -312,12 +417,12 @@ __global__ void scan_small_kernel(
     const int32_t* __restrict__ beam_len,
     const uint8_t* __restrict__ beam_ended,
     uint64_t* __restrict__ out_keys,
-    int chunks) {
-    __shared__ uint64_t keys[kThreads * KMAX];
+    int chunks,
+    int items) {
     __shared__ float parent_raw[KMAX];
     __shared__ int32_t parent_len[KMAX];
     __shared__ int expand[KMAX];
-    __shared__ int any_valid;
+    __shared__ TopKShared topk;
 
     const int b = static_cast<int>(blockIdx.x);
     const int chunk = static_cast<int>(blockIdx.y);
@@ -326,7 +431,6 @@ __global__ void scan_small_kernel(
     const Meta m = load_meta(p.a, b);
     const bool step_active = t < m.steps;
 
-    if (threadIdx.x == 0) any_valid = 0;
     for (int k = static_cast<int>(threadIdx.x); k < K; k += static_cast<int>(blockDim.x)) {
         const int64_t s = static_cast<int64_t>(b) * K + k;
         parent_raw[k] = beam_raw[s];
@@ -342,10 +446,10 @@ __global__ void scan_small_kernel(
 
     if (step_active) {
         const int64_t total = static_cast<int64_t>(K) * V;
-        int64_t c = static_cast<int64_t>(chunk) * kChunk + threadIdx.x;
+        int64_t c = static_cast<int64_t>(chunk) * kThreads * items + threadIdx.x;
         int parent = static_cast<int>(c / V);
         int token = static_cast<int>(c - static_cast<int64_t>(parent) * V);
-        for (int i = 0; i < kSmallItems && c < total; ++i) {
+        for (int i = 0; i < items && c < total; ++i) {
             if (expand[parent]) {
                 const uint64_t key = candidate_key(p, b, t, parent, token, parent_raw[parent], parent_len[parent], m,
                                                    static_cast<uint32_t>(c), invalid);
@@ -372,22 +476,7 @@ __global__ void scan_small_kernel(
     if (invalid && p.invalid) p.invalid[b] = 1;
 
     // The chunk's K best keys are among the threads' K best.
-#pragma unroll
-    for (int j = 0; j < KMAX; ++j) {
-        if (j < K) keys[threadIdx.x * K + j] = best[j];
-    }
-    if (best[0] != 0) atomicOr(&any_valid, 1);
-    const int n = next_pow2(kThreads * K);
-    for (int i = kThreads * K + static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) keys[i] = 0;
-    __syncthreads();
-
-    const bool active = any_valid != 0;
-    if (active) bitonic_sort<uint64_t, true>(keys, n);
-
-    uint64_t* out = out_keys + (static_cast<int64_t>(b) * chunks + chunk) * K;
-    for (int i = static_cast<int>(threadIdx.x); i < K; i += static_cast<int>(blockDim.x)) {
-        out[i] = active ? keys[i] : 0;
-    }
+    block_top_k(best, K, out_keys + (static_cast<int64_t>(b) * chunks + chunk) * K, topk);
 }
 
 // grid = (B, tiles). Writes the K best keys of each tile (0 = no candidate).
@@ -399,8 +488,7 @@ __global__ void scan_tiles_kernel(
     const uint8_t* __restrict__ beam_ended,
     uint64_t* __restrict__ out_keys,
     int tiles) {
-    __shared__ uint64_t keys[kTile];
-    __shared__ int any_valid;
+    __shared__ TopKShared topk;
 
     const int b = static_cast<int>(blockIdx.x);
     const int tile = static_cast<int>(blockIdx.y);
@@ -410,15 +498,13 @@ __global__ void scan_tiles_kernel(
     const int64_t base = static_cast<int64_t>(tile) * kTile;
     const int64_t remaining = static_cast<int64_t>(K) * V - base;
     const int count = static_cast<int>(remaining < kTile ? remaining : kTile);
-    const int n = next_pow2(count);
     const bool step_active = t < m.steps;
 
-    if (threadIdx.x == 0) any_valid = 0;
-    __syncthreads();
-
-    int mine = 0;
+    uint64_t keys[kTileItems];
     bool invalid = false;
-    for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) {
+#pragma unroll
+    for (int j = 0; j < kTileItems; ++j) {
+        const int i = static_cast<int>(threadIdx.x) + j * kThreads;
         uint64_t key = 0;
         if (step_active && i < count) {
             const int64_t c = base + i;
@@ -433,20 +519,11 @@ __global__ void scan_tiles_kernel(
                 }
             }
         }
-        keys[i] = key;
-        mine |= key != 0 ? 1 : 0;
+        keys[j] = key;
     }
     if (invalid && p.invalid) p.invalid[b] = 1;
-    if (mine) atomicOr(&any_valid, 1);
-    __syncthreads();
 
-    const bool active = any_valid != 0;
-    if (active) bitonic_sort<uint64_t, true>(keys, n);
-
-    uint64_t* out = out_keys + (static_cast<int64_t>(b) * tiles + tile) * K;
-    for (int i = static_cast<int>(threadIdx.x); i < K; i += static_cast<int>(blockDim.x)) {
-        out[i] = (active && i < n) ? keys[i] : 0;
-    }
+    block_top_k(keys, K, out_keys + (static_cast<int64_t>(b) * tiles + tile) * K, topk);
 }
 
 // grid = (B, tiles_out). Keeps the K best of each kTile slice of in_keys.
@@ -456,35 +533,21 @@ __global__ void reduce_tiles_kernel(
     int K,
     uint64_t* __restrict__ out_keys,
     int tiles_out) {
-    __shared__ uint64_t keys[kTile];
-    __shared__ int any_valid;
+    __shared__ TopKShared topk;
 
     const int b = static_cast<int>(blockIdx.x);
     const int tile = static_cast<int>(blockIdx.y);
     const int base = tile * kTile;
     const int count = (n_in - base) < kTile ? (n_in - base) : kTile;
-    const int n = next_pow2(count);
     const uint64_t* in = in_keys + static_cast<int64_t>(b) * n_in + base;
 
-    if (threadIdx.x == 0) any_valid = 0;
-    __syncthreads();
-
-    int mine = 0;
-    for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) {
-        const uint64_t key = i < count ? in[i] : 0;
-        keys[i] = key;
-        mine |= key != 0 ? 1 : 0;
+    uint64_t keys[kTileItems];
+#pragma unroll
+    for (int j = 0; j < kTileItems; ++j) {
+        const int i = static_cast<int>(threadIdx.x) + j * kThreads;
+        keys[j] = i < count ? in[i] : 0;
     }
-    if (mine) atomicOr(&any_valid, 1);
-    __syncthreads();
-
-    const bool active = any_valid != 0;
-    if (active) bitonic_sort<uint64_t, true>(keys, n);
-
-    uint64_t* out = out_keys + (static_cast<int64_t>(b) * tiles_out + tile) * K;
-    for (int i = static_cast<int>(threadIdx.x); i < K; i += static_cast<int>(blockDim.x)) {
-        out[i] = (active && i < n) ? keys[i] : 0;
-    }
+    block_top_k(keys, K, out_keys + (static_cast<int64_t>(b) * tiles_out + tile) * K, topk);
 }
 
 struct StepOutputs {
@@ -531,8 +594,9 @@ struct SelectShared {
     uint8_t state_ended[kMaxBeam];
     int n_scanned;
     int n_carry;
+    TopKShared topk;
     union {
-        uint64_t keys[kTile];
+        uint64_t keys[kMaxBeam];  // the step's best m.beam keys, sorted
         struct {
             float s_score[kMaxBeam];
             float s_raw[kMaxBeam];
@@ -579,11 +643,17 @@ __global__ void select_step_kernel(
         sh.state_len[k] = beam_len[s];
         sh.state_ended[k] = beam_ended[s];
     }
-    const int n = next_pow2(n_in);
+    // The m.beam best of the n_in (<= kTile) surviving keys, then sorted.
     const uint64_t* in = in_keys + static_cast<int64_t>(b) * n_in;
-    for (int i = static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) {
-        sh.u.keys[i] = i < n_in ? in[i] : 0;
+    uint64_t survivors[kTileItems];
+#pragma unroll
+    for (int j = 0; j < kTileItems; ++j) {
+        const int i = static_cast<int>(threadIdx.x) + j * kThreads;
+        survivors[j] = i < n_in ? in[i] : 0;
     }
+    block_top_k(survivors, m.beam, sh.u.keys, sh.topk);
+    const int n = next_pow2(m.beam);
+    for (int i = m.beam + static_cast<int>(threadIdx.x); i < n; i += static_cast<int>(blockDim.x)) sh.u.keys[i] = 0;
     __syncthreads();
     bitonic_sort<uint64_t, true>(sh.u.keys, n);
 
@@ -857,14 +927,27 @@ bool valid_args(const DBSCudaDecodeArgs* a) {
     // in gridDim.y (65535 tiles of kTile candidates, about 268M candidates).
     const int64_t candidates = static_cast<int64_t>(a->beam_size) * a->vocab_size;
     if (candidates > std::numeric_limits<int32_t>::max()) return false;
-    if (ceil_div(candidates, kTile) > 65535) return false;
+    if (ceil_div(candidates, kTile) > kMaxGridY) return false;
     // All tensor element counts must fit in int64.
     const double elements = static_cast<double>(a->batch_size) * a->steps * a->beam_size * a->vocab_size;
     return elements < 9.0e18;
 }
 
+// Candidates per thread of the register top-k scan: few enough that the whole
+// batch spans about kTargetBlocks blocks (so one example still fills a large
+// GPU), but at least kSmallItemsMin, and enough to keep the grid within
+// kMaxGridY blocks per example. Depends only on the arguments, so workspace
+// sizes do not depend on the device.
+int small_scan_items(const DBSCudaDecodeArgs& a) {
+    const int64_t per_example = static_cast<int64_t>(a.beam_size) * a.vocab_size;
+    int64_t items = ceil_div(per_example * a.batch_size, static_cast<int64_t>(kTargetBlocks) * kThreads);
+    items = std::max<int64_t>(items, ceil_div(per_example, static_cast<int64_t>(kMaxGridY) * kThreads));
+    return static_cast<int>(std::min<int64_t>(kSmallItemsMax, std::max<int64_t>(kSmallItemsMin, items)));
+}
+
 struct DecodePlan {
     bool small;          // register top-k scan (beam_size <= kSmallBeam)
+    int small_items;     // candidates per thread in the register top-k scan
     int blocks0;         // scan blocks per example
     int words;           // constraint bitmap words per beam
     int64_t state_raw_offset;
@@ -891,7 +974,8 @@ DecodePlan make_plan(const DBSCudaDecodeArgs& a) {
     const int64_t T = a.steps;
     const int64_t candidates = K * a.vocab_size;
     p.small = K <= kSmallBeam;
-    p.blocks0 = static_cast<int>(ceil_div(candidates, p.small ? kChunk : kTile));
+    p.small_items = small_scan_items(a);
+    p.blocks0 = static_cast<int>(ceil_div(candidates, p.small ? static_cast<int64_t>(kThreads) * p.small_items : kTile));
     const int64_t n0 = static_cast<int64_t>(p.blocks0) * K;
     const int64_t n1 = n0 > kTile ? ceil_div(n0, kTile) * K : 0;
     int64_t off = 0;
@@ -987,15 +1071,15 @@ void launch_scan(const DecodePlan& plan, const ScanParams& params, int t, const 
     }
     const int K = params.a.beam_size;
     if (K <= 1) {
-        DBS_LAUNCH(scan_small_kernel<1>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0);
+        DBS_LAUNCH(scan_small_kernel<1>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0, plan.small_items);
     } else if (K <= 2) {
-        DBS_LAUNCH(scan_small_kernel<2>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0);
+        DBS_LAUNCH(scan_small_kernel<2>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0, plan.small_items);
     } else if (K <= 4) {
-        DBS_LAUNCH(scan_small_kernel<4>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0);
+        DBS_LAUNCH(scan_small_kernel<4>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0, plan.small_items);
     } else if (K <= 8) {
-        DBS_LAUNCH(scan_small_kernel<8>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0);
+        DBS_LAUNCH(scan_small_kernel<8>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0, plan.small_items);
     } else {
-        DBS_LAUNCH(scan_small_kernel<16>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0);
+        DBS_LAUNCH(scan_small_kernel<16>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0, plan.small_items);
     }
 }
 

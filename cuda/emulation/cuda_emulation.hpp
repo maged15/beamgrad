@@ -188,6 +188,12 @@ inline int atomicOr(int* address, int value) {
     return old;
 }
 
+inline int atomicAdd(int* address, int value) {
+    const int old = *address;
+    *address = old + value;
+    return old;
+}
+
 inline int atomicCAS(int* address, int compare, int value) {
     const int old = *address;
     if (old == compare) *address = value;

@@ -48,7 +48,8 @@ best = beamgrad.backtrack(trace)[:, 0]                  # [B, T] best sequence p
   for bit.
 - **A good PyTorch citizen.** The operators are registered with
   `torch.library`, with fake-tensor, autograd and vmap rules: `torch.compile`
-  (even `fullgraph=True`), `torch.export` and `torch.vmap` work.
+  (even `fullgraph=True`), `torch.export`, `torch.vmap` and `torch.func`
+  (`grad`, `vjp`, `jacrev`, per-example gradients) work.
 - **A stable C ABI.** `libdbs` works from C, C++ or any FFI. It adds forced
   tokens and token-filter callbacks, fp16/bf16 input, incremental
   model-callback decoding (with each beam's parent, for KV-cache reordering),

@@ -5,7 +5,10 @@ The work is done by two operators registered with ``torch.library``:
 ``torch.ops.beamgrad.decode`` and ``torch.ops.beamgrad.final_scores_backward``.
 They have fake (meta) implementations, an autograd formula and a vmap rule, so
 they work under ``torch.compile`` (without graph breaks), ``torch.export``,
-fake-tensor tracing and ``torch.vmap``.
+fake-tensor tracing and ``torch.vmap``. :func:`final_scores` differentiates
+through an ``autograd.Function`` with a separate ``setup_context``, which
+``torch.func`` transforms (``grad``, ``vjp``, ``jacrev``, ``vmap`` of those)
+require.
 """
 
 from __future__ import annotations
@@ -248,8 +251,12 @@ def _prepare(
         if steps_t.dim() != 1 or steps_t.shape[0] != B:
             raise ValueError(f"steps must have shape [B] = [{B}], got {tuple(steps_t.shape)}")
 
-    mask = options.banned_mask(V)
-    banned = None if mask is None else torch.tensor(mask, dtype=torch.uint8, device=x.device)
+    ids = options.banned_ids(V)
+    banned = None
+    if ids is not None:
+        # Scattered on the target device: a [V] Python list would cost milliseconds per call.
+        index = torch.tensor(ids, dtype=torch.long, device=x.device)
+        banned = torch.zeros(V, dtype=torch.uint8, device=x.device).index_fill_(0, index, 1)
     return x, steps_t, banned, unbatched
 
 
@@ -265,6 +272,49 @@ def _decode_op(x: torch.Tensor, steps_t: torch.Tensor | None, banned: torch.Tens
         float(options.repetition_penalty),
         options.validate_inputs,
     )
+
+
+class _FinalScores(torch.autograd.Function):
+    """The final scores and the trace their backward needs.
+
+    ``torch.ops.beamgrad.decode`` carries its own autograd formula, but
+    ``torch.library`` implements it as an ``autograd.Function`` whose forward
+    takes ``ctx``, which ``torch.func`` transforms reject. This function has
+    the same backward and a separate ``setup_context``; its vmap rule is
+    generated from the operators' own rules.
+    """
+
+    generate_vmap_rule = True
+
+    @staticmethod
+    def forward(x, steps, banned, options):
+        out = _decode_op(x, steps, banned, options)
+        final_scores_, _, _, tokens, parents, lengths, _, _, from_logprob = out
+        return final_scores_, tokens, parents, lengths, from_logprob
+
+    @staticmethod
+    def setup_context(ctx, inputs, output):
+        x, steps, _, options = inputs
+        _, tokens, parents, lengths, from_logprob = output
+        ctx.mark_non_differentiable(tokens, parents, lengths, from_logprob)
+        ctx.save_for_backward(parents, tokens, lengths, from_logprob, steps)
+        ctx.vocab_size = x.shape[-1]
+        ctx.length_penalty_alpha = float(options.length_penalty_alpha)
+
+    @staticmethod
+    def backward(ctx, grad_final_scores, *unused_grads):
+        parents, tokens, lengths, from_logprob, steps = ctx.saved_tensors
+        grad = torch.ops.beamgrad.final_scores_backward(
+            grad_final_scores.to(torch.float32).contiguous(),
+            parents,
+            tokens,
+            lengths,
+            from_logprob,
+            steps,
+            ctx.vocab_size,
+            ctx.length_penalty_alpha,
+        )
+        return grad, None, None, None
 
 
 def final_scores(log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike = None) -> torch.Tensor:
@@ -288,7 +338,7 @@ def final_scores(log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike
     holding the beam selection fixed.
     """
     x, steps_t, banned, unbatched = _prepare(log_probs, options, steps)
-    scores = _decode_op(x, steps_t, banned, options)[0]
+    scores = _FinalScores.apply(x, steps_t, banned, options)[0]
     return scores.squeeze(0) if unbatched else scores
 
 

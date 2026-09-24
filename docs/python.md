@@ -14,6 +14,8 @@ The work is done by two operators registered with `torch.library`
 with fake-tensor implementations, an autograd formula and a vmap rule, so
 beamgrad works inside `torch.compile` (including `fullgraph=True`), with
 `torch.export` and fake-tensor tracing, and under `torch.vmap` (PyTorch 2.5+).
+`final_scores` also works under the `torch.func` transforms (`grad`, `vjp`,
+`jacrev`, and `vmap` of them, for example per-example gradients).
 
 ## `BeamOptions`
 

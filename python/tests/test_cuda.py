@@ -147,6 +147,14 @@ def test_validation_on_device():
         final_scores(x, BeamOptions(beam_size=2))
 
 
+def test_torch_func_grad_matches_cpu():
+    options = BeamOptions(beam_size=3, eos_token=2, banned_tokens=[5])
+    x = random_log_probs(2, 5, 3, 64, seed=10)
+    cpu = torch.func.grad(lambda y: final_scores(y, options).sum())(x)
+    gpu = torch.func.grad(lambda y: final_scores(y, options).sum())(x.cuda())
+    assert torch.equal(gpu.cpu(), cpu)
+
+
 def test_torch_compile():
     options = BeamOptions(beam_size=4, eos_token=3)
     x = random_log_probs(2, 6, 4, 300, seed=9).cuda()
