@@ -4,10 +4,14 @@
 // emulation layer and checks it against the CPU decoder in libdbs:
 //   * every per-step output (tokens, parents, lengths, scores, raw scores,
 //     carry-forward flags) and every final score must be bitwise identical;
+//   * the NaN/+inf flags must match the CPU decoder's input validation;
 //   * the CUDA backward must reproduce dbs_backward_sparse() exactly.
-// Cases are randomized but seeded, and cover ties, -inf entries, EOS
-// carry-forward, min_length, length penalty, variable batches, multi-level
-// tile reduction, and the maximum beam size.
+// Cases are randomized but seeded, and cover ties, -inf, NaN and +inf entries,
+// EOS carry-forward, min_length, length penalty, banned tokens, n-gram
+// blocking, repetition penalty, variable batches, both scan kernels,
+// multi-level tile reduction, and the maximum beam size. Every case runs with
+// the block's threads scheduled forward, in reverse and shuffled, so a data
+// race between barriers shows up as a mismatch.
 #define DBS_CUDA_EMULATION 1
 #include "../cuda/dbs_cuda.cu"
 
@@ -27,7 +31,10 @@ struct Case {
     int min_length;
     float alpha;
     bool variable;
-    int value_mode;  // 0 continuous, 1 heavy ties, 2 sparse -inf
+    int value_mode;  // 0 continuous, 1 heavy ties, 2 sparse -inf, 3 ties with a few NaN/+inf, 4 many NaN/+inf
+    int ngram = 0;
+    float penalty = 0.0f;
+    bool banned = false;
 };
 
 bool same_bits(float a, float b) { return std::memcmp(&a, &b, sizeof(float)) == 0; }
@@ -44,10 +51,19 @@ std::vector<float> make_log_probs(const Case& c, std::mt19937& rng) {
     std::uniform_real_distribution<float> u(-9.0f, 0.0f);
     std::uniform_int_distribution<int> q(0, 3);
     std::uniform_int_distribution<int> coin(0, 9);
+    std::uniform_int_distribution<int> rare(0, 199);
     for (float& v : x) {
         switch (c.value_mode) {
             case 1: v = -0.5f * static_cast<float>(q(rng)); break;
             case 2: v = coin(rng) < 3 ? -std::numeric_limits<float>::infinity() : u(rng); break;
+            case 3:
+            case 4: {
+                const int r = c.value_mode == 4 ? rare(rng) % 12 : rare(rng);
+                v = r == 0 ? std::numeric_limits<float>::quiet_NaN()
+                  : r == 1 ? std::numeric_limits<float>::infinity()
+                  : -0.5f * static_cast<float>(q(rng));
+                break;
+            }
             default: v = u(rng); break;
         }
     }
@@ -70,6 +86,9 @@ int run_case(const Case& c, uint32_t seed) {
         }
     }
 
+    std::vector<uint8_t> banned(static_cast<size_t>(c.V), 0);
+    for (uint8_t& v : banned) v = rng() % (c.value_mode == 4 ? 2 : 6) == 0 ? 1 : 0;
+
     DBSCudaDecodeArgs args{};
     args.batch_size = c.B;
     args.steps = c.T;
@@ -78,6 +97,9 @@ int run_case(const Case& c, uint32_t seed) {
     args.eos_token = c.eos;
     args.min_length = c.min_length;
     args.length_penalty_alpha = c.alpha;
+    args.no_repeat_ngram_size = c.ngram;
+    args.repetition_penalty = c.penalty;
+    args.banned_tokens = c.banned ? banned.data() : nullptr;
     if (c.variable) {
         args.steps_per_example = steps.data();
         args.beam_sizes_per_example = beams.data();
@@ -95,7 +117,9 @@ int run_case(const Case& c, uint32_t seed) {
     g.scores.assign(BTK, 1.0f);
     g.raw_scores.assign(BTK, 1.0f);
     g.from_logprob.assign(BTK, 7);
+    std::vector<uint8_t> invalid(static_cast<size_t>(c.B), 7);
     DBSCudaDecodeOutputs out{};
+    out.invalid_input = invalid.data();
     out.final_scores = g.final_scores.data();
     out.final_raw_scores = g.final_raw.data();
     out.final_lengths = g.final_len.data();
@@ -117,8 +141,9 @@ int run_case(const Case& c, uint32_t seed) {
     int mismatches = 0;
     auto report = [&](const char* what, int b, int t, int k) {
         if (mismatches++ < 5) {
-            std::fprintf(stderr, "  mismatch %s b=%d t=%d k=%d (B=%d T=%d K=%d V=%d eos=%d minlen=%d alpha=%g var=%d mode=%d)\n",
-                         what, b, t, k, c.B, c.T, c.K, c.V, c.eos, c.min_length, c.alpha, c.variable, c.value_mode);
+            std::fprintf(stderr, "  mismatch %s b=%d t=%d k=%d (B=%d T=%d K=%d V=%d eos=%d minlen=%d alpha=%g var=%d mode=%d ngram=%d penalty=%g banned=%d)\n",
+                         what, b, t, k, c.B, c.T, c.K, c.V, c.eos, c.min_length, c.alpha, c.variable, c.value_mode,
+                         c.ngram, c.penalty, c.banned);
         }
     };
 
@@ -139,8 +164,24 @@ int run_case(const Case& c, uint32_t seed) {
             for (int k = 0; k < Kb; ++k)
                 std::memcpy(&local[(static_cast<size_t>(t) * Kb + k) * c.V],
                             &x[((static_cast<size_t>(b) * c.T + t) * c.K + k) * c.V], sizeof(float) * c.V);
+        DBSAdvancedConstraintsC constraints{};
+        constraints.min_length = -1;
+        constraints.banned_tokens = c.banned ? banned.data() : nullptr;
+        constraints.no_repeat_ngram_size = c.ngram;
+        constraints.repetition_penalty = c.penalty;
         DBSResultHandle* r = nullptr;
-        CHECK(dbs_decode(h, local.data(), Tb, c.V, &r) == 0);
+        CHECK(dbs_decode_constrained_ex(h, local.data(), Tb, c.V, &constraints, &r) == 0);
+
+        // The NaN/+inf flag matches the CPU decoder's validation of the rows it reads.
+        DBSOptionsC strict = opt;
+        strict.validate_inputs = 1;
+        DBSDecoderHandle* hs = nullptr;
+        CHECK(dbs_create_ex(strict, &hs) == 0);
+        DBSResultHandle* rs = nullptr;
+        const int rc_strict = dbs_decode_constrained_ex(hs, local.data(), Tb, c.V, &constraints, &rs);
+        if (rs) dbs_free_result(rs);
+        dbs_destroy(hs);
+        if ((rc_strict != 0) != (invalid[static_cast<size_t>(b)] != 0)) report("invalid flag", b, -1, -1);
 
         const int32_t* tok = dbs_result_tokens(r);
         const int32_t* par = dbs_result_parents(r);
@@ -210,6 +251,16 @@ int run_case(const Case& c, uint32_t seed) {
     return mismatches;
 }
 
+int run_all_schedules(const Case& c, uint32_t seed) {
+    int failures = 0;
+    for (auto schedule : {dbs_emu::Schedule::Forward, dbs_emu::Schedule::Reverse, dbs_emu::Schedule::Shuffled}) {
+        dbs_emu::set_schedule(schedule, seed);
+        failures += run_case(c, seed) != 0 ? 1 : 0;
+    }
+    dbs_emu::set_schedule(dbs_emu::Schedule::Forward);
+    return failures;
+}
+
 void test_randomized_parity() {
     std::mt19937 rng(20240917);
     int cases = 0;
@@ -224,19 +275,96 @@ void test_randomized_parity() {
         c.min_length = static_cast<int>(rng() % 3);
         c.alpha = (rng() % 3) * 0.35f;
         c.variable = rng() % 3 == 0;
-        c.value_mode = static_cast<int>(rng() % 3);
-        failures += run_case(c, static_cast<uint32_t>(rng())) != 0 ? 1 : 0;
+        c.value_mode = static_cast<int>(rng() % 4);
+        if (rng() % 3 == 0) {
+            c.ngram = static_cast<int>(rng() % 4);
+            const float penalties[] = {0.0f, 1.0f, 1.3f, 2.0f};
+            c.penalty = penalties[rng() % 4];
+            c.banned = rng() % 2 == 0;
+        }
+        failures += run_all_schedules(c, static_cast<uint32_t>(rng()));
         ++cases;
     }
+    // Both scan kernels around their boundary, with constraints.
+    for (int K : {15, 16, 17, 32}) {
+        failures += run_all_schedules(Case{2, 4, K, 37, 3, 2, 0.6f, false, 3, 2, 1.5f, true}, 10u + K);
+        failures += run_all_schedules(Case{1, 3, K, 300, -1, 0, 0.0f, true, 1}, 20u + K);
+        cases += 2;
+    }
+    // Tiny vocabularies over many steps, so prefixes repeat and n-gram blocking
+    // and the repetition penalty act often.
+    for (int V : {2, 3, 5}) {
+        for (int ngram : {1, 2, 3, 4}) {
+            for (int K : {1, 3, 20}) {
+                const float penalty = (ngram % 2) ? 1.5f : 0.0f;
+                failures += run_all_schedules(Case{2, 10, K, V, V > 2 ? V - 1 : -1, 0, 0.5f, false, 1, ngram, penalty, false}, 100u + V * 10 + ngram);
+                ++cases;
+            }
+        }
+    }
+    // Many NaN/+inf entries, half the vocabulary banned, EOS masked by min_length:
+    // every entry of a row that is read must be checked.
+    for (int K : {2, 7, 18}) {
+        failures += run_all_schedules(Case{3, 5, K, 23, 4, 4, 0.3f, false, 4, 0, 0.0f, true}, 200u + K);
+        failures += run_all_schedules(Case{2, 4, K, 31, 1, 3, 0.0f, true, 4, 2, 1.3f, true}, 300u + K);
+        cases += 2;
+    }
+    // Several register-scan chunks per example (K*V > 8192).
+    failures += run_all_schedules(Case{2, 3, 4, 5000, 7, 1, 0.6f, false, 0}, 5);
+    failures += run_all_schedules(Case{1, 3, 16, 2100, 4, 0, 0.9f, false, 3, 3, 1.2f, true}, 6);
     // Multi-tile scans with a reduction level (K*V spans many 4096-candidate tiles).
-    failures += run_case(Case{2, 3, 64, 5000, 7, 1, 0.6f, false, 0}, 1) != 0 ? 1 : 0;
-    failures += run_case(Case{1, 2, 64, 4200, -1, 0, 0.0f, false, 1}, 2) != 0 ? 1 : 0;
+    failures += run_all_schedules(Case{2, 3, 64, 5000, 7, 1, 0.6f, false, 0}, 1);
+    failures += run_all_schedules(Case{1, 2, 64, 4200, -1, 0, 0.0f, false, 1, 1, 1.4f, false}, 2);
     // Maximum beam size.
-    failures += run_case(Case{1, 3, DBS_CUDA_MAX_BEAM, 9, 2, 0, 0.8f, false, 1}, 3) != 0 ? 1 : 0;
-    failures += run_case(Case{2, 2, DBS_CUDA_MAX_BEAM, 5, -1, 0, 0.0f, true, 0}, 4) != 0 ? 1 : 0;
-    cases += 4;
-    std::printf("cuda emulation parity: %d cases, %d failing\n", cases, failures);
+    failures += run_all_schedules(Case{1, 3, DBS_CUDA_MAX_BEAM, 9, 2, 0, 0.8f, false, 1}, 3);
+    failures += run_all_schedules(Case{2, 2, DBS_CUDA_MAX_BEAM, 5, -1, 0, 0.0f, true, 0}, 4);
+    cases += 6;
+    std::printf("cuda emulation parity: %d cases x 3 schedules, %d failing runs\n", cases, failures);
     CHECK(failures == 0);
+}
+
+// NaN/+inf flags for entries placed exactly where the search must still look
+// (banned tokens, EOS masked by min_length) or must not (rows it never reads).
+void test_validation_flags() {
+    const float nan = std::numeric_limits<float>::quiet_NaN();
+    const float inf = std::numeric_limits<float>::infinity();
+    for (int K : {2, 20}) {  // register scan and tile scan
+        const int B = 2, T = 3, V = 8;
+        struct Placement {
+            int b, t, k, v;
+            float value;
+            bool read;  // the search reads this row
+        };
+        const Placement placements[] = {
+            {0, 0, 0, 3, nan, true},    // banned token of a live row
+            {1, 0, 0, 5, inf, true},    // EOS masked by min_length
+            {0, 1, 1, 6, nan, true},    // second beam once it is live
+            {0, 0, 1, 2, nan, false},   // beam 1 is not live at step 0
+            {1, 0, K - 1, 0, inf, false},
+        };
+        std::vector<uint8_t> banned(V, 0);
+        banned[3] = 1;
+        for (const Placement& pl : placements) {
+            std::vector<float> x(static_cast<size_t>(B) * T * K * V);
+            for (size_t i = 0; i < x.size(); ++i) x[i] = -0.25f * static_cast<float>((i * 7) % 5) - 0.1f * static_cast<float>(i % V == 1);
+            x[((static_cast<size_t>(pl.b) * T + pl.t) * K + pl.k) * V + pl.v] = pl.value;
+            DBSCudaDecodeArgs a{};
+            a.batch_size = B;
+            a.steps = T;
+            a.beam_size = K;
+            a.vocab_size = V;
+            a.eos_token = 5;
+            a.min_length = 3;
+            a.banned_tokens = banned.data();
+            std::vector<float> scores(static_cast<size_t>(B) * K);
+            std::vector<uint8_t> invalid(B, 7);
+            DBSCudaDecodeOutputs out{};
+            out.final_scores = scores.data();
+            out.invalid_input = invalid.data();
+            CHECK(dbs_cuda_decode(x.data(), &a, &out, nullptr, 0, nullptr) == DBS_CUDA_STATUS_OK);
+            for (int b = 0; b < B; ++b) CHECK(invalid[b] == ((b == pl.b && pl.read) ? 1 : 0));
+        }
+    }
 }
 
 void test_argument_validation() {
@@ -261,6 +389,13 @@ void test_argument_validation() {
     bad = a;
     bad.length_penalty_alpha = -1.0f;
     CHECK(dbs_cuda_decode(x.data(), &bad, &out, nullptr, 0, nullptr) == DBS_CUDA_STATUS_INVALID_ARGUMENT);
+    bad = a;
+    bad.repetition_penalty = -2.0f;
+    CHECK(dbs_cuda_decode(x.data(), &bad, &out, nullptr, 0, nullptr) == DBS_CUDA_STATUS_INVALID_ARGUMENT);
+    bad = a;
+    bad.reserved0 = 1;
+    CHECK(dbs_cuda_decode(x.data(), &bad, &out, nullptr, 0, nullptr) == DBS_CUDA_STATUS_INVALID_ARGUMENT);
+    CHECK(dbs_cuda_backward_workspace_size(&a) == 0);
     CHECK(dbs_cuda_decode(x.data(), &a, nullptr, nullptr, 0, nullptr) == DBS_CUDA_STATUS_INVALID_ARGUMENT);
 
     // Too-small caller workspace is rejected; an adequate one works.
@@ -293,6 +428,7 @@ void test_argument_validation() {
 int main() {
     CHECK(dbs_cuda_available() == 1);
     test_argument_validation();
+    test_validation_flags();
     test_randomized_parity();
     std::printf("cuda_emulation_tests passed\n");
     return 0;

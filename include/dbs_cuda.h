@@ -5,9 +5,10 @@
 //
 // dbs_cuda_decode() runs hard beam search on the GPU: deterministic candidate
 // ordering (score, raw score, parent, token), GNMT length penalty, EOS
-// carry-forward, EOS min-length masking, and per-example variable steps, beam
-// sizes, EOS tokens and minimum lengths. Given identical inputs it selects the
-// same beams as the CPU decoder and produces the same scores.
+// carry-forward, EOS min-length masking, banned tokens, n-gram blocking, a
+// repetition penalty, and per-example variable steps, beam sizes, EOS tokens
+// and minimum lengths. Given identical inputs it selects the same beams as the
+// CPU decoder and produces the same scores, bit for bit.
 //
 // dbs_cuda_backward() computes the surrogate gradient of the final beam scores
 // with respect to log_probs: each final beam's upstream gradient (scaled by its
@@ -66,6 +67,8 @@ typedef struct DBSCudaDecodeArgs {
     int eos_token;                /* -1 disables EOS handling */
     int min_length;               /* EOS is masked until a hypothesis reaches this length */
     float length_penalty_alpha;   /* GNMT penalty ((5 + len) / 6)^alpha; 0 disables */
+    int no_repeat_ngram_size;     /* n > 0 blocks tokens that would repeat an n-gram of the beam's prefix */
+    float repetition_penalty;     /* > 1: tokens already in the beam's prefix lose log(penalty); <= 1 disables */
     int reserved0;                /* must be 0 */
     /* Optional per-example overrides (device pointers to int32 [B], or NULL).
      * steps must be in [1, T], beams in [1, K], EOS in [-1, V), min lengths >= 0. */
@@ -73,6 +76,7 @@ typedef struct DBSCudaDecodeArgs {
     const int32_t* beam_sizes_per_example;
     const int32_t* eos_tokens_per_example;
     const int32_t* min_lengths_per_example;
+    const uint8_t* banned_tokens; /* optional device [V]: non-zero bans the token in every example */
 } DBSCudaDecodeArgs;
 
 typedef struct DBSCudaDecodeOutputs {
@@ -85,6 +89,7 @@ typedef struct DBSCudaDecodeOutputs {
     float* scores;                /* optional: [B, T, K] length-penalised ranking scores */
     float* raw_scores;            /* optional: [B, T, K] cumulative log-probabilities */
     uint8_t* from_logprob;        /* optional: [B, T, K] 0 for EOS carry-forward slots */
+    uint8_t* invalid_input;       /* optional: [B] 1 if a row the search read for example b holds NaN or +inf */
 } DBSCudaDecodeOutputs;
 
 DBS_CUDA_EXPORT int dbs_cuda_available(void);
@@ -101,10 +106,12 @@ DBS_CUDA_EXPORT int64_t dbs_cuda_backward_workspace_size(const DBSCudaDecodeArgs
 
 /* Hard beam search. `workspace` may be NULL, in which case scratch memory is
  * allocated and released on `stream` with cudaMallocAsync/cudaFreeAsync.
- * log_probs entries that are NaN or +/-Inf are never selected; callers that
- * need NaN/+Inf rejection must validate inputs themselves. When per-example
- * arrays are supplied they are validated on the device, which synchronizes the
- * stream once. */
+ * log_probs entries that are NaN or +/-Inf are never selected. Every element of
+ * every row the search reads (the rows of live, unfinished beams) is checked
+ * for NaN and +inf while it is scanned, and outputs->invalid_input reports the
+ * examples that had any; reading the flags back is up to the caller. When
+ * per-example arrays are supplied they are validated on the device, which
+ * synchronizes the stream once. */
 DBS_CUDA_EXPORT int dbs_cuda_decode(
     const float* log_probs,
     const DBSCudaDecodeArgs* args,
@@ -116,7 +123,10 @@ DBS_CUDA_EXPORT int dbs_cuda_decode(
 /* Surrogate gradient of the final scores. parents, tokens, lengths and
  * from_logprob come from dbs_cuda_decode() with the same args.
  * grad_final_scores is [B, K]; the gradient is accumulated (+=) into
- * grad_log_probs [B, T, K, V], which the caller normally zero-fills first. */
+ * grad_log_probs [B, T, K, V], which the caller normally zero-fills first.
+ * One thread block per example walks the steps backwards; the beams of a step
+ * are processed in parallel, and each parent sums its children in slot order,
+ * so the result is deterministic and equal to the CPU backward. */
 DBS_CUDA_EXPORT int dbs_cuda_backward(
     const DBSCudaDecodeArgs* args,
     const int32_t* parents,

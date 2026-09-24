@@ -129,9 +129,11 @@ else()
   dbs_set_warnings(dbs_cuda)
 endif()
 add_library(beamgrad::dbs_cuda ALIAS dbs_cuda)
-target_include_directories(dbs_cuda PUBLIC
-  $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
-  $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>)
+target_include_directories(dbs_cuda
+  PUBLIC
+    $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>
+    $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+  PRIVATE src)
 if(DBS_BUILD_SHARED)
   target_compile_definitions(dbs_cuda PRIVATE DBS_BUILD_SHARED DBS_COMPILING_LIBRARY INTERFACE DBS_BUILD_SHARED)
   set_target_properties(dbs_cuda PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${DBS_ABI_VERSION})
@@ -181,8 +183,9 @@ if(DBS_BUILD_TESTS)
   # Needs POSIX ucontext; Linux is enough to verify the kernel logic.
   if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_executable(dbs_cuda_emulation_tests tests/cuda_emulation_tests.cpp)
-    target_include_directories(dbs_cuda_emulation_tests PRIVATE include tests)
+    target_include_directories(dbs_cuda_emulation_tests PRIVATE include src tests)
     target_link_libraries(dbs_cuda_emulation_tests PRIVATE dbs)
+    dbs_set_fp_model(dbs_cuda_emulation_tests)
     add_test(NAME dbs_cuda_emulation_tests COMMAND dbs_cuda_emulation_tests)
     if(DBS_ENABLE_SANITIZERS)
       # ASan cannot follow ucontext stack switches.

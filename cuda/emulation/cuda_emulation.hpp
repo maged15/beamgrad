@@ -10,6 +10,12 @@
 // configuration CUDA would reject. Blocks run one after another, so
 // `__shared__` variables can be emulated with function-local statics.
 //
+// Between two barriers the threads of a block run one after another, in an
+// order set by dbs_emu::set_schedule(): forward, reverse, or shuffled (seeded,
+// reshuffled at every barrier). A kernel whose result changes with the order
+// has a data race between barriers; running the tests under several orders
+// exposes it.
+//
 // This is a correctness tool only: it says nothing about performance, memory
 // coalescing, or warp-level behaviour, and it is never part of a release build.
 #pragma once
@@ -159,6 +165,7 @@ inline cudaError_t cudaStreamSynchronize(cudaStream_t) { return cudaSuccess; }
 // ---------------------------------------------------------------------------
 
 inline float __fadd_rn(float a, float b) { return a + b; }
+inline float __fsub_rn(float a, float b) { return a - b; }
 inline float __fmul_rn(float a, float b) { return a * b; }
 inline float __fdiv_rn(float a, float b) { return a / b; }
 
@@ -189,9 +196,16 @@ inline int atomicCAS(int* address, int compare, int value) {
 
 namespace dbs_emu {
 
+enum class Schedule { Forward, Reverse, Shuffled };
+
 class BlockScheduler {
 public:
     static constexpr size_t kStackBytes = 256 * 1024;
+
+    void set_schedule(Schedule schedule, uint32_t seed) {
+        schedule_ = schedule;
+        seed_ = seed == 0 ? 1u : seed;
+    }
 
     static BlockScheduler& instance() {
         static BlockScheduler scheduler;
@@ -211,10 +225,14 @@ public:
             f.ctx.uc_link = &scheduler_ctx_;
             makecontext(&f.ctx, reinterpret_cast<void (*)()>(&BlockScheduler::trampoline), 0);
         }
+        order_.resize(threads);
+        for (unsigned int i = 0; i < threads; ++i) order_[i] = i;
         for (;;) {
             unsigned int finished = 0;
             unsigned int waiting = 0;
-            for (unsigned int i = 0; i < threads; ++i) {
+            arrange(threads);
+            for (unsigned int n = 0; n < threads; ++n) {
+                const unsigned int i = order_[n];
                 Fiber& f = fibers_[i];
                 if (f.done) {
                     ++finished;
@@ -252,6 +270,22 @@ private:
         bool at_barrier = false;
     };
 
+    // The order in which the block's threads run until their next barrier.
+    void arrange(unsigned int threads) {
+        for (unsigned int i = 0; i < threads; ++i) {
+            order_[i] = schedule_ == Schedule::Reverse ? threads - 1 - i : i;
+        }
+        if (schedule_ == Schedule::Shuffled) {
+            for (unsigned int i = threads; i > 1; --i) {
+                seed_ = seed_ * 1664525u + 1013904223u;
+                const unsigned int j = (seed_ >> 8) % i;
+                const unsigned int tmp = order_[i - 1];
+                order_[i - 1] = order_[j];
+                order_[j] = tmp;
+            }
+        }
+    }
+
     static void trampoline() {
         BlockScheduler& s = instance();
         (*s.body_)();
@@ -268,6 +302,9 @@ private:
     }
 
     std::vector<Fiber> fibers_;
+    std::vector<unsigned int> order_;
+    Schedule schedule_ = Schedule::Forward;
+    uint32_t seed_ = 1;
     ucontext_t scheduler_ctx_{};
     const std::function<void()>* body_ = nullptr;
     unsigned int current_ = 0;
@@ -291,6 +328,8 @@ void launch(Kernel kernel, dim3 grid, dim3 block, cudaStream_t, Args... args) {
         }
     }
 }
+
+inline void set_schedule(Schedule schedule, uint32_t seed = 1) { BlockScheduler::instance().set_schedule(schedule, seed); }
 
 } // namespace dbs_emu
 
