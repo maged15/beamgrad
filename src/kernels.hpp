@@ -2,11 +2,17 @@
 //
 // CPU numerical kernels and their runtime ISA dispatch.
 //
-// Every kernel has a scalar reference implementation. SIMD variants (AVX-512,
-// AVX2, SSE4.2, NEON) are compiled with per-function target attributes and are
-// selected at runtime from the host's CPU features, so one binary runs on any
-// x86-64 machine. The dispatchers in this header always pick the best path the
-// host supports, unless a kernel override is active (used by parity tests).
+// The hot loop of the decoder is the row scan: turning one parent beam's
+// [V] log-probabilities into candidates and keeping the best of them. It has a
+// scalar reference implementation and SIMD variants (AVX-512, AVX2, SSE4.2,
+// NEON). The x86 variants are compiled with per-function target attributes (or
+// as plain intrinsics on MSVC) and chosen at runtime from the host's CPU
+// features, so one binary runs on any x86-64 machine. Every variant produces
+// exactly the same candidates as the scalar reference.
+//
+// The small per-step reductions over K selected beams (softmax, dot product,
+// relaxed top-k) are scalar on every platform: they are cheap, and a fixed
+// evaluation order keeps their results identical on all kernel paths.
 #pragma once
 
 #include "common.hpp"
@@ -27,8 +33,8 @@ bool runtime_has_avx2() noexcept;
 bool runtime_has_sse42() noexcept;
 bool runtime_has_neon() noexcept;
 
-// Thread-local kernel override. When enabled, dispatchers only use `path`
-// (falling back to scalar if the host lacks it).
+// Thread-local kernel override. When enabled, the dispatcher only uses `path`
+// (falling back to scalar if the host lacks it). Used by the parity tests.
 struct KernelOverride {
     bool enabled = false;
     KernelPath path = KernelPath::Scalar;
@@ -40,73 +46,88 @@ bool kernel_path_enabled(KernelPath path) noexcept;
 KernelPath selected_kernel_path() noexcept;
 const char* kernel_path_name(KernelPath path) noexcept;
 
-// Scalar reference kernels.
-float dot_scalar(const float* a, const float* b, int n);
-void softmax_selected_scalar(const float* scores, float* out, int n, float temperature);
-float sum_sigmoid_shifted_scalar(const float* scores, int n, float theta, float temperature);
-void soft_topk_write_scalar(const float* scores, float* out, int n, float theta, float temperature);
-void scan_parent_row_scalar(
-    const float* row,
-    float parent_raw,
-    int parent_length,
-    int parent,
-    int vocab_size,
-    Candidate* top,
-    int top_count,
-    int vocab_block,
-    float length_penalty_alpha,
-    const uint8_t* banned_tokens,
-    int forced_token,
-    int eos_token,
-    int min_length);
+// One parent beam's expansion: every token v of `row` is a candidate
+// (parent, v) with raw score parent_raw + row[v] and ranking score
+// raw * inv_penalty, unless it is excluded.
+struct RowScan {
+    const float* row;          // [V] log-probabilities conditioned on the parent's prefix
+    const uint8_t* banned;     // [V], non-zero excludes the token; may be null
+    float parent_raw;          // the parent's cumulative log-probability (finite)
+    float inv_penalty;         // 1 / gnmt_length_penalty(new_length, alpha)
+    int parent;
+    int new_length;            // parent length + 1
+    int vocab_size;
+    int forced_token;          // >= 0: only this token is a candidate
+    int masked_token;          // >= 0: this token is excluded (EOS below min_length)
+};
+
+// Inserts every finite, allowed candidate of the row into `top` (a descending
+// buffer of top_count candidates, see insert_topk). Returns true if the row
+// contains NaN or +inf anywhere, including at excluded tokens; such entries
+// are never candidates.
+bool scan_row(const RowScan& scan, Candidate* top, int top_count);
+bool scan_row_scalar(const RowScan& scan, Candidate* top, int top_count);
 
 #if DBS_CAN_COMPILE_AVX512
 namespace avx512 {
-float dot(const float* a, const float* b, int n);
-void softmax_selected(const float* scores, float* out, int n, float temperature);
-float sum_sigmoid_shifted(const float* scores, int n, float theta, float temperature);
-void soft_topk_write(const float* scores, float* out, int n, float theta, float temperature);
-void scan_parent_row(
-    const float* row, float parent_raw, int parent_length, int parent, int vocab_size,
-    Candidate* top, int top_count, int vocab_block, float length_penalty_alpha,
-    const uint8_t* banned_tokens, int forced_token, int eos_token, int min_length);
-// 16-lane vector math entry points, exposed for the internal parity tests.
-void exp16(const float* in, float* out);
-void sigmoid16(const float* in, float* out);
-} // namespace avx512
+bool scan_row(const RowScan& scan, Candidate* top, int top_count);
+}
 #endif
-
 #if DBS_CAN_COMPILE_AVX2
 namespace avx2 {
-float dot(const float* a, const float* b, int n);
-void softmax_selected(const float* scores, float* out, int n, float temperature);
-void scan_parent_row(
-    const float* row, float parent_raw, int parent_length, int parent, int vocab_size,
-    Candidate* top, int top_count, int vocab_block, float length_penalty_alpha,
-    const uint8_t* banned_tokens, int forced_token, int eos_token, int min_length);
-} // namespace avx2
+bool scan_row(const RowScan& scan, Candidate* top, int top_count);
+}
 #endif
-
 #if DBS_CAN_COMPILE_SSE42
 namespace sse42 {
-float dot(const float* a, const float* b, int n);
-void softmax_selected(const float* scores, float* out, int n, float temperature);
-void scan_parent_row(
-    const float* row, float parent_raw, int parent_length, int parent, int vocab_size,
-    Candidate* top, int top_count, int vocab_block, float length_penalty_alpha,
-    const uint8_t* banned_tokens, int forced_token, int eos_token, int min_length);
-} // namespace sse42
+bool scan_row(const RowScan& scan, Candidate* top, int top_count);
+}
+#endif
+#if DBS_ARM_NEON
+namespace neon {
+bool scan_row(const RowScan& scan, Candidate* top, int top_count);
+}
 #endif
 
-// Dispatchers: pick the best kernel for the host (honouring any override).
+// Scalar reference for one token (the masked token is handled by the caller,
+// see scan_around_masked); the SIMD kernels use it for their tails. Returns
+// true if row[v] is NaN or +inf.
+inline bool scan_token(const RowScan& s, int v, Candidate* top, int top_count) noexcept {
+    constexpr float kInf = std::numeric_limits<float>::infinity();
+    const float lp = s.row[v];
+    if (!(lp < kInf)) return true;
+    if (lp == -kInf) return false;
+    if (s.banned && s.banned[v]) return false;
+    const float raw = s.parent_raw + lp;
+    insert_topk(top, top_count, Candidate{raw * s.inv_penalty, raw, s.parent, v, s.new_length, 1});
+    return false;
+}
+
+// Runs scan_range(begin, end) over the row without the masked token, which is
+// only checked for NaN/+inf, and returns whether any entry was NaN or +inf.
+template <class ScanRange>
+inline bool scan_around_masked(const RowScan& s, ScanRange&& scan_range) {
+    const int m = s.masked_token;
+    if (m < 0) return scan_range(0, s.vocab_size);
+    bool invalid = !(s.row[m] < std::numeric_limits<float>::infinity());
+    invalid |= scan_range(0, m);
+    invalid |= scan_range(m + 1, s.vocab_size);
+    return invalid;
+}
+
+inline int count_trailing_zeros(uint32_t x) noexcept {
+#if defined(_MSC_VER) && !defined(__clang__)
+    unsigned long index = 0;
+    _BitScanForward(&index, x);
+    return static_cast<int>(index);
+#else
+    return __builtin_ctz(x);
+#endif
+}
+
+// Deterministic scalar reductions over the K selected beams.
 float dot(const float* a, const float* b, int n);
 void softmax_selected(const float* scores, float* out, int n, float temperature);
-float sum_sigmoid_shifted(const float* scores, int n, float theta, float temperature);
-void soft_topk_write(const float* scores, float* out, int n, float theta, float temperature);
-void scan_parent_row(
-    const float* row, float parent_raw, int parent_length, int parent, int vocab_size,
-    Candidate* top, int top_count, int vocab_block, float length_penalty_alpha,
-    const uint8_t* banned_tokens, int forced_token, int eos_token, int min_length);
 
 // Sigmoid k-hot relaxation: finds theta by bisection so that
 // sum_i sigmoid((scores[i] - theta) / temperature) ~= target_k, then writes the

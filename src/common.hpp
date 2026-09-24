@@ -16,8 +16,11 @@
 #include <vector>
 
 #if defined(_MSC_VER)
+#include <intrin.h>
 #include <malloc.h>
 #endif
+
+#include "penalty.hpp"
 
 #if defined(__x86_64__) || defined(__i386__) || defined(_M_X64) || defined(_M_IX86)
 #include <immintrin.h>
@@ -26,36 +29,41 @@
 #define DBS_X86 0
 #endif
 
-#if defined(__ARM_NEON) || defined(__ARM_NEON__)
+#if defined(__ARM_NEON) || defined(__ARM_NEON__) || defined(_M_ARM64)
 #include <arm_neon.h>
 #define DBS_ARM_NEON 1
 #else
 #define DBS_ARM_NEON 0
 #endif
 
+// x86 SIMD kernels: GCC and Clang compile them with per-function target
+// attributes; MSVC accepts the intrinsics in any function.
 #if DBS_X86 && (defined(__GNUC__) || defined(__clang__))
-#define DBS_CAN_COMPILE_AVX512 1
-#define DBS_AVX512_TARGET __attribute__((target("avx512f,fma")))
-#else
-#define DBS_CAN_COMPILE_AVX512 0
-#define DBS_AVX512_TARGET
-#endif
-
-#if DBS_X86 && (defined(__GNUC__) || defined(__clang__))
-#define DBS_CAN_COMPILE_AVX2 1
-#define DBS_AVX2_TARGET __attribute__((target("avx2,fma")))
-#define DBS_CAN_COMPILE_SSE42 1
+#define DBS_X86_SIMD 1
+#define DBS_AVX512_TARGET __attribute__((target("avx512f")))
+#define DBS_AVX2_TARGET __attribute__((target("avx2")))
 #define DBS_SSE42_TARGET __attribute__((target("sse4.2")))
-#else
-#define DBS_CAN_COMPILE_AVX2 0
+#elif DBS_X86 && defined(_MSC_VER)
+#define DBS_X86_SIMD 1
+#define DBS_AVX512_TARGET
 #define DBS_AVX2_TARGET
-#define DBS_CAN_COMPILE_SSE42 0
+#define DBS_SSE42_TARGET
+#else
+#define DBS_X86_SIMD 0
+#define DBS_AVX512_TARGET
+#define DBS_AVX2_TARGET
 #define DBS_SSE42_TARGET
 #endif
 
+#define DBS_CAN_COMPILE_AVX512 DBS_X86_SIMD
+#define DBS_CAN_COMPILE_AVX2 DBS_X86_SIMD
+#define DBS_CAN_COMPILE_SSE42 DBS_X86_SIMD
+
 namespace dbs {
 
-// Process-wide counters for the aligned allocator (reported through dbs_get_stats).
+// Process-wide statistics of the aligned allocator (reported through
+// dbs_get_stats): the number of allocations since the last reset, and the bytes
+// currently allocated (a gauge, which a reset leaves alone).
 inline std::atomic<int64_t> g_allocator_calls{0};
 inline std::atomic<int64_t> g_allocator_bytes{0};
 
@@ -139,8 +147,8 @@ struct BeamOptions {
     float selected_temperature = 1.0f;
     float soft_topk_temperature = 0.25f;
 
-    int relaxed_pool_multiplier = 8;
-    int vocab_block = 4096;
+    // 0 disables the relaxed pool; m >= 1 keeps the best K * m candidates per step.
+    int relaxed_pool_multiplier = 0;
 
     float length_penalty_alpha = 0.0f;
     float soft_topk_tolerance = 1.0e-4f;
@@ -174,7 +182,7 @@ struct DecodeResult {
     int beam_size = 0;
     int vocab_size = 0;
     int eos_token = -1;
-    int relaxed_pool_size = 0;
+    int relaxed_pool_size = 0;          // P; 0 when the relaxed pool is disabled
 
     float selected_temperature = 1.0f;
     float soft_topk_temperature = 0.25f;
@@ -202,8 +210,6 @@ struct DecodeResult {
     AlignedFloatVector relaxed_weights;  // [T * P]
 
     std::vector<uint8_t> pool_from_logprob; // [T * P]
-
-    std::vector<std::vector<int32_t>> sequences;
 };
 
 struct BackwardResult {
@@ -228,30 +234,6 @@ struct Candidate {
     int32_t length;
     uint8_t from_logprob;
 };
-
-inline float safe_exp_scalar(float x) {
-    x = std::min(88.3762626647949f, std::max(-88.3762626647949f, x));
-    return std::exp(x);
-}
-
-inline float sigmoid_scalar(float x) {
-    if (x >= 0.0f) {
-        const float e = safe_exp_scalar(-x);
-        return 1.0f / (1.0f + e);
-    }
-
-    const float e = safe_exp_scalar(x);
-    return e / (1.0f + e);
-}
-
-// GNMT length penalty ((5 + len) / 6)^alpha. Evaluated in double precision and
-// rounded once, so every platform and the CUDA backend get the same float.
-inline float gnmt_length_penalty(int length, float alpha) {
-    if (alpha == 0.0f) return 1.0f;
-
-    const int l = std::max(1, length);
-    return static_cast<float>(std::pow((5.0 + static_cast<double>(l)) / 6.0, static_cast<double>(alpha)));
-}
 
 inline size_t checked_mul_size(size_t a, size_t b, const char* what) {
     if (a != 0 && b > std::numeric_limits<size_t>::max() / a) {

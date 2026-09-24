@@ -41,6 +41,14 @@ if(DBS_ENABLE_TSAN AND NOT MSVC)
   add_link_options(-fsanitize=thread)
 endif()
 
+# Floating-point contraction (fused multiply-add) would let compilers round
+# differently on different targets; results must not depend on the target.
+function(dbs_set_fp_model target)
+  if(NOT MSVC)
+    target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:C,CXX>:-ffp-contract=off>)
+  endif()
+endfunction()
+
 function(dbs_set_warnings target)
   if(MSVC)
     target_compile_options(${target} PRIVATE /W4 /permissive-)
@@ -69,11 +77,10 @@ set(DBS_CORE_SOURCES
   src/c_api.cpp
   src/cpu_features.cpp
   src/decoder.cpp
-  src/internal_test_hooks.cpp
   src/kernels_scalar.cpp
   src/kernels_x86.cpp)
 
-# Object library so the internal SIMD tests can link the implementation directly.
+# Object library so the internal tests can link the implementation directly.
 add_library(dbs_core_objects OBJECT ${DBS_CORE_SOURCES})
 set_target_properties(dbs_core_objects PROPERTIES POSITION_INDEPENDENT_CODE ON)
 target_include_directories(dbs_core_objects PRIVATE include src)
@@ -83,6 +90,7 @@ else()
   target_compile_definitions(dbs_core_objects PRIVATE DBS_STATIC)
 endif()
 dbs_set_warnings(dbs_core_objects)
+dbs_set_fp_model(dbs_core_objects)
 
 add_library(dbs ${DBS_LIBRARY_TYPE} $<TARGET_OBJECTS:dbs_core_objects>)
 add_library(beamgrad::dbs ALIAS dbs)
@@ -143,12 +151,13 @@ if(DBS_BUILD_TESTS)
   dbs_set_warnings(dbs_tests)
   add_test(NAME dbs_tests COMMAND dbs_tests)
 
-  add_executable(dbs_simd_internal_tests tests/simd_internal_tests.cpp $<TARGET_OBJECTS:dbs_core_objects>)
-  target_include_directories(dbs_simd_internal_tests PRIVATE include src)
-  target_compile_definitions(dbs_simd_internal_tests PRIVATE DBS_STATIC)
-  target_link_libraries(dbs_simd_internal_tests PRIVATE Threads::Threads)
-  dbs_set_warnings(dbs_simd_internal_tests)
-  add_test(NAME dbs_simd_internal_tests COMMAND dbs_simd_internal_tests)
+  add_executable(dbs_internal_tests tests/internal_tests.cpp $<TARGET_OBJECTS:dbs_core_objects>)
+  target_include_directories(dbs_internal_tests PRIVATE include src tests)
+  target_compile_definitions(dbs_internal_tests PRIVATE DBS_STATIC)
+  target_link_libraries(dbs_internal_tests PRIVATE Threads::Threads)
+  dbs_set_warnings(dbs_internal_tests)
+  dbs_set_fp_model(dbs_internal_tests)
+  add_test(NAME dbs_internal_tests COMMAND dbs_internal_tests)
 
   # Both public headers must be valid C, and both libraries must export them.
   add_executable(dbs_c_api_test tests/c_api_test.c)
