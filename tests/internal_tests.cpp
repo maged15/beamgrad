@@ -9,7 +9,8 @@
 //   * constrained decoding (n-gram blocking, repetition penalty, token filter,
 //     banned/forced tokens, min length) against a direct reference
 //     implementation that checks every candidate token against the prefix;
-//   * input validation covers exactly the rows the search reads.
+//   * input validation covers exactly the rows the search reads;
+//   * the length penalty matches pow() and stays defined for huge exponents.
 #include "decoder.hpp"
 
 #include "check.hpp"
@@ -532,6 +533,25 @@ void test_model_steps_match_tensor_decode() {
     }
 }
 
+void test_length_penalty() {
+    // Within one float ulp of pow() on the exponents and lengths decoders use.
+    for (float alpha : {0.1f, 0.25f, 0.5f, 0.6f, 0.7f, 1.0f, 1.3f, 2.0f, 3.7f}) {
+        for (int len = 0; len <= 2000; ++len) {
+            const double base = (5.0 + static_cast<double>(std::max(len, 1))) / 6.0;
+            const float expected = static_cast<float>(std::pow(base, static_cast<double>(alpha)));
+            const float actual = gnmt_length_penalty(len, alpha);
+            const uint32_t a = bits(actual), e = bits(expected);
+            CHECK((a > e ? a - e : e - a) <= 1u);
+        }
+    }
+    // Exponents far beyond int range: no float-to-int overflow (the sanitizer
+    // build checks the conversion), and the result saturates to +inf.
+    for (float alpha : {64.5f, 1.0e4f, 3.0e9f, 1.0e30f, std::numeric_limits<float>::max()}) {
+        CHECK(gnmt_length_penalty(1, alpha) == 1.0f);
+        CHECK(gnmt_length_penalty(100, alpha) == kInf);
+    }
+}
+
 } // namespace
 
 int main() {
@@ -547,6 +567,7 @@ int main() {
     test_validation_covers_the_rows_read();
     test_backward_uses_result_beam_size();
     test_model_steps_match_tensor_decode();
+    test_length_penalty();
     std::cout << "dbs_internal_tests passed\n";
     return 0;
 }
