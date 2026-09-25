@@ -15,6 +15,17 @@
 //   beamgrad::final_scores_backward(grad_final[B,K], parents, tokens, lengths,
 //                    from_logprob, steps[B]?, vocab_size, length_penalty_alpha)
 //     -> grad_log_probs[B,T,K,V] f32
+//   beamgrad::decode_step(log_probs[B,K,V] f32, raw_scores[B,K] f32,
+//                    lengths[B,K] i32, finished[B,K] u8, prefixes[B,K,L] i32,
+//                    eos_token, min_length, length_penalty_alpha,
+//                    banned_tokens[V] u8?, no_repeat_ngram_size,
+//                    repetition_penalty, validate)
+//     -> tokens, parents [B,K] i32, lengths [B,K] i32, scores [B,K] f32,
+//        raw_scores [B,K] f32, from_logprob [B,K] u8, finished [B,K] u8,
+//        final_scores [B,K] f32: one search step from an explicit state (the
+//        beams after the previous step and their token prefixes), returning
+//        the step's beams, which are also the new state, and their final
+//        scores were the search to end here. Used by beamgrad.beam_search.
 //
 // With validate, a NaN or +inf in any row the search reads raises ValueError.
 #include <torch/extension.h>
@@ -33,6 +44,7 @@ namespace {
 
 using Tensor = at::Tensor;
 using DecodeOutputs = std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>;
+using StepOutputs = std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>;
 
 constexpr int64_t kIntMax = std::numeric_limits<int>::max();
 
@@ -43,6 +55,8 @@ void check_dim(int64_t value, const char* name) {
 std::vector<int32_t> per_example_steps(const c10::optional<Tensor>& steps, int64_t B, int64_t T) {
     std::vector<int32_t> out(static_cast<size_t>(B), static_cast<int32_t>(T));
     if (!steps.has_value()) return out;
+    TORCH_CHECK_VALUE(!steps->is_floating_point() && !steps->is_complex() && steps->scalar_type() != torch::kBool,
+                      "steps must be an integer tensor, got ", steps->scalar_type());
     const Tensor s = steps->to(torch::kCPU, torch::kInt64).contiguous();
     TORCH_CHECK_VALUE(s.dim() == 1 && s.size(0) == B, "steps must have shape [B] = [", B, "]");
     const int64_t* p = s.data_ptr<int64_t>();
@@ -169,6 +183,105 @@ DecodeOutputs decode_cpu(
     return {final_scores, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob};
 }
 
+void check_step_inputs(const Tensor& log_probs, const Tensor& raw_scores, const Tensor& lengths, const Tensor& finished,
+                       const Tensor& prefixes) {
+    TORCH_CHECK_VALUE(log_probs.scalar_type() == torch::kFloat32 && log_probs.dim() == 3,
+                      "log_probs must be a float32 [B, K, V] tensor");
+    const auto B = log_probs.size(0), K = log_probs.size(1);
+    check_dim(B, "B");
+    check_dim(K, "K");
+    check_dim(log_probs.size(2), "V");
+    TORCH_CHECK_VALUE(raw_scores.scalar_type() == torch::kFloat32 && raw_scores.sizes() == torch::IntArrayRef({B, K}),
+                      "raw_scores must be a float32 [B, K] tensor");
+    TORCH_CHECK_VALUE(lengths.scalar_type() == torch::kInt32 && lengths.sizes() == torch::IntArrayRef({B, K}),
+                      "lengths must be an int32 [B, K] tensor");
+    TORCH_CHECK_VALUE(finished.scalar_type() == torch::kUInt8 && finished.sizes() == torch::IntArrayRef({B, K}),
+                      "finished must be a uint8 [B, K] tensor");
+    TORCH_CHECK_VALUE(prefixes.scalar_type() == torch::kInt32 && prefixes.dim() == 3 && prefixes.size(0) == B &&
+                          prefixes.size(1) == K && prefixes.size(2) <= kIntMax,
+                      "prefixes must be an int32 [B, K, L] tensor");
+}
+
+StepOutputs decode_step_cpu(
+    const Tensor& log_probs,
+    const Tensor& raw_scores,
+    const Tensor& lengths,
+    const Tensor& finished,
+    const Tensor& prefixes,
+    int64_t eos_token,
+    int64_t min_length,
+    double length_penalty_alpha,
+    const c10::optional<Tensor>& banned_tokens,
+    int64_t no_repeat_ngram_size,
+    double repetition_penalty,
+    bool validate) {
+    TORCH_CHECK(log_probs.device().is_cpu(), "beamgrad::decode_step (CPU) expects CPU tensors");
+    check_step_inputs(log_probs, raw_scores, lengths, finished, prefixes);
+    const Tensor x = log_probs.contiguous();
+    const Tensor pre = prefixes.contiguous();
+    const int64_t B = x.size(0), K = x.size(1), V = x.size(2), L = pre.size(2);
+    TORCH_CHECK_VALUE(eos_token >= -1 && eos_token < V, "eos_token must be -1 or a token id < ", V);
+    TORCH_CHECK_VALUE(min_length >= 0 && min_length <= kIntMax, "min_length must be non-negative");
+    TORCH_CHECK_VALUE(std::isfinite(length_penalty_alpha) && length_penalty_alpha >= 0.0,
+                      "length_penalty_alpha must be finite and non-negative");
+    TORCH_CHECK_VALUE(std::isfinite(repetition_penalty) && repetition_penalty > 0.0,
+                      "repetition_penalty must be finite and positive");
+    Tensor banned;
+    if (banned_tokens.has_value()) {
+        banned = banned_tokens->to(torch::kCPU, torch::kUInt8).contiguous();
+        TORCH_CHECK_VALUE(banned.dim() == 1 && banned.size(0) == V, "banned_tokens must be a [V] mask");
+    }
+
+    dbs::BeamOptions opt;
+    opt.beam_size = static_cast<int>(K);
+    opt.eos_token = static_cast<int>(eos_token);
+    opt.min_length = static_cast<int>(min_length);
+    opt.length_penalty_alpha = static_cast<float>(length_penalty_alpha);
+    opt.validate_inputs = validate ? 1 : 0;
+    const dbs::BeamSearchDecoder decoder(opt);
+    dbs::DecodeConstraints constraints;
+    constraints.banned_tokens = banned.defined() ? banned.data_ptr<uint8_t>() : nullptr;
+    constraints.no_repeat_ngram_size = static_cast<int>(std::max<int64_t>(0, std::min<int64_t>(no_repeat_ngram_size, kIntMax)));
+    constraints.repetition_penalty = static_cast<float>(repetition_penalty);
+
+    // The state is advanced in copies, so the inputs are left untouched.
+    Tensor raw = raw_scores.contiguous().clone();
+    Tensor len = lengths.contiguous().clone();
+    Tensor fin = finished.contiguous().clone();
+    const auto i32 = torch::TensorOptions().dtype(torch::kInt32);
+    Tensor tokens = torch::empty({B, K}, i32);
+    Tensor parents = torch::empty({B, K}, i32);
+    Tensor scores = torch::empty({B, K}, torch::TensorOptions().dtype(torch::kFloat32));
+    Tensor final_scores = torch::empty({B, K}, torch::TensorOptions().dtype(torch::kFloat32));
+    Tensor from_logprob = torch::empty({B, K}, torch::TensorOptions().dtype(torch::kUInt8));
+
+    FirstError error;
+    at::parallel_for(0, B, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t b = begin; b < end; ++b) {
+            dbs::TraceOutputs out;
+            out.tokens = tokens.data_ptr<int32_t>() + b * K;
+            out.parents = parents.data_ptr<int32_t>() + b * K;
+            out.scores = scores.data_ptr<float>() + b * K;
+            out.from_logprob = from_logprob.data_ptr<uint8_t>() + b * K;
+            dbs::DecodeConstraints c = constraints;
+            c.batch_index = static_cast<int>(b);
+            try {
+                decoder.step(x.data_ptr<float>() + b * K * V, static_cast<int>(V), static_cast<int>(L), &c,
+                             raw.data_ptr<float>() + b * K, len.data_ptr<int32_t>() + b * K,
+                             fin.data_ptr<uint8_t>() + b * K, pre.data_ptr<int32_t>() + b * K * L, static_cast<int>(L), out,
+                             final_scores.data_ptr<float>() + b * K);
+            } catch (const std::invalid_argument& e) {
+                error.record(b, e.what(), true);
+            } catch (const std::exception& e) {
+                error.record(b, e.what(), false);
+            }
+        }
+    });
+    error.raise_if_failed();
+    // The new state's lengths and raw scores are the selected beams'.
+    return {tokens, parents, len, scores, raw, from_logprob, fin, final_scores};
+}
+
 Tensor final_scores_backward_cpu(
     const Tensor& grad_final,
     const Tensor& parents,
@@ -230,11 +343,16 @@ TORCH_LIBRARY(beamgrad, m) {
     m.def(
         "final_scores_backward(Tensor grad_final, Tensor parents, Tensor tokens, Tensor lengths, "
         "Tensor from_logprob, Tensor? steps, int vocab_size, float length_penalty_alpha) -> Tensor");
+    m.def(
+        "decode_step(Tensor log_probs, Tensor raw_scores, Tensor lengths, Tensor finished, Tensor prefixes, "
+        "int eos_token, int min_length, float length_penalty_alpha, Tensor? banned_tokens, int no_repeat_ngram_size, "
+        "float repetition_penalty, bool validate) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
 }
 
 TORCH_LIBRARY_IMPL(beamgrad, CPU, m) {
     m.impl("decode", &decode_cpu);
     m.impl("final_scores_backward", &final_scores_backward_cpu);
+    m.impl("decode_step", &decode_step_cpu);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

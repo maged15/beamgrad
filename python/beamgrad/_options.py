@@ -10,6 +10,14 @@ from dataclasses import dataclass
 # Mirrors DBS_CUDA_MAX_BEAM in include/dbs_cuda.h.
 CUDA_MAX_BEAM = 1024
 
+# Integer options reach the native code as 32-bit ints: larger values are
+# rejected here rather than truncated (2**32 + 1 would silently become 1).
+INT32_MAX = 2**31 - 1
+
+
+def _is_int(value) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
 
 @dataclass(frozen=True)
 class BeamOptions:
@@ -52,12 +60,12 @@ class BeamOptions:
     repetition_penalty: float = 1.0
 
     def __post_init__(self) -> None:
-        if isinstance(self.beam_size, bool) or not isinstance(self.beam_size, int) or self.beam_size < 1:
-            raise ValueError(f"beam_size must be a positive int, got {self.beam_size!r}")
-        if isinstance(self.eos_token, bool) or not isinstance(self.eos_token, int) or self.eos_token < -1:
+        if not _is_int(self.beam_size) or not 1 <= self.beam_size <= INT32_MAX:
+            raise ValueError(f"beam_size must be a positive int (at most 2**31 - 1), got {self.beam_size!r}")
+        if not _is_int(self.eos_token) or not -1 <= self.eos_token <= INT32_MAX:
             raise ValueError(f"eos_token must be -1 (disabled) or a token id, got {self.eos_token!r}")
-        if isinstance(self.min_length, bool) or not isinstance(self.min_length, int) or self.min_length < 0:
-            raise ValueError(f"min_length must be a non-negative int, got {self.min_length!r}")
+        if not _is_int(self.min_length) or not 0 <= self.min_length <= INT32_MAX:
+            raise ValueError(f"min_length must be a non-negative int (at most 2**31 - 1), got {self.min_length!r}")
         alpha = float(self.length_penalty_alpha)
         if not math.isfinite(alpha) or alpha < 0.0:
             raise ValueError(f"length_penalty_alpha must be finite and non-negative, got {self.length_penalty_alpha!r}")
@@ -67,15 +75,12 @@ class BeamOptions:
             if isinstance(self.banned_tokens, (str, bytes)) or not isinstance(self.banned_tokens, Iterable):
                 raise ValueError(f"banned_tokens must be a sequence of token ids, got {self.banned_tokens!r}")
             banned = tuple(self.banned_tokens)
-            if any(isinstance(t, bool) or not isinstance(t, int) or t < 0 for t in banned):
+            if any(not _is_int(t) or not 0 <= t <= INT32_MAX for t in banned):
                 raise ValueError(f"banned_tokens must hold non-negative token ids, got {banned!r}")
             object.__setattr__(self, "banned_tokens", banned or None)
-        if (
-            isinstance(self.no_repeat_ngram_size, bool)
-            or not isinstance(self.no_repeat_ngram_size, int)
-            or self.no_repeat_ngram_size < 0
-        ):
-            raise ValueError(f"no_repeat_ngram_size must be a non-negative int, got {self.no_repeat_ngram_size!r}")
+        if not _is_int(self.no_repeat_ngram_size) or not 0 <= self.no_repeat_ngram_size <= INT32_MAX:
+            value = self.no_repeat_ngram_size
+            raise ValueError(f"no_repeat_ngram_size must be a non-negative int (at most 2**31 - 1), got {value!r}")
         penalty = float(self.repetition_penalty)
         if not math.isfinite(penalty) or penalty <= 0.0:
             raise ValueError(f"repetition_penalty must be finite and positive, got {self.repetition_penalty!r}")

@@ -125,6 +125,27 @@ def _host_backward(
     return grad.reshape(*lead, T, K, vocab_size)
 
 
+def _steps_array(steps, batch: int, max_steps: int):
+    """``[B]`` int32 step counts, range-checked before they are narrowed to 32 bits.
+
+    Concrete values outside ``[1, T]`` raise here. Traced ones (under ``jit``)
+    are clipped to 0 or ``T + 1``, which the library then rejects, so that
+    ``2**32 + 1`` cannot wrap around to 1.
+    """
+    if isinstance(steps, jax.Array):  # includes tracers
+        if not jnp.issubdtype(steps.dtype, jnp.integer):
+            raise TypeError(f"steps must hold integers, got {steps.dtype}")
+        return jnp.clip(steps, 0, max_steps + 1).astype(jnp.int32).reshape(batch)
+    host = np.asarray(steps)
+    if not np.issubdtype(host.dtype, np.integer):
+        raise TypeError(f"steps must hold integers, got {host.dtype}")
+    host = host.reshape(batch)
+    bad = np.flatnonzero((host < 1) | (host > max_steps))
+    if bad.size:
+        raise ValueError(f"steps[{bad[0]}] = {host[bad[0]]} must be in [1, {max_steps}]")
+    return jnp.asarray(host.astype(np.int32))
+
+
 def final_scores(log_probs, options: BeamOptions, steps=None, lib_path: str | None = None):
     """Final beam scores for ``[T, K, V]`` or ``[B, T, K, V]`` log-probabilities.
 
@@ -190,6 +211,6 @@ def final_scores(log_probs, options: BeamOptions, steps=None, lib_path: str | No
 
     scores.defvjp(scores_fwd, scores_bwd)
     # Steps travel as an array (T when not given), so one code path serves both.
-    s = jnp.full((B,), T, dtype=jnp.int32) if steps is None else jnp.asarray(steps, dtype=jnp.int32).reshape(B)
+    s = jnp.full((B,), T, dtype=jnp.int32) if steps is None else _steps_array(steps, B, T)
     out = scores(x, s)
     return out[0] if unbatched else out

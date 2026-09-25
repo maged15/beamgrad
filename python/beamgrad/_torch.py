@@ -125,6 +125,34 @@ def _decode_fake(
     )
 
 
+@torch.library.register_fake("beamgrad::decode_step")
+def _decode_step_fake(
+    log_probs,
+    raw_scores,
+    lengths,
+    finished,
+    prefixes,
+    eos_token,
+    min_length,
+    length_penalty_alpha,
+    banned_tokens,
+    no_repeat_ngram_size,
+    repetition_penalty,
+    validate,
+):
+    B, K, _ = log_probs.shape
+    return (
+        log_probs.new_empty((B, K), dtype=torch.int32),
+        log_probs.new_empty((B, K), dtype=torch.int32),
+        log_probs.new_empty((B, K), dtype=torch.int32),
+        log_probs.new_empty((B, K), dtype=torch.float32),
+        log_probs.new_empty((B, K), dtype=torch.float32),
+        log_probs.new_empty((B, K), dtype=torch.uint8),
+        log_probs.new_empty((B, K), dtype=torch.uint8),
+        log_probs.new_empty((B, K), dtype=torch.float32),
+    )
+
+
 @torch.library.register_fake("beamgrad::final_scores_backward")
 def _final_scores_backward_fake(
     grad_final, parents, tokens, lengths, from_logprob, steps, vocab_size, length_penalty_alpha
@@ -247,7 +275,11 @@ def _prepare(
 
     steps_t: torch.Tensor | None = None
     if steps is not None:
-        steps_t = torch.as_tensor(steps, device=x.device).to(torch.int32)
+        steps_t = torch.as_tensor(steps, device=x.device)
+        if steps_t.is_floating_point() or steps_t.is_complex() or steps_t.dtype == torch.bool:
+            raise TypeError(f"steps must hold integers, got {steps_t.dtype}")
+        # Kept at 64 bits: the operators range-check before narrowing, so 2**32 + 1 is an error rather than 1.
+        steps_t = steps_t.to(torch.int64)
         if steps_t.dim() != 1 or steps_t.shape[0] != B:
             raise ValueError(f"steps must have shape [B] = [{B}], got {tuple(steps_t.shape)}")
 

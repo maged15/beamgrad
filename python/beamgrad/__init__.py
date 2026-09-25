@@ -11,18 +11,26 @@ Hard beam search forward, surrogate gradients backward::
 
     trace = beamgrad.decode(log_probs, options)          # tokens, parents, scores, ...
     sequences = beamgrad.backtrack(trace)                # [B, K, T] token paths
+
+With an autoregressive model, whose rows depend on the beams chosen so far,
+``beamgrad.beam_search(step_fn, options, max_steps)`` runs the model inside the
+search and returns differentiable scores of the beams it found.
 """
 
 from ._options import CUDA_MAX_BEAM, BeamOptions
+from ._search import BeamSearchResult, BeamState, beam_search
 from ._torch import BeamSearchOutput, backtrack, cuda_available, decode, final_scores
 from ._version import __version__
 
 __all__ = [
     "BeamOptions",
     "BeamSearchOutput",
+    "BeamSearchResult",
+    "BeamState",
     "CUDA_MAX_BEAM",
     "__version__",
     "backtrack",
+    "beam_search",
     "cuda_available",
     "decode",
     "final_scores",
