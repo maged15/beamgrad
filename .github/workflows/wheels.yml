@@ -92,7 +92,7 @@ jobs:
             (cd /tmp && python -m pytest "$GITHUB_WORKSPACE/python/tests" -q)
             deactivate
           done
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-linux-torch${{ matrix.torch }}-${{ matrix.variant }}
           path: wheelhouse/*.whl
@@ -137,7 +137,7 @@ jobs:
         run: |
           python -m pip install wheelhouse/*.whl
           cd "$RUNNER_TEMP" && python -m pytest "$GITHUB_WORKSPACE/python/tests" -q
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: wheel-${{ runner.os }}-torch${{ matrix.torch }}-cpu
           path: wheelhouse/*.whl
