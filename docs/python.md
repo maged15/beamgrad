@@ -210,6 +210,11 @@ ignored) divided by the search's length penalty. This puts a
 teacher-forced reference sequence on the same scale as the final beam
 scores. Differentiable.
 
+`lengths` must be in `[0, T]`. A longer length would silently score a
+truncated sequence, so it raises `ValueError`. The check reads the lengths
+(one flag from the GPU) and is skipped while compiling or tracing and for
+fake tensors.
+
 ## `length_penalty(lengths, alpha) -> Tensor`
 
 `((5 + max(lengths, 1)) / 6) ** alpha` in float32, bit-identical to the

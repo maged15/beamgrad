@@ -14,6 +14,13 @@
 
 ### Fixed
 
+- `beam_search` rejected NumPy integers for `max_steps` and `batch_size`,
+  although `BeamOptions` accepts them. Any integer but `bool` is now
+  accepted.
+- `sequence_scores` accepted lengths past the sequences' last dimension, and
+  negative lengths, silently scoring a truncated sequence. It now raises
+  `ValueError`. The check is skipped while compiling or tracing and for fake
+  tensors, so `sequence_scores` stays traceable.
 - The relaxed top-k pool's weights did not sum to `K` when the scores were
   large (a long search's cumulative log-probabilities). The bisection
   stopped once `theta` was known to `soft_topk_tolerance` of its own
