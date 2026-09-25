@@ -319,7 +319,7 @@ def _decode_op(x: torch.Tensor, steps_t: torch.Tensor | None, banned: torch.Tens
 
 
 class _FinalScores(torch.autograd.Function):
-    """The final scores and the trace their backward needs.
+    """The final scores (differentiable) and the whole decode trace, from one decode.
 
     ``torch.ops.beamgrad.decode`` carries its own autograd formula, but
     ``torch.library`` implements it as an ``autograd.Function`` whose forward
@@ -332,15 +332,16 @@ class _FinalScores(torch.autograd.Function):
 
     @staticmethod
     def forward(x, steps, banned, options):
-        out = _decode_op(x, steps, banned, options)
-        final_scores_, _, _, tokens, parents, lengths, _, _, from_logprob = out
-        return final_scores_, tokens, parents, lengths, from_logprob
+        # final_scores, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob
+        return _decode_op(x, steps, banned, options)
 
     @staticmethod
     def setup_context(ctx, inputs, output):
         x, steps, _, options = inputs
-        _, tokens, parents, lengths, from_logprob = output
-        ctx.mark_non_differentiable(tokens, parents, lengths, from_logprob)
+        _, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob = output
+        ctx.mark_non_differentiable(
+            final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob
+        )
         ctx.save_for_backward(parents, tokens, lengths, from_logprob, steps)
         ctx.vocab_size = x.shape[-1]
         ctx.length_penalty_alpha = float(options.length_penalty_alpha)

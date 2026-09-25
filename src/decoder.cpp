@@ -480,15 +480,23 @@ struct SlotSink {
     }
 };
 
+// The selected beam (t * K + k) a gradient came from, or none for a
+// relaxed-pool candidate. A type of its own, so that it cannot be swapped
+// with the float gradient next to it.
+struct Slot {
+    int64_t value;
+};
+constexpr Slot kPoolCandidate{-1};
+
 // A candidate's raw-score gradient flows to its parent beam and, unless it was
 // carried forward, to the log-prob entry that produced it.
 template <class Sink>
 void scatter(const BackwardInputs& in, const Sink& sink, float* prev_raw_grad, int t, int parent, int token,
-             uint8_t from_logprob, float draw, int64_t slot) {
+             uint8_t from_logprob, float draw, Slot slot) {
     if (parent < 0 || draw == 0.0f) return;
     prev_raw_grad[parent] += draw;
     if (from_logprob && token >= 0) {
-        sink.add((static_cast<int64_t>(t) * in.K + parent) * static_cast<int64_t>(in.V) + token, slot, draw);
+        sink.add((static_cast<int64_t>(t) * in.K + parent) * static_cast<int64_t>(in.V) + token, slot.value, draw);
     }
 }
 
@@ -534,7 +542,7 @@ void run_backward(
             const float inv_penalty = 1.0f / gnmt_length_penalty(len, in.alpha);
             const float draw = next_raw_grad[static_cast<size_t>(k)] + drank * inv_penalty;
             scatter(in, sink, prev_raw_grad.data(), t, parent, in.tokens[idx], in.from_logprob[idx], draw,
-                    static_cast<int64_t>(idx));
+                    Slot{static_cast<int64_t>(idx)});
         }
 
         // Relaxed pool: implicit differentiation through the bisection threshold.
@@ -561,8 +569,8 @@ void run_backward(
                     if (drank == 0.0f) continue;
                     const int len = std::max(1, static_cast<int>(in.pool_lengths[idx]));
                     const float inv_penalty = 1.0f / gnmt_length_penalty(len, in.alpha);
-                    scatter(in, sink, prev_raw_grad.data(), t, parent, in.pool_tokens[idx], in.pool_from_logprob[idx], -1,
-                            drank * inv_penalty);
+                    scatter(in, sink, prev_raw_grad.data(), t, parent, in.pool_tokens[idx], in.pool_from_logprob[idx],
+                            drank * inv_penalty, kPoolCandidate);
                 }
             }
         }

@@ -46,6 +46,53 @@ static float final_score0(DBSDecoderHandle* h, const std::vector<float>& x, int 
     return y;
 }
 
+// One step from a single start beam: every pool candidate is one log-prob
+// entry x[0, 0, token], so the gradient of sum(g * relaxed_weights) is the
+// implicit-function result a_p / tau * (g_p - sum(g a) / sum(a)), with
+// a_p = r_p (1 - r_p), at exactly that entry and nowhere else.
+static void test_relaxed_pool_gradient_closed_form() {
+    DBSOptionsC opt = test_options();
+    opt.beam_size = 2;
+    opt.relaxed_pool_multiplier = 3;  // P = 6 of the V = 8 candidates
+    DBSDecoderHandle* h = nullptr;
+    CHECK(dbs_create_ex(opt, &h) == 0);
+    constexpr int T = 1;
+    constexpr int K = 2;
+    constexpr int V = 8;
+    constexpr int P = 6;
+    const std::vector<float> x = {-0.3f, -1.1f, -0.7f, -2.0f, -0.9f, -1.6f, -3.0f, -1.3f,  // beam 0
+                                  -9.f,  -9.f,  -9.f,  -9.f,  -9.f,  -9.f,  -9.f,  -9.f};  // unused at t = 0
+    DBSResultHandle* r = nullptr;
+    CHECK(dbs_decode(h, x.data(), T, V, &r) == 0);
+    CHECK(dbs_result_pool_size(r) == P);
+    const float* w = dbs_result_relaxed_weights(r);
+    const int32_t* tokens = dbs_result_pool_tokens(r);
+    const int32_t* parents = dbs_result_pool_parents(r);
+    const float g[P] = {0.5f, -1.0f, 2.0f, 0.25f, -0.75f, 1.5f};
+    DBSBackwardHandle* b = nullptr;
+    CHECK(dbs_backward_dense(h, r, nullptr, g, nullptr, &b) == 0);
+    const float* grad = dbs_backward_grad_log_probs(b);
+    double sum_a = 0.0;
+    double sum_ga = 0.0;
+    for (int p = 0; p < P; ++p) {
+        const double a = static_cast<double>(w[p]) * (1.0 - w[p]);
+        sum_a += a;
+        sum_ga += g[p] * a;
+    }
+    std::vector<double> expected(static_cast<size_t>(T * K * V), 0.0);
+    for (int p = 0; p < P; ++p) {
+        CHECK(parents[p] == 0);
+        const double a = static_cast<double>(w[p]) * (1.0 - w[p]);
+        expected[static_cast<size_t>(tokens[p])] = a / opt.soft_topk_temperature * (g[p] - sum_ga / sum_a);
+    }
+    for (int i = 0; i < T * K * V; ++i) {
+        CHECK(std::fabs(grad[i] - expected[static_cast<size_t>(i)]) <= 1.0e-5 + 1.0e-4 * std::fabs(expected[i]));
+    }
+    dbs_free_backward(b);
+    dbs_free_result(r);
+    dbs_destroy(h);
+}
+
 static void test_deterministic_ties() {
     auto* h = make_decoder();
     constexpr int T = 1;
@@ -896,6 +943,7 @@ int main() {
     test_constraints();
     test_invalid_nan_rejected();
     test_sparse_gradient_matches_finite_difference();
+    test_relaxed_pool_gradient_closed_form();
     test_batch_decode();
     test_default_backward_is_sparse();
     test_model_step_decode();

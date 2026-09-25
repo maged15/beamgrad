@@ -20,7 +20,7 @@ from typing import NamedTuple
 import torch
 
 from ._options import INT32_MAX, BeamOptions
-from ._torch import BeamSearchOutput, length_penalty
+from ._torch import BeamSearchOutput, StepsLike, _FinalScores, _prepare, backtrack, length_penalty
 
 
 class BeamState(NamedTuple):
@@ -197,6 +197,78 @@ def beam_search(
     return _rescore(result, rescore_fn, options)
 
 
+def sequence_scores(token_log_probs: torch.Tensor, lengths: torch.Tensor, options: BeamOptions) -> torch.Tensor:
+    """Scores of given sequences, on the scale of the search's final scores.
+
+    ``token_log_probs[..., t]`` is the log-probability of token ``t`` of a
+    sequence given the tokens before it (under teacher forcing), and
+    ``lengths[...]`` its length; entries at or past the length are ignored.
+    Returns the summed log-probability divided by the length penalty, with the
+    penalty the search uses, so for example a reference sequence can be
+    compared with the beams in a structured-margin loss. Differentiable.
+    """
+    if not isinstance(options, BeamOptions):
+        raise TypeError(f"options must be a beamgrad.BeamOptions, got {type(options).__name__}")
+    T = token_log_probs.shape[-1]
+    if tuple(lengths.shape) != tuple(token_log_probs.shape[:-1]):
+        raise ValueError(f"lengths must have shape {tuple(token_log_probs.shape[:-1])}, got {tuple(lengths.shape)}")
+    lengths = lengths.to(token_log_probs.device)
+    on_path = torch.arange(T, device=token_log_probs.device) < lengths[..., None]
+    if token_log_probs.dtype != torch.float64:
+        token_log_probs = token_log_probs.float()
+    raw = token_log_probs.masked_fill(~on_path, 0.0).sum(-1)
+    return raw / length_penalty(lengths, options.length_penalty_alpha)
+
+
+def search(log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike = None) -> BeamSearchResult:
+    """Beam search over precomputed ``[B, T, K, V]`` rows: scores and trace from one decode.
+
+    The same search as :func:`beamgrad.final_scores` and :func:`beamgrad.decode`
+    together, without decoding twice, returned as a :class:`BeamSearchResult`
+    like :func:`beam_search`'s: ``scores`` are differentiable (the path
+    gradient of ``final_scores``), and ``step_log_probs`` are the input's steps
+    (views, not copies). Unbatched ``[T, K, V]`` input gives unbatched results.
+    """
+    x, steps_t, banned, unbatched = _prepare(log_probs, options, steps)
+    B, T = x.shape[:2]
+    final, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob = _FinalScores.apply(
+        x, steps_t, banned, options
+    )
+    trace = BeamSearchOutput(
+        final_scores=final.detach(),
+        final_raw_scores=final_raw,
+        final_lengths=final_lengths.long(),
+        tokens=tokens.long(),
+        parents=parents.long(),
+        lengths=lengths.long(),
+        scores=scores,
+        raw_scores=raw_scores,
+        from_logprob=from_logprob.bool(),
+        steps=torch.full((B,), T, dtype=torch.long, device=x.device) if steps_t is None else steps_t.long(),
+    )
+    paths = backtrack(trace)  # [B, K, T]
+    sequences = torch.where(torch.arange(T, device=x.device) < trace.final_lengths[..., None], paths, -1)
+    rows = log_probs.unsqueeze(0) if unbatched else log_probs
+    result = BeamSearchResult(
+        scores=final,
+        sequences=sequences,
+        lengths=trace.final_lengths,
+        raw_scores=final_raw,
+        trace=trace,
+        step_log_probs=tuple(rows.unbind(1)),
+    )
+    if unbatched:
+        result = BeamSearchResult(
+            scores=final.squeeze(0),
+            sequences=sequences.squeeze(0),
+            lengths=trace.final_lengths.squeeze(0),
+            raw_scores=final_raw.squeeze(0),
+            trace=BeamSearchOutput(*(t.squeeze(0) for t in trace)),
+            step_log_probs=tuple(log_probs.unbind(0)),
+        )
+    return result
+
+
 def _rescore(result: BeamSearchResult, rescore_fn: RescoreFunction, options: BeamOptions) -> BeamSearchResult:
     """Attach the gradient of the teacher-forced re-scoring of the final beams."""
     B, K, _ = result.sequences.shape
@@ -205,11 +277,7 @@ def _rescore(result: BeamSearchResult, rescore_fn: RescoreFunction, options: Bea
     if not isinstance(log_probs, torch.Tensor) or tuple(log_probs.shape) != (B, K, T):
         shape = tuple(log_probs.shape) if isinstance(log_probs, torch.Tensor) else type(log_probs).__name__
         raise ValueError(f"rescore_fn must return [B, K, T] = [{B}, {K}, {T}] token log-probabilities, got {shape}")
-    on_path = torch.arange(T, device=log_probs.device) < result.lengths[..., None]
-    if log_probs.dtype != torch.float64:
-        log_probs = log_probs.float()
-    raw = log_probs.masked_fill(~on_path, 0.0).sum(-1)
-    rescored = raw / length_penalty(result.lengths, options.length_penalty_alpha)
+    rescored = sequence_scores(log_probs, result.lengths, options)
     # The value is the search's own score; the gradient is the re-scoring's.
     delta = (rescored - rescored.detach()).to(result.scores.dtype)
     live = torch.isfinite(result.scores)
