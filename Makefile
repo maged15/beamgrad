@@ -43,8 +43,8 @@ python-test:
 	$(PYTHON) -m pytest python/tests
 
 lint:
-	ruff check python setup.py benchmarks examples
-	ruff format --check python setup.py benchmarks examples
+	ruff check python setup.py benchmarks examples experiments scripts
+	ruff format --check python setup.py benchmarks examples experiments scripts
 	$(PYTHON) scripts/check_version_metadata.py
 
 clean:

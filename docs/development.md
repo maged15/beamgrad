@@ -127,9 +127,9 @@ the two break ties differently (beamgrad by parent slot then token id,
 ## Releasing
 
 1. Update `VERSION`, `DBS_VERSION_*` in `include/dbs.h`, `project(... VERSION)`
-   in `CMakeLists.txt`, `python/beamgrad/_version.py`, and add a
-   `CHANGELOG.md` section. `python scripts/check_version_metadata.py` checks
-   that they agree.
+   in `CMakeLists.txt`, `python/beamgrad/_version.py`, `version` in
+   `CITATION.cff`, and add a `CHANGELOG.md` section.
+   `python scripts/check_version_metadata.py` checks that they agree.
 2. If the exported symbols changed, update `abi/libdbs.symbols`. If the change
    is binary-incompatible, bump `DBS_ABI_VERSION` in both `include/dbs.h` and
    `CMakeLists.txt`.

@@ -50,6 +50,10 @@ def main() -> int:
     if not py_version or py_version.group(1) != version:
         errors.append(f"python/beamgrad/_version.py must set __version__ = {version!r}")
 
+    citation = re.search(r"^version:\s*[\"']?([^\"'\s]+)", read("CITATION.cff"), flags=re.MULTILINE)
+    if not citation or citation.group(1) != version:
+        errors.append(f"CITATION.cff must state version: {version}")
+
     changelog = read("CHANGELOG.md")
     heading = re.search(r"^##\s+\[?(\d+\.\d+\.\d+)", changelog, flags=re.MULTILINE)
     if not heading or heading.group(1) != version:

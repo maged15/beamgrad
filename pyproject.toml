@@ -55,6 +55,9 @@ addopts = "-ra"
 [tool.ruff]
 line-length = 120
 target-version = "py310"
+# Written by setup.py. It is gitignored, but ruff does not reliably apply
+# .gitignore when given several paths, as `make lint` does.
+extend-exclude = ["python/beamgrad/_build_info.py"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "B", "UP"]
