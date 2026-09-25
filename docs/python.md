@@ -10,7 +10,8 @@ dtype. There is no silent device fallback: CUDA tensors run the native CUDA
 engine, forward and backward.
 
 The work is done by operators registered with `torch.library`
-(`torch.ops.beamgrad.decode`, `decode_step` and `final_scores_backward`)
+(`torch.ops.beamgrad.decode`, `decode_step`, `final_scores_backward`,
+`final_scores_path_gradient` and `length_penalty`)
 with fake-tensor implementations, an autograd formula and a vmap rule, so
 beamgrad works inside `torch.compile` (including `fullgraph=True`), with
 `torch.export` and fake-tensor tracing, and under `torch.vmap` (PyTorch 2.5+).
@@ -114,7 +115,7 @@ trace = beamgrad.decode(x, options)
 best = beamgrad.backtrack(trace)[:, 0]    # [B, T] best hypothesis per example
 ```
 
-## `beam_search(step_fn, options, max_steps, *, batch_size=1, device=None) -> BeamSearchResult`
+## `beam_search(step_fn, options, max_steps, *, batch_size=1, device=None, rescore_fn=None, return_log_probs=None) -> BeamSearchResult`
 
 Beam search over a model's next-token distributions, for autoregressive models
 whose rows at step `t` depend on the beams chosen at step `t - 1`. Each step
@@ -150,14 +151,28 @@ hypothesis and only slot 0 is read.
 | `sequences` | `[B, K, max_steps]` int64 | each final beam's tokens, `-1` past its length |
 | `lengths`, `raw_scores` | `[B, K]` | hypothesis lengths and cumulative log-probabilities |
 | `trace` | `BeamSearchOutput` | the per-step trace, as `decode(torch.stack(step_log_probs, 1), options)` returns it |
-| `step_log_probs` | `T × [B, K, V]` | the tensors `step_fn` returned (not copied) |
+| `step_log_probs` | `T × [B, K, V]` | the tensors `step_fn` returned (not copied); empty when not kept |
 
 `scores` equals `final_scores(torch.stack(step_log_probs, 1), options)`, with
-the same gradient: each beam is differentiated along its own path with the
-selection held fixed, and the gradient reaches whatever the rows were computed
-from. The rows are never stacked or copied, so with a large vocabulary the
-search itself adds only `[B, K]` state per step; under `torch.no_grad()` a
-step's rows can be freed once the next step starts.
+the same gradient. Each beam is differentiated along its own path with the
+selection held fixed, and the gradient reaches whatever the rows were
+computed from. The rows are never stacked or copied. The engine's backward
+gives each step only its `[B, K]` path gradient, which autograd scatters into
+that step's rows when it reaches them, so no dense `[B, T, K, V]` gradient
+exists. `return_log_probs` (by default: whether gradients are enabled)
+controls whether the rows are kept in `step_log_probs`. Under
+`torch.no_grad()` they are not, so each step's rows are freed once the next
+step starts.
+
+With `rescore_fn`, the search runs without an autograd graph (inference
+memory), and the gradient comes from one teacher-forced pass instead:
+`rescore_fn(sequences [B, K, T], lengths [B, K])` must return each final
+beam's token log-probabilities, `[B, K, T]` (entries at or past a beam's
+length are ignored). `scores` keep the search's values; their gradient is the
+re-scoring's, which is the same function's gradient recomputed (no dropout),
+and the pass can use activation checkpointing. See
+[training.md](training.md#memory-three-ways-to-take-the-gradient) for
+measurements and trade-offs.
 
 ```python
 def step(beams):                                   # an RNN whose hidden states follow the beams
@@ -175,6 +190,69 @@ result = beamgrad.beam_search(step, options, max_steps=20, batch_size=B)
 [`examples/train_lm.py`](../examples/train_lm.py) trains such a model so that
 reference sequences win the search by a margin.
 
+## `search(log_probs, options, steps=None) -> BeamSearchResult`
+
+`final_scores` and `decode` in one decode, returned as a `BeamSearchResult`,
+for rows that are already a `[B, T, K, V]` (or `[T, K, V]`) tensor.
+`scores` carry the path gradient, `sequences` are `-1`-padded after each
+beam's length, and `step_log_probs` are views of the input's steps. The
+losses and estimators below accept it like `beam_search`'s result.
+
+## `sequence_scores(token_log_probs, lengths, options) -> Tensor`
+
+Summed token log-probabilities (`[..., T]`, entries at or past `lengths`
+ignored) divided by the search's length penalty. This puts a
+teacher-forced reference sequence on the same scale as the final beam
+scores. Differentiable.
+
+## `length_penalty(lengths, alpha) -> Tensor`
+
+`((5 + lengths) / 6) ** alpha` in float32, bit-identical to the penalty the
+CPU and CUDA engines use.
+
+## `beamgrad.losses`
+
+| function | loss |
+|---|---|
+| `structured_margin(result, reference, reference_scores, margin=1.0, reduction="mean")` | `max(0, margin + best non-reference beam's score − reference_scores)`; zero when the reference wins by the margin |
+| `minimum_risk(result, costs, temperature=1.0, reduction="mean")` | `Σ_k softmax(scores / temperature)_k · costs[:, k]`; dead beams get no probability, examples without live beams give 0 |
+| `matches(sequences, reference)` | `[B, K]` bool, beam `k` equals the `-1`-padded reference `[B, T']` |
+
+## `beamgrad.estimators`
+
+Smooth quantities of a search, computed from its trace and the rows it read
+(`result.step_log_probs`): use `search()`, or `beam_search()` through the
+steps. They match the C library's surrogates and run on the rows' device.
+
+| function | returns |
+|---|---|
+| `path_scores(result, options)` | `[B, T, K]` every step's selected-beam scores (`trace.scores`), differentiable along each path |
+| `selected_softmax(result, options, temperature=1.0)` | `[B, T, K]` `softmax(scores[t] / temperature)` over the selected beams; dead slots 0 |
+| `relaxed_topk(result, options, pool_multiplier=8, temperature=0.25, tolerance=1e-4, max_iters=48)` | `RelaxedTopK(scores, weights, parents, tokens, from_logprob)`, each `[B, T, P]` with `P = K · pool_multiplier`: the best `P` candidates per step, their sigmoid k-hot membership (summing to `K`, gradient by implicit differentiation through the bisection threshold), and which candidate each is |
+
+`relaxed_topk` gives gradient to candidates the search did not keep, so it
+can train the model to keep a reference prefix in the beam. It does not
+support `no_repeat_ngram_size` or `repetition_penalty`. The formulas are in
+[training.md](training.md#gradient-estimators).
+
+## `beamgrad.hf`
+
+Adapters for Hugging Face `transformers` causal LMs (the module does not
+import `transformers`):
+
+- `CausalLMStep(model, input_ids, attention_mask, beam_size)`: a step
+  function. It runs the left-padded prompts once, then one token per beam per
+  step, reordering the key/value cache by `beams.parents`. Its inputs match
+  `generate()`'s, so a float32 model returns the same beams as
+  `generate(num_beams=K)`.
+- `CausalLMRescorer(model, input_ids, attention_mask, chunk_size=256,
+  gradient_checkpointing=False)`: a `rescore_fn`. It runs one teacher-forced
+  pass over prompt + beam and projects to the vocabulary in checkpointed
+  chunks. With `gradient_checkpointing=True` it enables the model's
+  checkpointing and training mode for its own pass only. Run the search in
+  eval mode, because `transformers` disables the cache for checkpointing
+  models in training mode.
+
 ## `cuda_available() -> bool`
 
 `True` when beamgrad was built with its CUDA operators and PyTorch sees a CUDA
@@ -184,7 +262,9 @@ CPU backend has no fixed limit.
 ## Installation and the PyTorch version
 
 The compiled operators only work with the PyTorch they were built against.
-Build without isolation so they are compiled against the torch you use:
+Prebuilt wheels exist for some combinations (see
+[installation.md](installation.md)). Otherwise, build without isolation so
+they are compiled against the torch you use:
 
 ```bash
 pip install --no-build-isolation beamgrad

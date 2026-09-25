@@ -107,10 +107,13 @@ losses that separate a reference sequence from the best competing beam
 (see [`examples/train.py`](../examples/train.py)), expected-risk objectives
 over the beam, and sequence-level distillation.
 
-### Additional surrogates (C ABI)
+### Additional surrogates (C ABI and `beamgrad.estimators`)
 
 The C library (`dbs_decode` / `dbs_backward`) additionally exposes two smooth
-relaxations of the selection itself, and accepts upstream gradients for them:
+relaxations of the selection itself, and accepts upstream gradients for them.
+In Python, `beamgrad.estimators.selected_softmax` and `relaxed_topk` compute
+the same quantities in PyTorch, on CPU or CUDA, with the same gradients (the
+test suite checks them against the C library):
 
 - **Selected-beam weights.** At each step, `weights[t] = softmax(scores[t] /
   selected_temperature)` over the `K` selected beams. The gradient
@@ -135,7 +138,9 @@ final scores or the final-score gradient.
   candidates, and fixed accumulation order in every backward pass.
 - **Batch invariant.** Each example of a batch is decoded independently.
 - **Surrogate, not exact.** Gradients do not account for how selection would
-  change; a beam that is not selected receives no gradient.
+  change; a beam that is not selected receives no gradient, except through
+  the relaxed top-k pool, which differentiates a smooth version of the
+  selection instead.
 - **Rows conditioned on the search.** The search consumes `[T, K, V]` rows.
   When each row depends on its beam's prefix (an autoregressive model), the
   model must produce the rows of step `t` after the beams of step `t - 1` are

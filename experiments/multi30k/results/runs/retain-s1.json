@@ -1,0 +1,66 @@
+{
+  "arm": "retain",
+  "name": "retain",
+  "seed": 1,
+  "valid_bleu": 38.35982428486838,
+  "test_bleu": 38.098852837111636,
+  "seconds_per_step": 0.2511762368374475,
+  "peak_gib": 3.7387709617614746,
+  "history": [
+    {
+      "step": 0,
+      "valid_bleu": 37.18237775367346
+    },
+    {
+      "step": 200,
+      "valid_bleu": 37.53486031980655,
+      "train_loss": 1.0479613327980042,
+      "retained_steps": 0.44854257558298755
+    },
+    {
+      "step": 400,
+      "valid_bleu": 37.70584275622677,
+      "train_loss": 1.0432229444384575,
+      "retained_steps": 0.4404996143750364
+    },
+    {
+      "step": 600,
+      "valid_bleu": 38.04541182013401,
+      "train_loss": 1.0403187236189841,
+      "retained_steps": 0.44417803775100884
+    },
+    {
+      "step": 800,
+      "valid_bleu": 38.35982428486838,
+      "train_loss": 1.040794130563736,
+      "retained_steps": 0.4468372060139749
+    },
+    {
+      "step": 1000,
+      "valid_bleu": 37.57290055011752,
+      "train_loss": 1.0276141184568406,
+      "retained_steps": 0.454907247809958
+    }
+  ],
+  "config": {
+    "seed": 1,
+    "vocab": 8000,
+    "smoothing": 0.1,
+    "eval_beam": 4,
+    "eval_alpha": 0.6,
+    "arm": "retain",
+    "name": "retain",
+    "steps": 1000,
+    "batch_size": 32,
+    "lr": 0.0001,
+    "dropout": 0.1,
+    "beam": 4,
+    "alpha": 0.6,
+    "nll_weight": 0.3,
+    "temperature": 1.0,
+    "margin": 1.0,
+    "pool_multiplier": 4,
+    "gradient": "steps",
+    "eval_every": 200
+  }
+}

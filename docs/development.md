@@ -108,7 +108,11 @@ cmake --build build-fuzz && ./build-fuzz/dbs_fuzz -max_total_time=300
 ./build/dbs_bench 16 8 32000 4 20               # T K V B repeats
 python benchmarks/benchmark.py --device all     # PyTorch API vs a torch.topk beam search
 python benchmarks/hf_beam_search.py --train     # beam_search on a Hugging Face LM vs generate()
+python benchmarks/hf_training_memory.py --check # training-step memory per gradient mode
 ```
+
+[benchmarks.md](benchmarks.md) explains what each one measures (kernel or end to
+end) and how to read the numbers.
 
 `benchmark.py` also asserts that beamgrad's scores match the reference, and
 `--csv` records results with the environment. `hf_beam_search.py` (needs

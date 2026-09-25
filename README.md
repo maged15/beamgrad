@@ -29,18 +29,22 @@ result = beamgrad.beam_search(step, options, max_steps=T, batch_size=B)
 # result.sequences: [B, K, T] tokens of each beam, -1 after it ends
 
 # Structured margin: the reference must beat the best beam that is not the reference.
-gold_score = model.sequence_log_prob(src, gold)                 # [B], teacher-forced; gold is [B, T], -1-padded
-is_gold = (result.sequences == gold[:, None]).all(-1)          # [B, K]
-rival = result.scores.masked_fill(is_gold, float("-inf")).amax(1)
-loss = torch.relu(rival - gold_score + 1.0).mean()
+gold_lp = model.token_log_probs(src, gold)                      # [B, T] teacher-forced; gold is [B, T], -1-padded
+gold_score = beamgrad.sequence_scores(gold_lp, gold_lengths, options)  # on the beams' scale
+loss = beamgrad.losses.structured_margin(result, gold, gold_score, margin=1.0)
 loss.backward()                                                 # through the search, into the model
 ```
 
-The loss is defined on what beam search actually returns: when the reference
-already wins by the margin it is zero, otherwise it raises the reference and
+The loss is defined on what beam search actually returns. When the reference
+already wins by the margin it is zero; otherwise it raises the reference and
 lowers the beam that beat it. [`examples/train_lm.py`](examples/train_lm.py)
-is the runnable version, with a GRU whose hidden states follow the beams
+is a runnable version, with a GRU whose hidden states follow the beams
 (`beams.parents` reorders them, as it would a key/value cache).
+`beamgrad.losses.minimum_risk` (expected cost over the beams) and the
+estimators in `beamgrad.estimators` are the alternatives. In a controlled
+translation experiment, minimum-risk training improved test BLEU over
+continued MLE on every seed, and this margin against the reference did not
+([training guide](docs/training.md#experiment-multi30k-ende)).
 
 If the next-token distributions of every beam are already in a
 `[B, T, K, V]` tensor, score and decode it directly:
@@ -60,6 +64,17 @@ best = beamgrad.backtrack(beamgrad.decode(log_probs, options))[:, 0]   # [B, T] 
   the path that produced it (see [how it works](docs/algorithm.md)). The
   gradients match the C reference bit for bit and agree with finite
   differences.
+- **Trains in bounded memory.** The backward pass hands each step only its
+  own path gradient, so no dense `[B, T, K, V]` gradient is ever built. With
+  `rescore_fn`, the search runs with inference memory and the gradient comes
+  from one teacher-forced pass, which can use activation checkpointing. A
+  Qwen2.5-0.5B training step at 8 beams × 64 steps × batch 8 drops from out
+  of memory on 16 GB to 1.3 GiB, with the same gradient
+  ([docs/training.md](docs/training.md)).
+- **Losses and estimators.** `beamgrad.losses` has a structured margin and
+  minimum-risk training. `beamgrad.estimators` has smoother surrogates:
+  softmax over the selected beams, and a relaxed top-k that also sends
+  gradient to candidates the search pruned.
 - **Drives real models.** `beam_search` runs an autoregressive model inside
   the search, one step at a time, reordering its cache by each beam's parent.
   On Qwen2.5-0.5B and Qwen3-0.6B it returns the same beams, with bit-identical
@@ -85,7 +100,11 @@ best = beamgrad.backtrack(beamgrad.decode(log_probs, options))[:, 0]   # [B, T] 
 
 ## Installation
 
-beamgrad compiles against your installed PyTorch:
+Releases include prebuilt wheels for PyTorch 2.13 and 2.14: Linux (CPU,
+CUDA 12.6, CUDA 13.0), macOS arm64 and Windows. Each wheel works on every
+Python from 3.10. [docs/installation.md](docs/installation.md) has the
+matrix and the command for your PyTorch. Otherwise beamgrad compiles against
+your installed PyTorch:
 
 ```bash
 pip install torch
@@ -93,9 +112,9 @@ pip install --no-build-isolation "git+https://github.com/maged15/beamgrad"
 ```
 
 `--no-build-isolation` matters: the compiled operators only work with the
-PyTorch they were built against, and `import beamgrad` says so (with the fix)
-if the two differ. If a CUDA toolkit (`nvcc`) is available, the CUDA operators
-are built automatically; `BEAMGRAD_CUDA=1` makes them required and
+PyTorch they were built against, and if the two differ, `import beamgrad`
+says so and gives the fix. If a CUDA toolkit (`nvcc`) is available, the CUDA
+operators are built automatically; `BEAMGRAD_CUDA=1` makes them required and
 `BEAMGRAD_CUDA=0` skips them. `beamgrad.cuda_available()` reports what you
 got. For the C library alone, use CMake (see [the C API](docs/c-api.md)).
 
@@ -167,21 +186,25 @@ The complete version, with error handling, is
 
 | | |
 |---|---|
+| [docs/installation.md](docs/installation.md) | wheels, compatibility matrix, building from source |
 | [docs/algorithm.md](docs/algorithm.md) | what the forward and backward passes compute |
+| [docs/training.md](docs/training.md) | training through the search: gradient, memory modes, losses, estimators, experiment |
 | [docs/python.md](docs/python.md) | Python API reference |
 | [docs/c-api.md](docs/c-api.md) | C API reference, CUDA C API, ABI policy |
 | [docs/cuda.md](docs/cuda.md) | CUDA engine design, limits, testing without a GPU |
-| [docs/development.md](docs/development.md) | building, testing, benchmarking, releasing |
+| [docs/benchmarks.md](docs/benchmarks.md) | what each benchmark measures (kernel or end to end) |
+| [docs/development.md](docs/development.md) | building, testing, releasing |
 | [examples/](examples) | quickstart, training a model through beam search, C usage |
+| [experiments/multi30k](experiments/multi30k) | a controlled training experiment (En→De translation) |
 
 ## Scope and limitations
 
 - Gradients are **surrogate** gradients. They are exact for a fixed beam
   selection and do not model how the selection itself would change.
-- The model runs inside the search, one step at a time (`beam_search`), and
-  the graph of every step is kept until the backward pass. Memory therefore
-  grows with `T × K` model evaluations, as with any backpropagation through
-  generation.
+- Through the steps (the default), the model's graph for every step is kept
+  until the backward pass, as with any backpropagation through generation.
+  `rescore_fn` avoids this at the cost of one teacher-forced pass, and the
+  estimators, which need the rows, are only available through the steps.
 - CUDA supports beams up to 1024 and about 268M candidates (`K × V`) per step.
 
 ## Contributing

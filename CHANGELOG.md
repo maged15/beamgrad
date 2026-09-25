@@ -17,6 +17,24 @@ three functions are added and one no-op stub is removed (see below).
   Qwen2.5-0.5B and Qwen3-0.6B, it returns the same beams with bit-identical
   scores as `transformers`' `generate(num_beams=...)` in float32, at the same
   speed (`benchmarks/hf_beam_search.py`).
+- **Training in bounded memory.** `beam_search`'s backward hands each step
+  only its own `[B, K]` path gradient, never a dense `[B, T, K, V]` one, and
+  `rescore_fn` takes the same gradient from one teacher-forced pass after a
+  search without an autograd graph. With activation checkpointing, a
+  Qwen2.5-0.5B training step at batch 8, 8 beams and 128 steps needs 1.7 GiB
+  above the weights instead of running out of memory on 16 GB
+  (`benchmarks/hf_training_memory.py`).
+- **Losses, estimators and a controlled experiment.** `beamgrad.losses`
+  (structured margin, minimum risk) and `beamgrad.estimators`
+  (selected-beam softmax, relaxed top-k) in PyTorch, and a Multi30k
+  translation experiment comparing them with continued MLE over three seeds
+  (`experiments/multi30k`): minimum-risk training on the search's beams
+  improved test BLEU on every seed (+0.55 on average), and a margin against
+  the reference made it worse.
+- **Wheels for every Python.** The extensions use only CPython's limited API,
+  so one wheel per PyTorch version and CUDA variant serves Python 3.10+.
+  Releases build them for PyTorch 2.13 and 2.14 on Linux (CPU, CUDA 12.6,
+  CUDA 13.0), macOS and Windows.
 - **Native CUDA engine.** Beam search and its backward pass run entirely on
   the GPU for beams up to 1024, with GNMT length penalty, EOS carry-forward,
   `min_length` and variable-length batches. It selects the same beams, with
@@ -42,6 +60,28 @@ three functions are added and one no-op stub is removed (see below).
 
 ### Added
 
+- `beam_search(..., rescore_fn=, return_log_probs=)`: gradients by
+  teacher-forced re-scoring of the final beams, and control over keeping
+  the rows. `beamgrad.search` (scores, sequences and trace from one decode),
+  `sequence_scores`, `length_penalty`, and `BeamSearchResult.trace`.
+- `beamgrad.losses`: `structured_margin`, `minimum_risk`, `matches`.
+- `beamgrad.estimators`: `path_scores`, `selected_softmax` and
+  `relaxed_topk` (with each pool candidate's parent, token and origin),
+  matching the C library's surrogates on CPU and CUDA.
+- `beamgrad.hf`: `CausalLMStep` (a step function for Hugging Face causal LMs,
+  with a key/value cache that follows the beams) and `CausalLMRescorer`
+  (chunked, checkpointed vocabulary projection; optional gradient
+  checkpointing).
+- Operators `final_scores_path_gradient` and `length_penalty` (CPU and
+  CUDA), and their C/CUDA counterparts `dbs_cuda_path_gradient` and
+  `dbs_cuda_length_penalty`.
+- `experiments/multi30k`, `benchmarks/hf_training_memory.py`, and the
+  guides `docs/training.md`, `docs/installation.md` and `docs/benchmarks.md`.
+- Wheel builds (`.github/workflows/wheels.yml`), attached to GitHub releases;
+  `BEAMGRAD_PIN_TORCH` and `BEAMGRAD_LOCAL_VERSION` for building them.
+- CI builds the CUDA operators with CUDA 12.4 (with PyTorch 2.4), 12.6 and
+  13.0 (with Blackwell architectures), and tests transformers with a
+  key/value cache, 384-step searches and autocast (bfloat16, float16).
 - `beamgrad.beam_search`, `BeamState`, `BeamSearchResult`: beam search that
   drives a model step by step, on CPU or CUDA, without stacking or copying the
   per-step rows. `torch.ops.beamgrad.decode_step` (one step from an explicit
@@ -86,6 +126,8 @@ three functions are added and one no-op stub is removed (see below).
 
 ### Changed
 
+- The Python extensions are built against CPython's limited API (abi3) and
+  no longer use pybind11.
 - The CPU core is split into modules (decoder, kernels, dispatch, C ABI)
   instead of one 4,300-line file. `src/c_api.cpp` includes `dbs.h` rather
   than re-declaring it.
@@ -136,6 +178,8 @@ three functions are added and one no-op stub is removed (see below).
 
 ### Fixed
 
+- `beam_search(..., device="cuda")` rejected rows on `cuda:0`, because
+  `torch.device("cuda")` does not compare equal to `torch.device("cuda:0")`.
 - Integers beyond 32 bits were truncated instead of rejected: `steps=[4,
   2**32 + 1]` decoded one step for the second example (PyTorch on CPU and
   CUDA, and JAX with 64-bit arrays), and through JAX's ctypes bindings
