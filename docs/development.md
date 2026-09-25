@@ -77,7 +77,10 @@ Release and Debug builds.
 finite-difference gradients, path/score consistency, EOS/min-length/length
 penalty, constraints, variable steps, validation, `torch.compile`, fake
 tensors, `torch.vmap`, `torch.func`), the ctypes bindings, JAX (values, gradients, `jit`,
-`vmap`, validation), and exact CUDA-vs-CPU parity (when a GPU is available).
+`vmap`, validation), exact CUDA-vs-CPU parity (when a GPU is available), and
+`beamgrad.hf` against tiny random `transformers` models (Llama, GPT-2; when
+`transformers` is installed): the same beams as `generate()`, re-scoring that
+reproduces the search's scores, and the same gradient both ways.
 
 Sanitizers and fuzzing:
 
@@ -111,7 +114,8 @@ guides the fuzzer through the library, not just the harness.
   warnings as errors, plus a static build), macOS and Windows; ASan/UBSan,
   TSan and a fuzz smoke run; an nvcc build of libdbs_cuda and of the Python
   CUDA operators in a CUDA 12.6 container; the Python package on Linux, macOS
-  and Windows with the newest PyTorch, and on Linux with the oldest supported
+  and Windows with the newest PyTorch (with JAX and `transformers` on Linux,
+  Python 3.13), and on Linux with the oldest supported
   versions (Python 3.10, PyTorch 2.4, JAX 0.4.20); lint and version metadata.
 - **GPU**: the CUDA tests and benchmark on a self-hosted GPU runner. It is
   enabled by the repository variable `BEAMGRAD_GPU_RUNNER=true` and a runner
