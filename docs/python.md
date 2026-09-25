@@ -9,8 +9,8 @@ runs in float32 on the tensor's device; gradients are returned in the input's
 dtype. There is no silent device fallback: CUDA tensors run the native CUDA
 engine, forward and backward.
 
-The work is done by two operators registered with `torch.library`
-(`torch.ops.beamgrad.decode` and `torch.ops.beamgrad.final_scores_backward`)
+The work is done by operators registered with `torch.library`
+(`torch.ops.beamgrad.decode`, `decode_step` and `final_scores_backward`)
 with fake-tensor implementations, an autograd formula and a vmap rule, so
 beamgrad works inside `torch.compile` (including `fullgraph=True`), with
 `torch.export` and fake-tensor tracing, and under `torch.vmap` (PyTorch 2.5+).
@@ -65,11 +65,20 @@ that produced it; see [algorithm.md](algorithm.md#backward-surrogate-gradients).
 Double backward is not supported.
 
 ```python
-x = model(...).log_softmax(-1)            # [B, T, K, V], requires grad
-scores = beamgrad.final_scores(x, beamgrad.BeamOptions(beam_size=4, eos_token=2))
-loss = (scores[:, 1] - scores[:, 0] + 1.0).clamp(min=0).mean()
+options = beamgrad.BeamOptions(beam_size=4, eos_token=2)
+x = model(...).log_softmax(-1)                                   # [B, T, K, V], requires grad
+scores = beamgrad.final_scores(x, options)                       # [B, K]
+paths = beamgrad.backtrack(beamgrad.decode(x.detach(), options))  # [B, K, T]
+# Structured margin: the reference must beat the best beam that is not the reference.
+is_gold = (paths == gold[:, None]).all(-1)                       # gold: [B, T] reference tokens
+rival = scores.masked_fill(is_gold, float("-inf")).amax(1)
+loss = torch.relu(rival - gold_score + 1.0).mean()               # gold_score: [B], its own score
 loss.backward()
 ```
+
+With a model whose rows depend on the beams chosen so far, use
+[`beam_search`](#beam_searchstep_fn-options-max_steps--batch_size1-devicenone---beamsearchresult)
+instead.
 
 ## `decode(log_probs, options, steps=None) -> BeamSearchOutput`
 
@@ -104,6 +113,67 @@ hold `-1`.
 trace = beamgrad.decode(x, options)
 best = beamgrad.backtrack(trace)[:, 0]    # [B, T] best hypothesis per example
 ```
+
+## `beam_search(step_fn, options, max_steps, *, batch_size=1, device=None) -> BeamSearchResult`
+
+Beam search over a model's next-token distributions, for autoregressive models
+whose rows at step `t` depend on the beams chosen at step `t - 1`. Each step
+calls `step_fn(beams)` with the current `BeamState` and expects `[B, K, V]`
+log-probabilities (row `k` follows beam `k`'s hypothesis). The next beams are
+chosen by the native engine on the rows' device, exactly as `decode` chooses
+them from the stacked rows. The search stops after `max_steps` steps, or once
+every beam has finished.
+
+`BeamState` fields (`t` is `beams.step`):
+
+| field | shape | meaning |
+|---|---|---|
+| `sequences` | `[B, K, t]` int64 | tokens of each hypothesis, `-1` past its length and for dead slots |
+| `parents` | `[B, K]` int64 | slot at step `t - 1` that beam `k` continues (`-1` at step 0 and for dead slots) |
+| `tokens` | `[B, K]` int64 | token beam `k` emitted at step `t - 1` (`-1` at step 0 and for dead slots) |
+| `lengths` | `[B, K]` int64 | hypothesis lengths |
+| `scores` | `[B, K]` float32 | length-penalised scores (no gradient) |
+| `finished` | `[B, K]` bool | the hypothesis ended with EOS |
+| `active` | `[B, K]` bool | live and unfinished: the rows the search reads |
+
+Beams are re-ranked every step, so slot `k` usually continues a different
+hypothesis than slot `k` did before: reorder any per-beam state (a
+transformer's key/value cache, an RNN's hidden state) by `parents` (clamped at
+0; dead slots' rows are never read). At step 0 all slots hold the empty
+hypothesis and only slot 0 is read.
+
+`BeamSearchResult` fields:
+
+| field | shape | meaning |
+|---|---|---|
+| `scores` | `[B, K]` | final length-penalised scores, best first, **differentiable** |
+| `sequences` | `[B, K, max_steps]` int64 | each final beam's tokens, `-1` past its length |
+| `lengths`, `raw_scores` | `[B, K]` | hypothesis lengths and cumulative log-probabilities |
+| `trace` | `BeamSearchOutput` | the per-step trace, as `decode(torch.stack(step_log_probs, 1), options)` returns it |
+| `step_log_probs` | `T × [B, K, V]` | the tensors `step_fn` returned (not copied) |
+
+`scores` equals `final_scores(torch.stack(step_log_probs, 1), options)`, with
+the same gradient: each beam is differentiated along its own path with the
+selection held fixed, and the gradient reaches whatever the rows were computed
+from. The rows are never stacked or copied, so with a large vocabulary the
+search itself adds only `[B, K]` state per step; under `torch.no_grad()` a
+step's rows can be freed once the next step starts.
+
+```python
+def step(beams):                                   # an RNN whose hidden states follow the beams
+    global hidden
+    if beams.step == 0:
+        hidden = encoder(src).repeat_interleave(K, 0)            # [B*K, H]
+    else:
+        order = (torch.arange(B)[:, None] * K + beams.parents.clamp(min=0)).flatten()
+        hidden = cell(embed(beams.tokens.clamp(min=0).flatten()), hidden[order])
+    return head(hidden).log_softmax(-1).view(B, K, -1)
+
+result = beamgrad.beam_search(step, options, max_steps=20, batch_size=B)
+```
+
+[`examples/train_lm.py`](../examples/train_lm.py) trains such a model so that
+reference sequences win the search by a margin.
 
 ## `cuda_available() -> bool`
 

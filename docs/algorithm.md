@@ -136,9 +136,11 @@ final scores or the final-score gradient.
 - **Batch invariant.** Each example of a batch is decoded independently.
 - **Surrogate, not exact.** Gradients do not account for how selection would
   change; a beam that is not selected receives no gradient.
-- **Precomputed rows.** beamgrad consumes a `[T, K, V]` tensor. When each
-  row depends on its beam's prefix (an autoregressive model), the model must
-  produce those rows during decoding; the C ABI's `dbs_decode_model_steps_ex`
-  runs the search step by step and asks a callback for each step's rows,
-  telling it which previous beam each row continues (see
-  [c-api.md](c-api.md#model-step-decoding)).
+- **Rows conditioned on the search.** The search consumes `[T, K, V]` rows.
+  When each row depends on its beam's prefix (an autoregressive model), the
+  model must produce the rows of step `t` after the beams of step `t - 1` are
+  known. `beamgrad.beam_search` (Python) and `dbs_decode_model_steps_ex` (C)
+  run the search step by step and ask the model for each step's rows, telling
+  it which previous beam each row continues. The scores are then those of the
+  stacked rows, so the gradient above applies unchanged, and reaches the
+  model through every row a final beam's path used.
