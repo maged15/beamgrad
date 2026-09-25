@@ -674,6 +674,32 @@ void test_length_penalty() {
 
 } // namespace
 
+// The relaxed pool's weights must sum to K whatever the scores' magnitude: a
+// long search has cumulative log-probabilities in the thousands. (The
+// bisection used to stop once theta was known to 1e-4 of its own magnitude,
+// so the sum drifted to 4.3 near -1e3 and 6 near -1e4.)
+void test_soft_topk_sums_to_k_at_any_magnitude() {
+    constexpr int n = 32;
+    constexpr int k = 4;
+    std::mt19937 rng(11);
+    std::normal_distribution<float> spread(0.0f, 1.5f);
+    for (float offset : {0.0f, -1.0e3f, -1.0e4f}) {
+        for (int variant = 0; variant < 12; ++variant) {
+            float scores[n];
+            float out[n];
+            for (int i = 0; i < n; ++i) {
+                // Spaced 0.1 apart (ascending, then descending), then random.
+                const float step = variant == 0 ? 0.1f : -0.1f;
+                scores[i] = variant < 2 ? offset + step * static_cast<float>(i) : offset + spread(rng);
+            }
+            soft_topk_inclusion(scores, out, n, k, 0.25f, 1.0e-4f, 48);
+            double sum = 0.0;
+            for (float w : out) sum += w;
+            CHECK(std::fabs(sum - k) < 1.0e-2);
+        }
+    }
+}
+
 int main() {
     std::cout << "kernel paths:";
     for (KernelPath p : simd_paths()) std::cout << ' ' << kernel_path_name(p);
@@ -690,6 +716,7 @@ int main() {
     test_length_penalty();
     test_step_matches_decode();
     test_path_gradient_matches_dense();
+    test_soft_topk_sums_to_k_at_any_magnitude();
     std::cout << "dbs_internal_tests passed\n";
     return 0;
 }

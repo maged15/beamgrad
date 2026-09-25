@@ -64,8 +64,8 @@ token 0, so set it to `-1` to disable EOS handling.
 | `selected_temperature` | 1.0 | softmax temperature of the selected-beam weights |
 | `soft_topk_temperature` | 0.25 | sigmoid temperature of the relaxed pool |
 | `relaxed_pool_multiplier` | 0 | relaxed pool size `P = K * multiplier`; 0 disables the pool |
-| `soft_topk_tolerance` | 1e-4 | bisection tolerance for the relaxed pool |
-| `soft_topk_max_iters` | 48 | bisection iteration cap |
+| `soft_topk_tolerance` | 1e-4 | the relaxed pool's bisection stops when the weights sum to `K` within this, or `theta` is bracketed to this × `soft_topk_temperature` (at any score magnitude) |
+| `soft_topk_max_iters` | 48 | bisection iteration cap; the defaults need about 21 iterations for a pool a few units wide |
 | `vocab_block` | (ignored) | kept for source compatibility |
 | `validate_inputs` | (none) | non-zero: fail with `-1` when a row the search reads contains NaN or `+inf` |
 

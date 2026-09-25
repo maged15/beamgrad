@@ -1,5 +1,21 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- The relaxed top-k pool's weights did not sum to `K` when the scores were
+  large (a long search's cumulative log-probabilities). The bisection
+  stopped once `theta` was known to `soft_topk_tolerance` of its own
+  magnitude. For 32 candidates 0.1 apart with `K = 4` and temperature 0.25,
+  the weights summed to 4.29 near −1,000 and 4.64 near −5,000; a 64-step
+  Python `relaxed_topk` search near −1,500 summed to 1.88 instead of 2. The
+  bisection now stops when `theta` is bracketed to `tolerance × temperature`,
+  and it bisects `theta` as an offset from the best score, so the sums stay
+  within about 1e-4 of `K` at any magnitude. This applies to the C library
+  (`relaxed_pool_multiplier`) and to `beamgrad.estimators.relaxed_topk`
+  alike. The default of 48 iterations is unchanged; about 21 are needed.
+
 ## 2.0.0 (2026-09-25)
 
 The project is renamed **beamgrad** (previously `differentiable-beam-search-cuda`

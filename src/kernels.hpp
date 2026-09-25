@@ -132,6 +132,9 @@ void softmax_selected(const float* scores, float* out, int n, float temperature)
 // Sigmoid k-hot relaxation: finds theta by bisection so that
 // sum_i sigmoid((scores[i] - theta) / temperature) ~= target_k, then writes the
 // per-candidate inclusion weights. Scores <= -1e30 are treated as padding.
+// Bisection stops when the sum is within `tolerance` of target_k or theta is
+// bracketed to tolerance * temperature, whatever the scores' magnitude (theta
+// is bisected as an offset from the best score), or after max_iters.
 void soft_topk_inclusion(
     const float* scores, float* out, int n, int target_k,
     float temperature, float tolerance, int max_iters);

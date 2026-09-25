@@ -124,7 +124,11 @@ test suite checks them against the C library):
   sigmoid "k-hot"
   relaxation of membership in the top `K`:
   `r_i = sigmoid((score_i - theta) / soft_topk_temperature)`, with `theta`
-  found by bisection so that `sum_i r_i = K`. Its gradient is obtained by
+  found by bisection so that `sum_i r_i = K`. The bisection stops once the
+  sum is within `soft_topk_tolerance` of `K` or `theta` is bracketed to
+  `soft_topk_tolerance × soft_topk_temperature`. It bisects `theta`'s offset
+  from the best candidate's score, so this accuracy holds for scores in the
+  thousands too. Its gradient is obtained by
   implicit differentiation through `theta`:
   `d r_i = a_i / tau * (g_i - sum_j g_j a_j / sum_j a_j)` with
   `a_i = r_i (1 - r_i)`.

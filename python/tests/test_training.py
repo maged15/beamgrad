@@ -287,3 +287,20 @@ def test_estimators_and_losses_on_cuda():
     assert torch.equal(outs["cpu"][0], outs["cuda"][0])
     torch.testing.assert_close(outs["cpu"][1], outs["cuda"][1], rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(outs["cpu"][2], outs["cuda"][2], rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("offset", [0.0, -1e3, -1e4])
+def test_relaxed_topk_weights_sum_to_k_at_any_score_magnitude(offset):
+    # A long search has cumulative scores in the thousands; the bisection must
+    # still place theta so that each step's weights sum to K.
+    spaced = offset + 0.1 * torch.arange(32, dtype=torch.float32)
+    for scores in (spaced, spaced.flip(0)):
+        weights = est._SoftTopK.apply(scores[None], 4, 0.25, 1e-4, 48)
+        assert abs(float(weights.sum()) - 4) < 1e-2
+    x = random_log_probs(2, 6, 4, 50, seed=12)
+    x[:, 0] += offset  # every hypothesis's score moves by the offset
+    options = BeamOptions(beam_size=4)
+    result = search(x, options)
+    assert float(result.scores.max()) < offset + 1
+    relaxed = est.relaxed_topk(result, options, pool_multiplier=8, temperature=0.25)
+    assert float((relaxed.weights.sum(-1) - 4).abs().max()) < 1e-2
