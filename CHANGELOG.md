@@ -12,6 +12,17 @@
   `sequence_scores` lengths include the EOS) is now documented. The default
   (`None`) behaves as before.
 
+### Changed
+
+- The libFuzzer harness covers `dbs_decode_constrained_ex`, the relaxed pool
+  with both backward passes, `dbs_decode_typed` (F16, BF16),
+  `dbs_decode_batch_into` with `dbs_backward_batch_into` on corrupted traces,
+  and `dbs_decode_batch_variable`. It checks results as well as crashes:
+  status codes, sparse vs dense gradients, typed vs float32 input, and
+  rejection of out-of-range traces. `dbs_fuzz` now compiles its own
+  coverage-instrumented copy of the library. Before, only the harness was
+  instrumented, so libFuzzer got no coverage feedback from the library.
+
 ### Fixed
 
 - `beam_search` rejected NumPy integers for `max_steps` and `batch_size`,

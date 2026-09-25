@@ -88,6 +88,23 @@ cmake -S . -B build-fuzz -DDBS_BUILD_FUZZER=ON -DDBS_ENABLE_SANITIZERS=ON \
 cmake --build build-fuzz && ./build-fuzz/dbs_fuzz -max_total_time=300
 ```
 
+The harness (`tests/fuzz_dbs.cpp`) derives every choice from the input. It
+covers `dbs_decode` with a relaxed pool and both backward passes (with
+selected-weight, relaxed-pool and final-score gradients),
+`dbs_decode_constrained_ex` (banned and forced tokens, `min_length`, n-gram
+blocking, repetition penalty), `dbs_decode_typed` (F16, BF16),
+`dbs_decode_batch_into` then `dbs_backward_batch_into` on a trace it may
+corrupt, and `dbs_decode_batch_variable`.
+
+Besides the sanitizers, it checks that:
+- every call returns `DBS_OK` or `DBS_ERROR_INVALID_ARGUMENT`;
+- the sparse backward equals the dense one;
+- F16/BF16 input decodes exactly like the same values in float32;
+- a corrupted trace is rejected exactly when it is out of range.
+
+`dbs_fuzz` compiles its own instrumented copy of the library, so coverage
+guides the fuzzer through the library, not just the harness.
+
 ## Continuous integration
 
 - **CI** (every push and pull request): C++ on Linux (GCC and Clang with
