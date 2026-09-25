@@ -120,7 +120,7 @@ def test_minimum_risk_and_dead_examples():
 
 
 def c_library_surrogates(x, options, pool_multiplier, selected_temperature, soft_topk_temperature, g_sel, g_rel):
-    """Selected weights, relaxed weights, pool scores and the dense gradient from libdbs."""
+    """Selected weights, relaxed weights, the pool (scores, parents, tokens) and the dense gradient from libdbs."""
     lib = load_library()
     f32p = ctypes.POINTER(ctypes.c_float)
     for name in (
@@ -130,6 +130,8 @@ def c_library_surrogates(x, options, pool_multiplier, selected_temperature, soft
         "dbs_backward_grad_log_probs",
     ):
         getattr(lib, name).argtypes, getattr(lib, name).restype = [ctypes.c_void_p], f32p
+    for name in ("dbs_result_pool_parents", "dbs_result_pool_tokens"):
+        getattr(lib, name).argtypes, getattr(lib, name).restype = [ctypes.c_void_p], ctypes.POINTER(ctypes.c_int32)
     lib.dbs_backward_dense.argtypes = [ctypes.c_void_p] * 2 + [f32p] * 3 + [ctypes.POINTER(ctypes.c_void_p)]
     lib.dbs_backward_dense.restype = ctypes.c_int
     c = options_to_c(options)
@@ -146,6 +148,8 @@ def c_library_surrogates(x, options, pool_multiplier, selected_temperature, soft
     weights = torch.tensor([lib.dbs_result_weights(result)[i] for i in range(T * K)]).view(T, K)
     relaxed = torch.tensor([lib.dbs_result_relaxed_weights(result)[i] for i in range(T * P)]).view(T, P)
     pool = torch.tensor([lib.dbs_result_pool_scores(result)[i] for i in range(T * P)]).view(T, P)
+    pool_parents = torch.tensor([lib.dbs_result_pool_parents(result)[i] for i in range(T * P)]).view(T, P)
+    pool_tokens = torch.tensor([lib.dbs_result_pool_tokens(result)[i] for i in range(T * P)]).view(T, P)
     backward = ctypes.c_void_p()
     gs, gr = g_sel.contiguous(), g_rel.contiguous()
     check(
@@ -164,7 +168,7 @@ def c_library_surrogates(x, options, pool_multiplier, selected_temperature, soft
     lib.dbs_free_backward(backward)
     lib.dbs_free_result(result)
     lib.dbs_destroy(handle)
-    return weights, relaxed, pool, grad
+    return weights, relaxed, (pool, pool_parents, pool_tokens), grad
 
 
 @pytest.mark.parametrize(
@@ -181,7 +185,16 @@ def test_estimators_match_the_c_library(options):
     g_sel, g_rel = torch.randn(T, K), torch.randn(T, K * m)
     c_weights, c_relaxed, c_pool, c_grad = c_library_surrogates(x, options, m, 0.7, 0.3, g_sel, g_rel)
     torch.testing.assert_close(weights.detach(), c_weights, rtol=1e-5, atol=1e-6)
-    torch.testing.assert_close(relaxed.scores.detach(), c_pool, rtol=0, atol=0)
+    torch.testing.assert_close(relaxed.scores.detach(), c_pool[0], rtol=0, atol=0)
+    assert torch.equal(relaxed.parents, c_pool[1].long()) and torch.equal(relaxed.tokens, c_pool[2].long())
+    # Each expansion's score is its parent's raw score plus its entry, length-penalised.
+    trace = result.trace
+    for t, p in relaxed.from_logprob.nonzero().tolist():
+        parent, token = int(relaxed.parents[t, p]), int(relaxed.tokens[t, p])
+        raw = (0.0 if t == 0 else trace.raw_scores[t - 1, parent]) + x[t, parent, token].detach()
+        length = 1 if t == 0 else int(trace.lengths[t - 1, parent]) + 1
+        penalty = beamgrad.length_penalty(torch.tensor(length), options.length_penalty_alpha)
+        torch.testing.assert_close(relaxed.scores[t, p].detach(), raw / penalty)
     torch.testing.assert_close(relaxed.weights.detach(), c_relaxed, rtol=1e-4, atol=1e-5)
     ((weights * g_sel).sum() + (relaxed.weights * g_rel).sum()).backward()
     torch.testing.assert_close(x.grad, c_grad, rtol=1e-4, atol=1e-5)

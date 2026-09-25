@@ -147,6 +147,9 @@ class RelaxedTopK(NamedTuple):
 
     scores: torch.Tensor  # [B, T, P] the P best candidates' scores per step, best first (differentiable)
     weights: torch.Tensor  # [B, T, P] relaxed top-K membership, summing to K per step (differentiable)
+    parents: torch.Tensor  # [B, T, P] int64 slot at step t - 1 each candidate extends; -1 for padding
+    tokens: torch.Tensor  # [B, T, P] int64 token it appends (EOS for a finished beam carried forward); -1 for padding
+    from_logprob: torch.Tensor  # [B, T, P] bool: an expansion (not a carried beam or padding)
 
 
 def relaxed_topk(
@@ -165,7 +168,10 @@ def relaxed_topk(
     temperature)``, with ``theta`` found by bisection so they sum to ``K``,
     are a smooth version of "kept by the search". The gradient comes from
     implicit differentiation through ``theta`` and reaches candidates that were
-    not selected. N-gram blocking and repetition penalties are not supported.
+    not selected. ``parents``, ``tokens`` and ``from_logprob`` say which
+    candidate each is, as in the C library's pool (the order of candidates
+    with exactly equal scores may differ from it). N-gram blocking and
+    repetition penalties are not supported.
     """
     if options.no_repeat_ngram_size > 0 or options.repetition_penalty > 1.0:
         raise NotImplementedError("relaxed_topk does not support no_repeat_ngram_size or repetition_penalty")
@@ -180,7 +186,7 @@ def relaxed_topk(
     alpha, eos = options.length_penalty_alpha, options.eos_token
     device = trace.tokens.device
     banned = None
-    pool_scores, pool_weights = [], []
+    pool_scores, pool_weights, pool_index = [], [], []
     for t, row in enumerate(rows):
         V = row.shape[-1]
         if banned is None and options.banned_tokens:
@@ -211,12 +217,28 @@ def relaxed_topk(
             float("-inf"),
         )
         candidates = torch.cat([expanded.flatten(1), carried], dim=1)  # [B, K * V + K]
-        best = candidates.topk(min(P, candidates.shape[1]), dim=1).values
+        best, index = candidates.topk(min(P, candidates.shape[1]), dim=1)
         if best.shape[1] < P:
             best = torch.nn.functional.pad(best, (0, P - best.shape[1]), value=float("-inf"))
+            index = torch.nn.functional.pad(index, (0, P - index.shape[1]), value=-1)
+        index = torch.where(best > _NEG_GUARD, index, -1)
         pool_scores.append(best)
         pool_weights.append(_SoftTopK.apply(best, K, temperature, tolerance, max_iters))
-    out = RelaxedTopK(torch.stack(pool_scores, 1), torch.stack(pool_weights, 1))
+        pool_index.append((index, K * V))
+    parents, tokens, from_logprob = [], [], []
+    for index, expansions in pool_index:
+        expanded = (index >= 0) & (index < expansions)
+        V = expansions // K
+        parents.append(torch.where(expanded, index // V, torch.where(index >= 0, index - expansions, -1)))
+        tokens.append(torch.where(expanded, index % V, torch.where(index >= 0, eos, -1)))
+        from_logprob.append(expanded)
+    out = RelaxedTopK(
+        torch.stack(pool_scores, 1),
+        torch.stack(pool_weights, 1),
+        torch.stack(parents, 1),
+        torch.stack(tokens, 1),
+        torch.stack(from_logprob, 1),
+    )
     if result.trace.tokens.dim() == 2:
-        out = RelaxedTopK(out.scores[0], out.weights[0])
+        out = RelaxedTopK(*(x[0] for x in out))
     return out

@@ -295,7 +295,11 @@ def _search(
 ) -> BeamSearchResult:
     B, K = batch_size, options.beam_size
     keep_rows = torch.is_grad_enabled() if return_log_probs is None else return_log_probs
-    fixed_device = torch.device(device) if device is not None else None
+    fixed_device = None
+    if device is not None:
+        # The device tensors report ("cuda:0" for "cuda"), so that it compares
+        # equal to the rows' device.
+        fixed_device = torch.empty(0, device=device).device
     state_device = fixed_device or torch.device("cpu")
 
     raw = torch.full((B, K), float("-inf"), device=state_device)
