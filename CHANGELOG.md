@@ -23,6 +23,15 @@
   coverage-instrumented copy of the library. Before, only the harness was
   instrumented, so libFuzzer got no coverage feedback from the library.
 
+### Documentation
+
+- `dbs_cuda_decode_step` (`include/dbs_cuda.h`, `docs/cuda.md`) requires every
+  live, unfinished beam of an example to have the same length: the CUDA scan
+  ranks by raw score. States produced by the search always satisfy this. A
+  hand-built state that does not, with a length penalty, can select
+  different beams than the CPU. The precondition is documented, not checked,
+  since a check would synchronize the stream on every step.
+
 ### Fixed
 
 - `beam_search` rejected NumPy integers for `max_steps` and `batch_size`,
