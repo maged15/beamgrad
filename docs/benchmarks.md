@@ -15,7 +15,12 @@ usually dominates. Pick the level that matches the question.
 
 `dbs_bench` times `dbs_decode` and the dense and sparse backward passes over
 a grid of `T × K × V × B` shapes, or over one shape given on the command
-line. `benchmark.py` times `beamgrad.final_scores` forward, forward +
+line. `dbs_bench model-steps` times `dbs_decode_model_steps_ex` over long
+searches, with a callback that only copies rows, so the search's own
+per-step work is measured. `dbs_bench batch-threads` compares
+`dbs_decode_batch_into` with automatic threading and with one thread. That
+comparison sets the size below which automatic threading uses one thread.
+`benchmark.py` times `beamgrad.final_scores` forward, forward +
 backward, and a reference beam search written with `torch.topk`, on every
 available device. It also asserts that the scores agree. `--csv` records the
 results together with the environment.

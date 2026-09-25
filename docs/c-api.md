@@ -89,7 +89,7 @@ per step costs time, so it is off by default.
 | `dbs_decode_typed` | float32, IEEE fp16 or bf16 `[T, K, V]` (`DBSDataTypeC`) |
 | `dbs_decode_constrained` | banned tokens `[V]`, forced tokens `[T]` (`-1` = free), per-call min length |
 | `dbs_decode_constrained_ex` | `DBSAdvancedConstraintsC`: the above plus repetition penalty, no-repeat n-gram size, and a token-filter callback |
-| `dbs_decode_batch` / `dbs_decode_batch_typed` | `[B, T, K, V]`, decoded on `num_threads` threads (0 = all cores) |
+| `dbs_decode_batch` / `dbs_decode_batch_typed` | `[B, T, K, V]`, decoded on `num_threads` threads (0 = all cores, or only the calling thread for a batch under 2^19 candidates) |
 | `dbs_decode_batch_variable` | `[B, maxT, maxK, V]` with per-example steps, beam sizes, EOS tokens, min lengths, banned masks and forced schedules |
 | `dbs_decode_model_steps_ex` | a callback produces each step's `[K, V]` rows from the current beams (see below); optional constraints |
 | `dbs_decode_model_steps` / `..._with_workspace` | the original callback, which sees only each beam's previous token and score |

@@ -14,6 +14,20 @@
 
 ### Changed
 
+- Model-step decoding (`dbs_decode_model_steps`, `_ex`, `_with_workspace`)
+  builds each step's `[K, t]` prefix matrix from the previous step's. It
+  copies each beam's parent row and appends one token, where it used to walk
+  every path back through the trace. The prefixes are byte for byte the
+  same. Best of 30 runs on this machine (`dbs_bench model-steps`, V = 32):
+  T = 1024 went from 3.6 ms to 0.55 ms at K = 4, and from 15.1 ms to 2.9 ms
+  at K = 16; T = 256, K = 4 went from 268 µs to 88 µs.
+- Batch functions with `num_threads <= 0` (automatic) run a batch under 2^19
+  candidates (B·T·K·V; B·T·K for `dbs_backward_batch_into`) on the calling
+  thread instead of starting a thread per core. For such batches that took
+  longer than the work itself. An 8 × 8 × 4 × 1000 decode went from 95 µs
+  to 51 µs, a 4 × 4 × 4 × 256 decode from 35 µs to 6 µs; batches of 1M
+  candidates and more are unchanged (`dbs_bench batch-threads`). An
+  explicit thread count is still honoured, capped at the batch size.
 - The libFuzzer harness covers `dbs_decode_constrained_ex`, the relaxed pool
   with both backward passes, `dbs_decode_typed` (F16, BF16),
   `dbs_decode_batch_into` with `dbs_backward_batch_into` on corrupted traces,

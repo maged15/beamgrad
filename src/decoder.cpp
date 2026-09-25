@@ -722,24 +722,34 @@ DecodeResult BeamSearchDecoder::decode_model_steps(
     std::vector<float> local_rows;
     std::vector<float>& rows = rows_buffer ? *rows_buffer : local_rows;
     std::vector<float> scores(static_cast<size_t>(K));
-    std::vector<int32_t> prefixes(checked_mul_size(static_cast<size_t>(K), static_cast<size_t>(steps), "prefix size overflow"));
+    // The [K, t] prefix matrix of step t (row k: beam k's tokens at steps
+    // 0..t-1), built from step t - 1's by copying each beam's parent row and
+    // appending the token it emitted; a dead slot's row is all -1. Two buffers
+    // alternate, so each step costs one pass over the matrix.
+    const size_t prefix_size = checked_mul_size(static_cast<size_t>(K), static_cast<size_t>(steps), "prefix size overflow");
+    std::vector<int32_t> prefixes(prefix_size);
+    std::vector<int32_t> next_prefixes(prefix_size);
 
     for (int t = 0; t < steps; ++t) {
+        if (t > 0) {
+            const size_t width = static_cast<size_t>(t - 1);  // the previous rows' length
+            for (int k = 0; k < K; ++k) {
+                const size_t idx = width * static_cast<size_t>(K) + static_cast<size_t>(k);  // step t - 1, slot k
+                const int32_t parent = result.parents[idx];
+                int32_t* row = next_prefixes.data() + static_cast<size_t>(k) * static_cast<size_t>(t);
+                if (parent >= 0) {
+                    std::copy_n(prefixes.data() + static_cast<size_t>(parent) * width, width, row);
+                } else {
+                    std::fill_n(row, width, -1);
+                }
+                row[width] = result.tokens[idx];
+            }
+            prefixes.swap(next_prefixes);
+        }
         for (int k = 0; k < K; ++k) {
             const size_t i = static_cast<size_t>(k);
             const int len = std::max(1, static_cast<int>(search.lengths()[i]));
             scores[i] = search.raw_scores()[i] / gnmt_length_penalty(len, opt_.length_penalty_alpha);
-            // Row k of the [K, t] prefix matrix: beam k's path, walked back from step t - 1.
-            int beam = k;
-            for (int s = t - 1; s >= 0; --s) {
-                int32_t token = -1;
-                if (beam >= 0) {
-                    const size_t idx = static_cast<size_t>(s) * static_cast<size_t>(K) + static_cast<size_t>(beam);
-                    token = result.tokens[idx];
-                    beam = result.parents[idx];
-                }
-                prefixes[i * static_cast<size_t>(t) + static_cast<size_t>(s)] = token;
-            }
         }
         ModelStepInfo info;
         info.step = t;

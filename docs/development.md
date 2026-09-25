@@ -129,6 +129,8 @@ guides the fuzzer through the library, not just the harness.
 ```bash
 ./build/dbs_bench                               # C ABI microbenchmark matrix
 ./build/dbs_bench 16 8 32000 4 20               # T K V B repeats
+./build/dbs_bench model-steps                   # dbs_decode_model_steps_ex, long searches
+./build/dbs_bench batch-threads                 # batch decode: automatic threads vs one
 python benchmarks/benchmark.py --device all     # PyTorch API vs a torch.topk beam search
 python benchmarks/hf_beam_search.py --train     # beam_search on a Hugging Face LM vs generate()
 python benchmarks/hf_training_memory.py --check # training-step memory per gradient mode
