@@ -41,8 +41,10 @@ def main() -> int:
         errors.append("DBS_ABI_VERSION in include/dbs.h and CMakeLists.txt must match")
 
     pyproject = read("pyproject.toml")
-    if 'dynamic = ["version"]' not in pyproject:
-        errors.append('pyproject.toml must declare dynamic = ["version"] (read from VERSION)')
+    if not re.search(r'^dynamic\s*=\s*\[[^\]]*"version"', pyproject, flags=re.MULTILINE):
+        errors.append('pyproject.toml must list "version" in dynamic (setup.py reads it from VERSION)')
+    if 'ROOT / "VERSION"' not in read("setup.py"):
+        errors.append("setup.py must read the package version from VERSION")
 
     py_version = re.search(r'__version__\s*=\s*"([^"]+)"', read("python/beamgrad/_version.py"))
     if not py_version or py_version.group(1) != version:

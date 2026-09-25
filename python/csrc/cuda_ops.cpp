@@ -6,7 +6,12 @@
 // PyTorch's caching allocator. Two things read back from the device and so
 // synchronize: per-example steps (validated on the device) and validate=true
 // (the engine's NaN/+inf flags, one byte per example).
-#include <torch/extension.h>
+//
+// Like beamgrad._C, the module uses only CPython's limited API (abi3).
+#include <Python.h>
+
+#include <torch/all.h>
+#include <torch/library.h>
 
 #include <ATen/cuda/CUDAContext.h>
 #include <c10/cuda/CUDAGuard.h>
@@ -327,9 +332,23 @@ TORCH_LIBRARY_IMPL(beamgrad, CUDA, m) {
     m.impl("decode_step", &decode_step_cuda);
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "beamgrad CUDA operators, registered as torch.ops.beamgrad.*";
-    m.def("device_available", []() { return dbs_cuda_available() != 0; },
-          "Whether the CUDA runtime reports a usable device");
-    m.def("max_beam_size", []() { return DBS_CUDA_MAX_BEAM; });
+namespace {
+
+PyObject* device_available(PyObject*, PyObject*) { return PyBool_FromLong(dbs_cuda_available() != 0); }
+
+PyObject* max_beam_size(PyObject*, PyObject*) { return PyLong_FromLong(DBS_CUDA_MAX_BEAM); }
+
+PyMethodDef methods[] = {
+    {"device_available", device_available, METH_NOARGS, "Whether the CUDA runtime reports a usable device"},
+    {"max_beam_size", max_beam_size, METH_NOARGS, "Largest beam size the CUDA engine supports"},
+    {nullptr, nullptr, 0, nullptr},
+};
+
+} // namespace
+
+PyMODINIT_FUNC PyInit__C_cuda(void) {
+    static PyModuleDef module = {
+        PyModuleDef_HEAD_INIT, "_C_cuda", "beamgrad CUDA operators, registered as torch.ops.beamgrad.*", -1, methods,
+    };
+    return PyModule_Create(&module);
 }

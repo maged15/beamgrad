@@ -1,7 +1,9 @@
 # On a version tag: verify the tag matches VERSION, build and check the source
-# distribution, and attach it to a GitHub release. Publishing to PyPI runs only
-# when the repository variable PYPI_PUBLISH=true and PyPI trusted publishing is
-# configured for this workflow (environment `pypi`).
+# distribution, build the binary wheels (wheels.yml), and attach all of them to
+# a GitHub release. Publishing to PyPI (the sdist only: the wheels carry local
+# version labels, which PyPI rejects) runs only when the repository variable
+# PYPI_PUBLISH=true and PyPI trusted publishing is configured for this workflow
+# (environment `pypi`).
 name: Release
 
 on:
@@ -38,8 +40,12 @@ jobs:
           name: sdist
           path: dist/
 
-  github-release:
+  wheels:
     needs: sdist
+    uses: ./.github/workflows/wheels.yml
+
+  github-release:
+    needs: [sdist, wheels]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -50,6 +56,11 @@ jobs:
         with:
           name: sdist
           path: dist
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: wheel-*
+          path: dist
+          merge-multiple: true
       - uses: actions/attest-build-provenance@v2
         with:
           subject-path: dist/*

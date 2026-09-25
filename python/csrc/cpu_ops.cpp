@@ -32,7 +32,14 @@
 //        scores were the search to end here. Used by beamgrad.beam_search.
 //
 // With validate, a NaN or +inf in any row the search reads raises ValueError.
-#include <torch/extension.h>
+//
+// The module itself is empty: importing it runs the TORCH_LIBRARY
+// registrations below. It uses only CPython's limited API (no pybind11), so
+// one build works with every CPython >= 3.10 (an abi3 wheel).
+#include <Python.h>
+
+#include <torch/all.h>
+#include <torch/library.h>
 
 #include <ATen/Parallel.h>
 
@@ -430,6 +437,9 @@ TORCH_LIBRARY_IMPL(beamgrad, CPU, m) {
     m.impl("length_penalty", &length_penalty_cpu);
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
-    m.doc() = "beamgrad CPU operators, registered as torch.ops.beamgrad.*";
+PyMODINIT_FUNC PyInit__C(void) {
+    static PyModuleDef module = {
+        PyModuleDef_HEAD_INIT, "_C", "beamgrad CPU operators, registered as torch.ops.beamgrad.*", -1, nullptr,
+    };
+    return PyModule_Create(&module);
 }

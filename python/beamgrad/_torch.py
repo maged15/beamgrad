@@ -60,8 +60,19 @@ if importlib.util.find_spec(f"{__package__}._C_cuda") is not None:  # built with
     try:
         from . import _C_cuda  # registers the CUDA kernels
     except ImportError as exc:  # pragma: no cover - depends on the machine
+        hint = ""
+        try:
+            from ._build_info import TORCH_CUDA_VERSION as built_cuda
+        except ImportError:
+            built_cuda = None
+        if built_cuda and _major_minor(built_cuda)[:1] != (_major_minor(torch.version.cuda or "0.0") or (0,))[:1]:
+            hint = (
+                f" They were built for CUDA {built_cuda}, but PyTorch uses "
+                f"{'CUDA ' + torch.version.cuda if torch.version.cuda else 'no CUDA'}: install the beamgrad wheel "
+                "for your PyTorch's CUDA variant (docs/installation.md), or build from source."
+            )
         warnings.warn(
-            f"beamgrad's CUDA operators failed to load ({exc}); CUDA tensors are not supported.",
+            f"beamgrad's CUDA operators failed to load ({exc}); CUDA tensors are not supported.{hint}",
             RuntimeWarning,
             stacklevel=2,
         )
