@@ -25,6 +25,21 @@
 
 ### Documentation
 
+- The README's `generate()` parity claim is qualified as the benchmark
+  measures it. All `K` beams are bit-identical in float32 with EOS
+  suppressed and `length_penalty=0`. With EOS the two searches differ by
+  design (finished hypotheses stay in beamgrad's slots but go to a separate
+  pool in `transformers`), and only the best beam is compared.
+- `docs/algorithm.md` has a "What beamgrad is and isn't" section, linked
+  from the README. It says:
+  - the default gradient is that of teacher-forced re-scoring of the
+    selected beams;
+  - only `relaxed_topk` relaxes the selection;
+  - how beamgrad relates to beam-search optimisation, minimum risk training
+    and continuous relaxations of beam search.
+- CONTRIBUTING.md, `docs/development.md` and `docs/installation.md`: builds
+  with `--no-build-isolation` need `setuptools>=77`, `wheel` and
+  `packaging>=24.2` installed first.
 - `dbs_cuda_decode_step` (`include/dbs_cuda.h`, `docs/cuda.md`) requires every
   live, unfinished beam of an example to have the same length: the CUDA scan
   ranks by raw score. States produced by the search always satisfy this. A

@@ -45,12 +45,14 @@ The `Makefile` wraps the common invocations: `make test`, `make cuda`,
 
 ```bash
 pip install torch                                # the build compiles against it
+pip install "setuptools>=77" wheel "packaging>=24.2"   # build tools (see below)
 pip install --no-build-isolation -e ".[test]"    # editable, with test extras
 pytest python/tests
 ```
 
 `--no-build-isolation` makes the extension compile against the PyTorch you
-will import. On Windows, build from a Visual Studio developer prompt (x64)
+will import. It also means the build uses the installed build tools:
+`setuptools>=77` needs `packaging>=24.2`. On Windows, build from a Visual Studio developer prompt (x64)
 with `DISTUTILS_USE_SDK=1` set. `BEAMGRAD_CUDA` controls the CUDA operators: `auto` (default)
 builds them when a CUDA toolkit (`nvcc`, `CUDA_HOME`) and a CUDA-enabled
 PyTorch are present, `1` requires them, `0` skips them. `TORCH_CUDA_ARCH_LIST`

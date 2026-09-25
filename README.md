@@ -78,10 +78,15 @@ best = beamgrad.backtrack(beamgrad.decode(log_probs, options))[:, 0]   # [B, T] 
   gradient to candidates the search pruned.
 - **Drives real models.** `beam_search` runs an autoregressive model inside
   the search, one step at a time, reordering its cache by each beam's parent.
-  On Qwen2.5-0.5B and Qwen3-0.6B it returns the same beams, with bit-identical
-  scores, as `transformers`' `generate(num_beams=...)` in float32, at the same
-  speed ([benchmarks/hf_beam_search.py](benchmarks/hf_beam_search.py)), and
-  fine-tunes the model through the search.
+  On Qwen2.5-0.5B and Qwen3-0.6B, with EOS suppressed and
+  `length_penalty=0`, it returns all `K` beams of `transformers`'
+  `generate(num_beams=K)` with bit-identical scores in float32, at the same
+  speed. With EOS enabled the two differ by design: beamgrad keeps finished
+  hypotheses in their beam slots, and `transformers` keeps them in a separate
+  pool. So there only the best beam is compared
+  ([benchmarks/hf_beam_search.py](benchmarks/hf_beam_search.py),
+  [docs/benchmarks.md](docs/benchmarks.md)). It also fine-tunes the model
+  through the search.
 - **Native everywhere.** CPU kernels are multi-threaded across the batch and
   pick AVX-512, AVX2, SSE4.2 or NEON at runtime. A CUDA engine runs forward
   and backward on the GPU for beams up to 1024, on PyTorch's stream and
@@ -130,6 +135,11 @@ for every `(t, p, v)` on its path, and zero elsewhere. That is the exact
 derivative wherever a small perturbation would not change the selection.
 [docs/algorithm.md](docs/algorithm.md) gives the full definitions, including
 the additional C-level surrogates.
+[What beamgrad is and isn't](docs/algorithm.md#what-beamgrad-is-and-isnt)
+explains two things. The default gradient is the one teacher-forced
+re-scoring of the beams gives, so what is new is the engineering. And it
+covers how beamgrad relates to beam-search optimisation, minimum risk
+training and continuous relaxations of beam search.
 
 ## Performance
 
@@ -201,7 +211,9 @@ The complete version, with error handling, is
 ## Scope and limitations
 
 - Gradients are **surrogate** gradients. They are exact for a fixed beam
-  selection and do not model how the selection itself would change.
+  selection and do not model how the selection itself would change; only
+  `estimators.relaxed_topk` relaxes the selection
+  ([what beamgrad is and isn't](docs/algorithm.md#what-beamgrad-is-and-isnt)).
 - Through the steps (the default), the model's graph for every step is kept
   until the backward pass, as with any backpropagation through generation.
   `rescore_fn` avoids this at the cost of one teacher-forced pass, and the

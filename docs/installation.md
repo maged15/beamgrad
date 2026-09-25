@@ -54,14 +54,16 @@ Building needs a C++17 compiler. For the CUDA operators it also needs a CUDA
 toolkit whose major version matches your PyTorch's CUDA.
 
 ```bash
-pip install torch
+pip install torch "setuptools>=77" wheel "packaging>=24.2"
 pip install --no-build-isolation beamgrad                                   # the PyPI sdist
 pip install --no-build-isolation "git+https://github.com/maged15/beamgrad"  # or the latest source
 ```
 
 `--no-build-isolation` compiles against the PyTorch you have. Without it, pip
 builds in a temporary environment with the newest PyTorch, and
-`import beamgrad` then reports the mismatch.
+`import beamgrad` then reports the mismatch. It also means the build uses
+the installed build tools, so install them first. `setuptools>=77` needs
+`packaging>=24.2`.
 
 Environment variables:
 

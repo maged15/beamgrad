@@ -7,11 +7,17 @@ all welcome.
 
 ```bash
 git clone https://github.com/maged15/beamgrad && cd beamgrad
-pip install torch ruff
+pip install torch ruff "setuptools>=77" wheel "packaging>=24.2"
 make python          # editable install with test extras
 make test            # C/C++ suites, including the emulated CUDA parity tests
 make python-test     # Python suites
 ```
+
+`make python` builds with `--no-build-isolation`, so that the extensions are
+compiled against the PyTorch you import. The build therefore uses the build
+tools already installed rather than fresh ones. `setuptools>=77` needs
+`packaging>=24.2`, and an older `packaging` in the environment makes the
+build fail, hence the explicit install above.
 
 With a CUDA toolkit installed, `make cuda` builds and tests the native CUDA
 backend, and the Python build compiles the CUDA operators automatically.
