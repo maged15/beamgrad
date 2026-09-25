@@ -2,6 +2,11 @@
 """beam_search driving a transformer with a key/value cache: cache handling,
 gradients, long sequences and mixed precision."""
 
+import functools
+import subprocess
+import sys
+from pathlib import Path
+
 import pytest
 import torch
 import torch.nn.functional as F
@@ -150,6 +155,34 @@ def test_long_sequences():
     assert stops.sequences.shape == (2, 4, T) and stops.trace.tokens.shape[1] <= T
 
 
+# The test model under CPU bfloat16 autocast, forward and backward, using
+# PyTorch's kernels only (no beamgrad operator runs).
+_CPU_BFLOAT16_PROBE = """
+import sys, torch
+sys.path.insert(0, sys.argv[1])
+from test_models import TinyTransformer
+model = TinyTransformer()
+with torch.autocast("cpu", dtype=torch.bfloat16):
+    logits, cache = model(model.start(torch.tensor([0, 2]).repeat_interleave(3)))
+    for t in range(1, 7):
+        logits, cache = model(model.tokens(torch.zeros(6, 1, dtype=torch.long), offset=t), cache)
+with torch.autocast("cpu", enabled=False):
+    logits[:, -1].to(torch.bfloat16).log_softmax(-1).float().sum().backward()
+"""
+
+
+@functools.cache
+def cpu_bfloat16_runs() -> bool:
+    """Whether PyTorch's own bfloat16 CPU kernels run on this machine.
+
+    On some virtualised CI hosts they die with an illegal instruction (Windows
+    0xC000001D), which would take the whole test process down, so they are
+    tried in a subprocess first.
+    """
+    probe = [sys.executable, "-c", _CPU_BFLOAT16_PROBE, str(Path(__file__).parent)]
+    return subprocess.run(probe, capture_output=True, timeout=600).returncode == 0
+
+
 def autocast_devices():
     devices = ["cpu"]
     if beamgrad.cuda_available():
@@ -162,6 +195,8 @@ def autocast_devices():
 def test_autocast(device, dtype):
     if device == "cpu" and dtype == torch.float16:
         pytest.skip("CPU autocast is bfloat16")
+    if device == "cpu" and not cpu_bfloat16_runs():
+        pytest.skip("PyTorch's bfloat16 CPU kernels crash on this machine (illegal instruction)")
     torch.manual_seed(3)
     model = TinyTransformer().to(device)
     ids = torch.tensor([0, 2], device=device)
