@@ -129,6 +129,7 @@ jobs:
         run: |
           python examples/quickstart.py
           python examples/train.py
+          python examples/train_lm.py
 
   python-minimum:
     name: Python 3.10 / oldest supported PyTorch and JAX
