@@ -8,6 +8,8 @@
 //     carry-forward, min_length, length penalty, banned tokens, n-gram
 //     blocking, repetition penalty, per-example steps, both scan kernels,
 //     multi-level reductions and the maximum beam size;
+//   * dbs_cuda_decode_step, stepped through the same rows, must select exactly
+//     what dbs_cuda_decode selects;
 //   * the NaN/+inf flags must point at the examples that have them.
 // Exits with 77 (skipped) when no CUDA device is available.
 #include "dbs.h"
@@ -209,6 +211,116 @@ int test_randomized_parity() {
     return failures;
 }
 
+// dbs_cuda_decode_step, driven through the rows of a tensor with the prefixes
+// tracked by the caller, must select exactly what dbs_cuda_decode selects.
+int test_step_api_parity() {
+    int failures = 0;
+    for (unsigned seed = 0; seed < 40; ++seed) {
+        std::mt19937 rng(seed + 1000u);
+        const int beams[] = {1, 3, 4, 16, 17, 64};
+        const int B = 1 + static_cast<int>(rng() % 3), T = 1 + static_cast<int>(rng() % 7);
+        const int K = beams[rng() % 6], V = 5 + static_cast<int>(rng() % 3000);
+        const size_t BK = static_cast<size_t>(B) * K, n = BK * T * V;
+        std::vector<float> x(n);
+        std::uniform_int_distribution<int> level(0, 5);
+        for (float& v : x) v = -0.5f * static_cast<float>(level(rng));
+        std::vector<uint8_t> banned(static_cast<size_t>(V), 0);
+        for (uint8_t& b : banned) b = rng() % 9 == 0;
+
+        DBSCudaDecodeArgs args{};
+        args.batch_size = B;
+        args.steps = T;
+        args.beam_size = K;
+        args.vocab_size = V;
+        args.eos_token = static_cast<int>(rng() % V);
+        args.min_length = static_cast<int>(rng() % 3);
+        args.length_penalty_alpha = 0.6f;
+        args.no_repeat_ngram_size = static_cast<int>(rng() % 3);
+        args.repetition_penalty = rng() % 2 ? 1.5f : 1.0f;
+        const DeviceBuffer<uint8_t> d_banned(banned);
+        args.banned_tokens = rng() % 2 ? d_banned.get() : nullptr;
+
+        // Full decode.
+        const DeviceBuffer<float> d_x(x);
+        const size_t tk = BK * T;
+        const DeviceBuffer<float> f_final(BK), f_scores(tk), f_raw(tk);
+        const DeviceBuffer<int32_t> f_tokens(tk), f_parents(tk), f_lengths(tk);
+        DBSCudaDecodeOutputs full{};
+        full.final_scores = f_final.get();
+        full.tokens = f_tokens.get();
+        full.parents = f_parents.get();
+        full.lengths = f_lengths.get();
+        full.scores = f_scores.get();
+        full.raw_scores = f_raw.get();
+        CHECK(dbs_cuda_decode(d_x.get(), &args, &full, nullptr, 0, nullptr) == DBS_CUDA_STATUS_OK);
+        const std::vector<int32_t> tokens = f_tokens.to_host(), parents = f_parents.to_host(), lengths = f_lengths.to_host();
+        const std::vector<float> scores = f_scores.to_host(), raw_scores = f_raw.to_host(), final_scores = f_final.to_host();
+
+        // Stepped.
+        DBSCudaDecodeArgs step_args = args;
+        step_args.steps = 1;
+        std::vector<float> raw0(BK, -std::numeric_limits<float>::infinity());
+        for (int b = 0; b < B; ++b) raw0[static_cast<size_t>(b) * K] = 0.0f;
+        const DeviceBuffer<float> s_raw(raw0);
+        const DeviceBuffer<int32_t> s_len(std::vector<int32_t>(BK, 0));
+        const DeviceBuffer<uint8_t> s_finished(std::vector<uint8_t>(BK, 0));
+        const DeviceBuffer<float> o_scores(BK), o_raw(BK), o_final(BK);
+        const DeviceBuffer<int32_t> o_tokens(BK), o_parents(BK), o_lengths(BK);
+        const DeviceBuffer<uint8_t> o_flp(BK);
+        std::vector<int32_t> paths(BK * T, -1), next(BK * T, -1);
+        bool ok = true;
+        for (int t = 0; t < T && ok; ++t) {
+            std::vector<float> rows(BK * V);
+            for (int b = 0; b < B; ++b) {
+                std::memcpy(&rows[static_cast<size_t>(b) * K * V], &x[(static_cast<size_t>(b) * T + t) * K * V],
+                            sizeof(float) * K * V);
+            }
+            const DeviceBuffer<float> d_rows(rows);
+            const DeviceBuffer<int32_t> d_paths(paths);
+            DBSCudaDecodeOutputs out{};
+            out.tokens = o_tokens.get();
+            out.parents = o_parents.get();
+            out.lengths = o_lengths.get();
+            out.scores = o_scores.get();
+            out.raw_scores = o_raw.get();
+            out.from_logprob = o_flp.get();
+            out.final_scores = t == T - 1 ? o_final.get() : nullptr;
+            const DBSCudaBeamState state{s_raw.get(), s_len.get(), s_finished.get(), d_paths.get(), T, 0};
+            const int64_t ws_bytes = dbs_cuda_decode_step_workspace_size(&step_args, T);
+            CHECK(ws_bytes >= 0);
+            const DeviceBuffer<uint8_t> ws(static_cast<size_t>(ws_bytes));
+            CHECK(dbs_cuda_decode_step(d_rows.get(), &step_args, &state, &out, ws.get(), ws_bytes, nullptr) ==
+                  DBS_CUDA_STATUS_OK);
+            const std::vector<int32_t> tok = o_tokens.to_host(), par = o_parents.to_host(), len = o_lengths.to_host();
+            const std::vector<float> sc = o_scores.to_host(), rs = o_raw.to_host();
+            const std::vector<uint8_t> flp = o_flp.to_host();
+            for (int b = 0; b < B; ++b) {
+                for (int k = 0; k < K; ++k) {
+                    const size_t i = static_cast<size_t>(b) * K + k;
+                    const size_t f = (static_cast<size_t>(b) * T + t) * K + k;
+                    ok = ok && tok[i] == tokens[f] && par[i] == parents[f] && len[i] == lengths[f] &&
+                         std::memcmp(&sc[i], &scores[f], 4) == 0 && std::memcmp(&rs[i], &raw_scores[f], 4) == 0;
+                    int32_t* dst = &next[i * T];
+                    if (par[i] < 0) {
+                        std::fill(dst, dst + T, -1);
+                    } else {
+                        const int32_t* src = &paths[(static_cast<size_t>(b) * K + par[i]) * T];
+                        std::copy(src, src + T, dst);
+                        if (flp[i]) dst[t] = tok[i];
+                    }
+                }
+            }
+            paths.swap(next);
+        }
+        ok = ok && same_bits(o_final.to_host(), final_scores);
+        if (!ok) {
+            std::fprintf(stderr, "step API case %u differs from the full decode: B=%d T=%d K=%d V=%d\n", seed, B, T, K, V);
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 int test_invalid_input_flags() {
     const int B = 3, T = 4, K = 4, V = 1000;
     std::vector<float> x(static_cast<size_t>(B) * T * K * V, -1.0f);
@@ -244,7 +356,7 @@ int main() {
     cudaDeviceProp prop{};
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     std::printf("device: %s\n", prop.name);
-    const int failures = test_randomized_parity() + test_invalid_input_flags();
+    const int failures = test_randomized_parity() + test_step_api_parity() + test_invalid_input_flags();
     if (failures != 0) {
         std::fprintf(stderr, "dbs_cuda_device_tests: %d failures\n", failures);
         return 1;

@@ -70,6 +70,76 @@ std::vector<float> make_log_probs(const Case& c, std::mt19937& rng) {
     return x;
 }
 
+// Drives dbs_cuda_decode_step through the same rows, one step at a time, with
+// the prefixes tracked here as a caller would; every step output, the final
+// scores and the NaN/+inf flags must equal the full decode's.
+int check_step_api(const Case& c, const std::vector<float>& x, DBSCudaDecodeArgs args, const GpuResult& g,
+                   const std::vector<uint8_t>& invalid_full) {
+    args.steps = 1;
+    const size_t BK = static_cast<size_t>(c.B) * c.K;
+    const size_t V = static_cast<size_t>(c.V);
+    std::vector<float> raw(BK, -std::numeric_limits<float>::infinity());
+    std::vector<int32_t> len(BK, 0);
+    std::vector<uint8_t> finished(BK, 0);
+    for (int b = 0; b < c.B; ++b) raw[static_cast<size_t>(b) * c.K] = 0.0f;
+    std::vector<int32_t> paths(BK * c.T, -1), next_paths(BK * c.T, -1);
+    std::vector<float> rows(BK * V);
+    std::vector<int32_t> tokens(BK), parents(BK), lengths(BK), final_len(BK);
+    std::vector<float> scores(BK), raw_scores(BK), final_scores(BK), final_raw(BK);
+    std::vector<uint8_t> from_logprob(BK), invalid(static_cast<size_t>(c.B)), any_invalid(static_cast<size_t>(c.B), 0);
+    int mismatches = 0;
+    for (int t = 0; t < c.T; ++t) {
+        for (int b = 0; b < c.B; ++b) {
+            std::memcpy(&rows[static_cast<size_t>(b) * c.K * V], &x[(static_cast<size_t>(b) * c.T + t) * c.K * V],
+                        sizeof(float) * c.K * V);
+        }
+        DBSCudaDecodeOutputs out{};
+        out.tokens = tokens.data();
+        out.parents = parents.data();
+        out.lengths = lengths.data();
+        out.scores = scores.data();
+        out.raw_scores = raw_scores.data();
+        out.from_logprob = from_logprob.data();
+        out.invalid_input = invalid.data();
+        const bool last = t == c.T - 1;
+        out.final_scores = last ? final_scores.data() : nullptr;
+        out.final_raw_scores = last ? final_raw.data() : nullptr;
+        out.final_lengths = last ? final_len.data() : nullptr;
+        const DBSCudaBeamState state{raw.data(), len.data(), finished.data(), paths.data(), c.T, 0};
+        CHECK(dbs_cuda_decode_step(rows.data(), &args, &state, &out, nullptr, 0, nullptr) == DBS_CUDA_STATUS_OK);
+        for (int b = 0; b < c.B; ++b) {
+            any_invalid[static_cast<size_t>(b)] |= invalid[static_cast<size_t>(b)];
+            for (int k = 0; k < c.K; ++k) {
+                const size_t i = static_cast<size_t>(b) * c.K + k;
+                const size_t gs = (static_cast<size_t>(b) * c.T + t) * c.K + k;
+                mismatches += tokens[i] != g.tokens[gs] || parents[i] != g.parents[gs] || lengths[i] != g.lengths[gs] ||
+                              from_logprob[i] != g.from_logprob[gs] || !same_bits(scores[i], g.scores[gs]) ||
+                              !same_bits(raw_scores[i], g.raw_scores[gs]);
+                // The new hypothesis: its parent's tokens, plus the one it emitted.
+                int32_t* dst = &next_paths[i * c.T];
+                if (parents[i] < 0) {
+                    std::fill(dst, dst + c.T, -1);
+                } else {
+                    const int32_t* src = &paths[(static_cast<size_t>(b) * c.K + parents[i]) * c.T];
+                    std::copy(src, src + c.T, dst);
+                    if (from_logprob[i]) dst[t] = tokens[i];
+                }
+            }
+        }
+        paths.swap(next_paths);
+    }
+    for (size_t i = 0; i < BK; ++i) {
+        mismatches += !same_bits(final_scores[i], g.final_scores[i]) || !same_bits(final_raw[i], g.final_raw[i]) ||
+                      final_len[i] != g.final_len[i];
+    }
+    for (int b = 0; b < c.B; ++b) mismatches += any_invalid[static_cast<size_t>(b)] != invalid_full[static_cast<size_t>(b)];
+    if (mismatches) {
+        std::fprintf(stderr, "  step API mismatch (B=%d T=%d K=%d V=%d eos=%d ngram=%d penalty=%g banned=%d)\n", c.B, c.T,
+                     c.K, c.V, c.eos, c.ngram, c.penalty, c.banned);
+    }
+    return mismatches;
+}
+
 int run_case(const Case& c, uint32_t seed) {
     std::mt19937 rng(seed);
     const std::vector<float> x = make_log_probs(c, rng);
@@ -248,6 +318,8 @@ int run_case(const Case& c, uint32_t seed) {
         dbs_free_result(r);
         dbs_destroy(h);
     }
+    // The step interface has no per-example step counts.
+    if (!c.variable) mismatches += check_step_api(c, x, args, g, invalid);
     return mismatches;
 }
 

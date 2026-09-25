@@ -54,6 +54,9 @@ int main(void) {
     REQUIRE(dbs_cuda_set_synchronization(0) == DBS_CUDA_STATUS_OK);
     cuda_status = dbs_cuda_decode(NULL, &cuda_args, NULL, NULL, 0, NULL);
     REQUIRE(cuda_status == DBS_CUDA_STATUS_INVALID_ARGUMENT || cuda_status == DBS_CUDA_STATUS_UNAVAILABLE);
+    cuda_status = dbs_cuda_decode_step(NULL, &cuda_args, NULL, NULL, NULL, 0, NULL);
+    REQUIRE(cuda_status == DBS_CUDA_STATUS_INVALID_ARGUMENT || cuda_status == DBS_CUDA_STATUS_UNAVAILABLE);
+    REQUIRE(dbs_cuda_decode_step_workspace_size(&cuda_args, 0) < 0); /* steps must be 1 (or no CUDA) */
     printf("c_api_test passed (cuda available: %d)\n", dbs_cuda_available());
     return EXIT_SUCCESS;
 }

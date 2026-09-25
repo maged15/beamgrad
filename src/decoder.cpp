@@ -69,6 +69,34 @@ public:
     }
 
     int step_index() const noexcept { return t_; }
+
+    // Resumes a search at `step` from an explicit state (see
+    // BeamSearchDecoder::step); the trace of that step is written at index 0.
+    void restore(int step, const float* raw, const int32_t* lengths, const uint8_t* finished,
+                 const int32_t* prefixes, int prefix_stride) {
+        t_ = step;
+        origin_ = step;
+        for (int k = 0; k < K_; ++k) {
+            const size_t i = static_cast<size_t>(k);
+            raw_[i] = raw[k];
+            len_[i] = lengths[k];
+            ended_[i] = finished[k] != 0 ? 1 : 0;
+            if (constrained_) {
+                const int n = std::max(0, std::min(lengths[k], prefix_stride));
+                const int32_t* row = prefixes + i * static_cast<size_t>(prefix_stride);
+                prefix_[i].assign(row, row + n);
+            }
+        }
+    }
+
+    void save(float* raw, int32_t* lengths, uint8_t* finished) const {
+        for (int k = 0; k < K_; ++k) {
+            const size_t i = static_cast<size_t>(k);
+            raw[k] = raw_[i];
+            lengths[k] = len_[i];
+            finished[k] = ended_[i];
+        }
+    }
     const float* raw_scores() const noexcept { return raw_.data(); }
     const int32_t* lengths() const noexcept { return len_.data(); }
     const uint8_t* finished() const noexcept { return ended_.data(); }
@@ -126,7 +154,10 @@ public:
     }
 
 private:
+    // Prefix tokens outside the vocabulary (only possible in a caller-supplied
+    // state, see restore) are ignored.
     void mark(int token, uint8_t bit) {
+        if (token < 0 || token >= V_) return;
         uint8_t& m = mask_[static_cast<size_t>(token)];
         if ((m & (kNgram | kPenalised)) == 0) touched_.push_back(token);
         m = static_cast<uint8_t>(m | bit);
@@ -158,6 +189,7 @@ private:
         }
         if (penalise_) {
             for (int32_t token : prefix) {
+                if (token < 0 || token >= V_) continue;
                 if ((mask_[static_cast<size_t>(token)] & kPenalised) == 0) {
                     mark(token, kPenalised);
                     penalised_.push_back(token);
@@ -213,7 +245,7 @@ private:
     }
 
     void record_pool(int t) {
-        const size_t base = static_cast<size_t>(t) * static_cast<size_t>(P_);
+        const size_t base = static_cast<size_t>(t - origin_) * static_cast<size_t>(P_);
         for (int p = 0; p < P_; ++p) {
             const Candidate& c = top_[static_cast<size_t>(p)];
             const size_t idx = base + static_cast<size_t>(p);
@@ -233,7 +265,7 @@ private:
     }
 
     void select(int t) {
-        const size_t base = static_cast<size_t>(t) * static_cast<size_t>(K_);
+        const size_t base = static_cast<size_t>(t - origin_) * static_cast<size_t>(K_);
         for (int k = 0; k < K_; ++k) {
             const Candidate& c = top_[static_cast<size_t>(k)];
             const size_t i = static_cast<size_t>(k);
@@ -284,6 +316,7 @@ private:
     bool penalise_ = false;
     float log_penalty_ = 0.0f;
     int t_ = 0;
+    int origin_ = 0;  // the step whose trace is written at index 0
 
     std::vector<float> raw_, next_raw_;
     std::vector<int32_t> len_, next_len_;
@@ -612,6 +645,43 @@ void BeamSearchDecoder::decode_into(
     const size_t row_block = static_cast<size_t>(opt_.beam_size) * static_cast<size_t>(vocab_size);
     for (int t = 0; t < steps; ++t) search.step(log_probs + static_cast<size_t>(t) * row_block);
     search.finish(final_scores, final_raw_scores, final_lengths);
+}
+
+void BeamSearchDecoder::step(
+    const float* rows,
+    int vocab_size,
+    int step,
+    const DecodeConstraints* constraints,
+    float* raw_scores,
+    int32_t* lengths,
+    uint8_t* finished,
+    const int32_t* prefixes,
+    int prefix_stride,
+    const TraceOutputs& out,
+    float* final_scores) const {
+    if (!rows) throw std::invalid_argument("log_probs cannot be null");
+    if (!raw_scores || !lengths || !finished) throw std::invalid_argument("the beam state cannot be null");
+    if (step < 0) throw std::invalid_argument("step cannot be negative");
+    if (prefix_stride < 0) throw std::invalid_argument("prefix_stride cannot be negative");
+    if (constraints && constraints->forced_tokens) {
+        throw std::invalid_argument("forced tokens are not supported by the step interface");
+    }
+    check_decode_args(opt_, 1, vocab_size, constraints);
+    const bool needs_prefixes =
+        constraints && (constraints->repetition_penalty > 1.0f || constraints->no_repeat_ngram_size > 0 ||
+                        constraints->token_filter != nullptr);
+    if (needs_prefixes && prefix_stride > 0 && !prefixes) {
+        throw std::invalid_argument("prefixes cannot be null with n-gram blocking, a repetition penalty or a token filter");
+    }
+    if (out.pool_parents || out.pool_tokens || out.pool_lengths || out.pool_scores || out.pool_raw_scores ||
+        out.relaxed_weights || out.pool_from_logprob) {
+        throw std::invalid_argument("the step interface has no relaxed pool");
+    }
+    BeamSearch search(opt_, vocab_size, constraints, out, /*with_pool=*/false);
+    search.restore(step, raw_scores, lengths, finished, prefixes, prefix_stride);
+    search.step(rows);
+    search.save(raw_scores, lengths, finished);
+    if (final_scores) search.finish(final_scores, nullptr, nullptr);
 }
 
 DecodeResult BeamSearchDecoder::decode_model_steps(

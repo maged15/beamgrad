@@ -198,6 +198,14 @@ int status = dbs_cuda_decode(d_log_probs, &args, &out, NULL, 0, stream);
   `banned_tokens`, `no_repeat_ngram_size` and `repetition_penalty` apply the
   CPU decoder's constraints. `outputs->invalid_input` (optional, `[B]`)
   reports the examples whose rows contained NaN or `+inf`.
+- `dbs_cuda_decode_step` runs one step from a caller-held state
+  (`DBSCudaBeamState`: `[B, K]` raw scores, lengths and finished flags,
+  updated in place, plus each beam's token prefix), for loops that ask a model
+  for each step's `[B, K, V]` rows. `args->steps` must be 1; the step's
+  `[B, K]` outputs go to the usual `DBSCudaDecodeOutputs` fields. Stepping
+  through the rows of a tensor selects exactly what `dbs_cuda_decode` selects.
+  Its workspace size is `dbs_cuda_decode_step_workspace_size(&args,
+  prefix_stride)`. `beamgrad.beam_search` is built on it.
 - `dbs_cuda_backward` takes the `parents`, `tokens`, `lengths` and
   `from_logprob` outputs plus `grad_final_scores [B, K]` and accumulates the
   final-score gradient into `grad_log_probs [B, T, K, V]`.
