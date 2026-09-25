@@ -1,0 +1,33 @@
+{
+  "arm": "mle",
+  "name": "timing-mle",
+  "seed": 0,
+  "valid_bleu": NaN,
+  "final_valid_bleu": NaN,
+  "test_bleu": NaN,
+  "seconds_per_step": 0.006629736259928905,
+  "peak_gib": 0.43077993392944336,
+  "history": [],
+  "config": {
+    "seed": 0,
+    "vocab": 8000,
+    "smoothing": 0.1,
+    "eval_beam": 4,
+    "eval_alpha": 0.6,
+    "arm": "mle",
+    "name": "timing-mle",
+    "steps": 110,
+    "batch_size": 32,
+    "lr": 0.0001,
+    "dropout": 0.1,
+    "beam": 4,
+    "alpha": 0.6,
+    "nll_weight": 0.3,
+    "temperature": 1.0,
+    "margin": 1.0,
+    "pool_multiplier": 4,
+    "gradient": "steps",
+    "eval_every": 200,
+    "time_only": true
+  }
+}

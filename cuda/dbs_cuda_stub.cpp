@@ -48,6 +48,15 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_step(
     return DBS_CUDA_STATUS_UNAVAILABLE;
 }
 
+extern "C" DBS_CUDA_EXPORT int dbs_cuda_length_penalty(const int32_t*, int64_t, float, float*, void*) {
+    return DBS_CUDA_STATUS_UNAVAILABLE;
+}
+
+extern "C" DBS_CUDA_EXPORT int dbs_cuda_path_gradient(
+    const DBSCudaDecodeArgs*, const int32_t*, const int32_t*, const int32_t*, const uint8_t*, const float*, float*, void*) {
+    return DBS_CUDA_STATUS_UNAVAILABLE;
+}
+
 extern "C" DBS_CUDA_EXPORT int dbs_cuda_backward(
     const DBSCudaDecodeArgs*, const int32_t*, const int32_t*, const int32_t*, const uint8_t*,
     const float*, float*, void*, int64_t, void*) {

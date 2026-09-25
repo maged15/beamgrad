@@ -25,7 +25,7 @@ class TinyLM(nn.Module):
 
         def step(beams: beamgrad.BeamState) -> torch.Tensor:
             B, K, t = beams.sequences.shape
-            h = torch.zeros(B * K, self.gru.hidden_size)
+            h = torch.zeros(B * K, self.gru.hidden_size, dtype=self.out.weight.dtype)
             tokens = beams.sequences.reshape(B * K, t).clamp(min=0)
             h = self.gru(self.embed(torch.full((B * K,), self.bos)), h)
             for i in range(t):
@@ -150,12 +150,73 @@ def test_gradient_equals_final_scores_of_the_stacked_rows():
         assert torch.equal(g, e)
 
 
-def test_no_grad_keeps_no_graph():
+def test_no_grad_keeps_no_graph_and_no_rows():
     model = TinyLM(seed=4)
     with torch.no_grad():
         result = beam_search(model.step_fn(2), BeamOptions(beam_size=3), max_steps=4, batch_size=2)
+        kept = beam_search(model.step_fn(2), BeamOptions(beam_size=3), max_steps=4, batch_size=2, return_log_probs=True)
     assert not result.scores.requires_grad
-    assert torch.equal(result.scores, final_scores(torch.stack(result.step_log_probs, 1), BeamOptions(beam_size=3)))
+    assert result.step_log_probs == ()  # inference holds one step's rows at a time
+    assert torch.equal(result.scores, kept.scores)
+    assert torch.equal(kept.scores, final_scores(torch.stack(kept.step_log_probs, 1), BeamOptions(beam_size=3)))
+
+
+class TinyLMRescorer:
+    """Teacher-forced token log-probabilities of TinyLM, for rescore_fn."""
+
+    def __init__(self, model):
+        self.model = model
+
+    def __call__(self, sequences, lengths):
+        B, K, T = sequences.shape
+        tokens = sequences.reshape(B * K, T).clamp(min=0)
+        h0 = torch.zeros(B * K, 16, dtype=self.model.out.weight.dtype)
+        h = self.model.gru(self.model.embed(torch.full((B * K,), self.model.bos)), h0)
+        out = []
+        for t in range(T):
+            out.append(self.model.out(h).log_softmax(-1).gather(1, tokens[:, t : t + 1])[:, 0])
+            h = self.model.gru(self.model.embed(tokens[:, t]), h)
+        return torch.stack(out, 1).view(B, K, T)
+
+
+@pytest.mark.parametrize(
+    "options", [BeamOptions(beam_size=3), BeamOptions(beam_size=4, eos_token=1, length_penalty_alpha=0.8)]
+)
+def test_rescoring_gives_the_same_gradient(options):
+    model = TinyLM(seed=5).double()
+    step = model.step_fn(2)
+
+    def step64(beams):
+        return step(beams).double()
+
+    through_steps = beam_search(step64, options, max_steps=6, batch_size=2)
+    rescored = beam_search(step64, options, max_steps=6, batch_size=2, rescore_fn=TinyLMRescorer(model))
+    assert rescored.step_log_probs == ()
+    assert torch.equal(rescored.scores.detach(), through_steps.scores.detach())  # the search's own scores
+    assert torch.equal(rescored.sequences, through_steps.sequences)
+    weights = torch.linspace(-1.0, 1.0, options.beam_size).double()
+    live = torch.isfinite(through_steps.scores)
+    a = torch.autograd.grad((through_steps.scores[live] * weights.expand(2, -1)[live]).sum(), list(model.parameters()))
+    b = torch.autograd.grad((rescored.scores[live] * weights.expand(2, -1)[live]).sum(), list(model.parameters()))
+    # Through the steps, the engine computes each entry's gradient in float32.
+    for x, y in zip(a, b, strict=True):
+        torch.testing.assert_close(x, y, rtol=1e-5, atol=1e-6)
+
+
+def test_rescore_fn_shape_is_checked():
+    model = TinyLM(seed=6)
+    with pytest.raises(ValueError, match="rescore_fn"):
+        beam_search(model.step_fn(1), BeamOptions(beam_size=2), max_steps=3, rescore_fn=lambda s, n: torch.zeros(1, 2))
+
+
+def test_length_penalty_matches_the_search():
+    trace = decode(
+        torch.randn(2, 6, 3, 9).log_softmax(-1), BeamOptions(beam_size=3, eos_token=1, length_penalty_alpha=0.7)
+    )
+    penalty = beamgrad.length_penalty(trace.final_lengths, 0.7)
+    assert penalty.dtype == torch.float32
+    assert torch.equal(trace.final_raw_scores / penalty, trace.final_scores)
+    assert torch.equal(beamgrad.length_penalty(torch.tensor([0, 1, 7]), 0.0), torch.ones(3))
 
 
 def test_argument_errors():

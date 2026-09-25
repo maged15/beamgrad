@@ -11,7 +11,12 @@ Extensions:
 
 The compiled operators only work with the PyTorch they were built against, so
 the build records its version in beamgrad/_build_info.py, which beamgrad checks
-at import time.
+at import time. They do not depend on the Python version: they use only
+CPython's limited API, so wheels are tagged cp310-abi3.
+
+Release wheels (see .github/workflows/wheels.yml) set:
+  BEAMGRAD_PIN_TORCH=1          require the PyTorch minor version built against
+  BEAMGRAD_LOCAL_VERSION=pt214cu126   append a local version label (+pt214cu126)
 """
 
 import os
@@ -32,6 +37,25 @@ WINDOWS = sys.platform == "win32"
 # does not contract by default).
 CXX_FLAGS = ["/O2"] if WINDOWS else ["-O3", "-ffp-contract=off"]
 CXX17_FLAGS = CXX_FLAGS + (["/std:c++17"] if WINDOWS else ["-std=c++17", "-fvisibility=hidden"])
+# CPython's stable ABI, as of the oldest supported Python (3.10).
+LIMITED_API = [("Py_LIMITED_API", "0x030A0000")]
+
+
+def enabled(name: str) -> bool:
+    return os.environ.get(name, "0").strip().lower() in {"1", "on", "true", "yes"}
+
+
+def package_version() -> str:
+    version = (ROOT / "VERSION").read_text().strip()
+    local = os.environ.get("BEAMGRAD_LOCAL_VERSION", "").strip()
+    return f"{version}+{local}" if local else version
+
+
+def requirements() -> list[str]:
+    if not enabled("BEAMGRAD_PIN_TORCH"):
+        return ["torch>=2.4"]
+    major, minor = torch.__version__.split("+")[0].split(".")[:2]
+    return [f"torch=={major}.{minor}.*"]
 
 
 def write_build_info() -> None:
@@ -69,15 +93,18 @@ ext_modules = [
         "beamgrad._C",
         ["python/csrc/cpu_ops.cpp", *CORE_SOURCES],
         include_dirs=INCLUDE_DIRS,
+        define_macros=LIMITED_API,
         extra_compile_args={"cxx": CXX_FLAGS},
+        py_limited_api=True,
     ),
     Extension(
         "beamgrad._libdbs",
         ["python/csrc/libdbs_module.cpp", *CORE_SOURCES],
         include_dirs=INCLUDE_DIRS,
-        define_macros=[("DBS_BUILD_SHARED", "1"), ("DBS_COMPILING_LIBRARY", "1")],
+        define_macros=[("DBS_BUILD_SHARED", "1"), ("DBS_COMPILING_LIBRARY", "1"), *LIMITED_API],
         extra_compile_args=CXX17_FLAGS,
         language="c++",
+        py_limited_api=True,
     ),
 ]
 
@@ -87,9 +114,17 @@ if build_cuda():
             "beamgrad._C_cuda",
             ["python/csrc/cuda_ops.cpp", "cuda/dbs_cuda.cu"],
             include_dirs=INCLUDE_DIRS,
+            define_macros=LIMITED_API,
             extra_compile_args={"cxx": CXX_FLAGS, "nvcc": ["-O3"]},
+            py_limited_api=True,
         )
     )
 
 write_build_info()
-setup(ext_modules=ext_modules, cmdclass={"build_ext": BuildExtension})
+setup(
+    version=package_version(),
+    install_requires=requirements(),
+    ext_modules=ext_modules,
+    cmdclass={"build_ext": BuildExtension},
+    options={"bdist_wheel": {"py_limited_api": "cp310"}},
+)

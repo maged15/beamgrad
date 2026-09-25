@@ -60,8 +60,19 @@ if importlib.util.find_spec(f"{__package__}._C_cuda") is not None:  # built with
     try:
         from . import _C_cuda  # registers the CUDA kernels
     except ImportError as exc:  # pragma: no cover - depends on the machine
+        hint = ""
+        try:
+            from ._build_info import TORCH_CUDA_VERSION as built_cuda
+        except ImportError:
+            built_cuda = None
+        if built_cuda and _major_minor(built_cuda)[:1] != (_major_minor(torch.version.cuda or "0.0") or (0,))[:1]:
+            hint = (
+                f" They were built for CUDA {built_cuda}, but PyTorch uses "
+                f"{'CUDA ' + torch.version.cuda if torch.version.cuda else 'no CUDA'}: install the beamgrad wheel "
+                "for your PyTorch's CUDA variant (docs/installation.md), or build from source."
+            )
         warnings.warn(
-            f"beamgrad's CUDA operators failed to load ({exc}); CUDA tensors are not supported.",
+            f"beamgrad's CUDA operators failed to load ({exc}); CUDA tensors are not supported.{hint}",
             RuntimeWarning,
             stacklevel=2,
         )
@@ -151,6 +162,18 @@ def _decode_step_fake(
         log_probs.new_empty((B, K), dtype=torch.uint8),
         log_probs.new_empty((B, K), dtype=torch.float32),
     )
+
+
+@torch.library.register_fake("beamgrad::length_penalty")
+def _length_penalty_fake(lengths, length_penalty_alpha):
+    return lengths.new_empty(lengths.shape, dtype=torch.float32)
+
+
+@torch.library.register_fake("beamgrad::final_scores_path_gradient")
+def _final_scores_path_gradient_fake(
+    grad_final, parents, tokens, lengths, from_logprob, steps, vocab_size, length_penalty_alpha
+):
+    return grad_final.new_empty(parents.shape, dtype=torch.float32)
 
 
 @torch.library.register_fake("beamgrad::final_scores_backward")
@@ -307,7 +330,7 @@ def _decode_op(x: torch.Tensor, steps_t: torch.Tensor | None, banned: torch.Tens
 
 
 class _FinalScores(torch.autograd.Function):
-    """The final scores and the trace their backward needs.
+    """The final scores (differentiable) and the whole decode trace, from one decode.
 
     ``torch.ops.beamgrad.decode`` carries its own autograd formula, but
     ``torch.library`` implements it as an ``autograd.Function`` whose forward
@@ -320,15 +343,16 @@ class _FinalScores(torch.autograd.Function):
 
     @staticmethod
     def forward(x, steps, banned, options):
-        out = _decode_op(x, steps, banned, options)
-        final_scores_, _, _, tokens, parents, lengths, _, _, from_logprob = out
-        return final_scores_, tokens, parents, lengths, from_logprob
+        # final_scores, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob
+        return _decode_op(x, steps, banned, options)
 
     @staticmethod
     def setup_context(ctx, inputs, output):
         x, steps, _, options = inputs
-        _, tokens, parents, lengths, from_logprob = output
-        ctx.mark_non_differentiable(tokens, parents, lengths, from_logprob)
+        _, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob = output
+        ctx.mark_non_differentiable(
+            final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob
+        )
         ctx.save_for_backward(parents, tokens, lengths, from_logprob, steps)
         ctx.vocab_size = x.shape[-1]
         ctx.length_penalty_alpha = float(options.length_penalty_alpha)
@@ -347,6 +371,19 @@ class _FinalScores(torch.autograd.Function):
             ctx.length_penalty_alpha,
         )
         return grad, None, None, None
+
+
+def length_penalty(lengths: torch.Tensor, alpha: float) -> torch.Tensor:
+    """The GNMT length penalty ``((5 + max(length, 1)) / 6) ** alpha``, as float32.
+
+    Bit for bit the value the search divides raw scores by, on CPU or CUDA, so
+    a reference sequence's score can be put on the scale of the beams' scores:
+    ``gold_log_prob / length_penalty(gold_length, options.length_penalty_alpha)``.
+    """
+    alpha = float(alpha)
+    if not torch.is_tensor(lengths):
+        lengths = torch.as_tensor(lengths)
+    return torch.ops.beamgrad.length_penalty(lengths, alpha)
 
 
 def final_scores(log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike = None) -> torch.Tensor:

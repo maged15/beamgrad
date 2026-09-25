@@ -8,14 +8,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "beamgrad"
-dynamic = ["version"]
+dynamic = ["version", "dependencies"]  # setup.py: VERSION, and torch (pinned in release wheels)
 description = "Differentiable beam search for PyTorch: exact beam search forward, surrogate gradients backward, native on CPU and CUDA."
 readme = "README.md"
 license = "MIT"
 license-files = ["LICENSE"]
 authors = [{ name = "Maged Amr" }]
 requires-python = ">=3.10"
-dependencies = ["torch>=2.4"]
 keywords = ["beam search", "differentiable", "pytorch", "cuda", "sequence generation", "surrogate gradients"]
 classifiers = [
     "Development Status :: 4 - Beta",
@@ -48,9 +47,6 @@ packages = ["beamgrad"]
 
 [tool.setuptools.package-data]
 beamgrad = ["py.typed"]
-
-[tool.setuptools.dynamic]
-version = { file = ["VERSION"] }
 
 [tool.pytest.ini_options]
 testpaths = ["python/tests"]

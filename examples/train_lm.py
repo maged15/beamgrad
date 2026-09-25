@@ -68,15 +68,16 @@ def main() -> None:
     hidden = None
     for update in range(301):
         result = beamgrad.beam_search(step, options, max_steps=T, batch_size=B)
+        # No length penalty, so the summed log-probability is on the beams' scale
+        # (otherwise: beamgrad.sequence_scores).
         gold_score = model.sequence_log_prob(src, gold)
-        is_gold = (result.sequences == gold[:, None]).all(-1)  # [B, K]
-        rival = result.scores.masked_fill(is_gold, float("-inf")).amax(1)
-        loss = torch.relu(rival - gold_score + 1.0).mean()
+        loss = beamgrad.losses.structured_margin(result, gold, gold_score, margin=1.0)
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         if update % 50 == 0:
-            print(f"update {update:3d}  loss {loss.item():.4f}  references won {int(is_gold[:, 0].sum())}/{B}")
+            won = int(beamgrad.losses.matches(result.sequences, gold)[:, 0].sum())
+            print(f"update {update:3d}  loss {loss.item():.4f}  references won {won}/{B}")
         if loss.item() == 0.0:
             print(f"update {update:3d}  loss 0: every reference beats its best rival by the margin")
             break

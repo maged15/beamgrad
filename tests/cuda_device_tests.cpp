@@ -177,6 +177,19 @@ int run_case(const Case& c, unsigned seed) {
     CUDA_CHECK(cudaDeviceSynchronize());
     expect(same_bits(grad, d_grad.to_host()), "gradient");
 
+    // The per-slot path gradient scatters to exactly the dense gradient.
+    const DeviceBuffer<float> d_draws(tk);
+    CHECK(dbs_cuda_path_gradient(&args, d_parents.get(), d_tokens.get(), d_lengths.get(), d_from_logprob.get(),
+                                 d_grad_final.get(), d_draws.get(), nullptr) == DBS_CUDA_STATUS_OK);
+    const std::vector<float> draws = d_draws.to_host();
+    std::vector<float> scattered(n, 0.0f);
+    for (size_t s = 0; s < tk; ++s) {
+        if (parents[s] < 0 || !from_logprob[s]) continue;
+        const size_t bt = s / static_cast<size_t>(c.K);
+        scattered[(bt * c.K + static_cast<size_t>(parents[s])) * c.V + static_cast<size_t>(tokens[s])] += draws[s];
+    }
+    expect(same_bits(scattered, grad), "path gradient");
+
     dbs_destroy(handle);
     return mismatches;
 }

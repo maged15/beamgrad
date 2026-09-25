@@ -1,0 +1,68 @@
+{
+  "arm": "margin",
+  "name": "margin-rescore",
+  "seed": 0,
+  "valid_bleu": 37.63159453220197,
+  "final_valid_bleu": 34.06944337763972,
+  "test_bleu": 37.144387912178786,
+  "seconds_per_step": 0.06884568404927238,
+  "peak_gib": 2.234898090362549,
+  "history": [
+    {
+      "step": 0,
+      "valid_bleu": 37.63159453220197
+    },
+    {
+      "step": 200,
+      "valid_bleu": 35.485359412441504,
+      "train_loss": 5.417069673538208,
+      "gold_in_beam": 0.1528125
+    },
+    {
+      "step": 400,
+      "valid_bleu": 35.32311210972742,
+      "train_loss": 4.82617239356041,
+      "gold_in_beam": 0.16171875
+    },
+    {
+      "step": 600,
+      "valid_bleu": 34.71409797984875,
+      "train_loss": 4.6059101045131685,
+      "gold_in_beam": 0.1575
+    },
+    {
+      "step": 800,
+      "valid_bleu": 34.31150652890276,
+      "train_loss": 4.562037917375565,
+      "gold_in_beam": 0.14171875
+    },
+    {
+      "step": 1000,
+      "valid_bleu": 34.06944337763972,
+      "train_loss": 4.330012092590332,
+      "gold_in_beam": 0.149375
+    }
+  ],
+  "config": {
+    "seed": 0,
+    "vocab": 8000,
+    "smoothing": 0.1,
+    "eval_beam": 4,
+    "eval_alpha": 0.6,
+    "arm": "margin",
+    "name": "margin-rescore",
+    "steps": 1000,
+    "batch_size": 32,
+    "lr": 0.0001,
+    "dropout": 0.1,
+    "beam": 4,
+    "alpha": 0.6,
+    "nll_weight": 0.3,
+    "temperature": 1.0,
+    "margin": 1.0,
+    "pool_multiplier": 4,
+    "gradient": "rescore",
+    "eval_every": 200,
+    "time_only": false
+  }
+}
