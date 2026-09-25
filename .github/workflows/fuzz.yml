@@ -17,7 +17,7 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 120
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Build fuzzer (ASan + UBSan)
         run: |
           cmake -S . -B build-fuzz -DCMAKE_BUILD_TYPE=Debug -DDBS_BUILD_FUZZER=ON -DDBS_ENABLE_SANITIZERS=ON \

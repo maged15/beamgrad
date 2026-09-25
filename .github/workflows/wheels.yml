@@ -55,7 +55,7 @@ jobs:
             echo /opt/rh/gcc-toolset-13/root/usr/bin >> "$GITHUB_PATH"
           fi
           curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - name: Build
         env:
           BEAMGRAD_CUDA: ${{ matrix.variant == 'cpu' && '0' || '1' }}
@@ -108,7 +108,7 @@ jobs:
     env:
       MACOSX_DEPLOYMENT_TARGET: "11.0"
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@v7
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
