@@ -236,6 +236,45 @@ def test_argument_errors():
         beam_search(good, BeamOptions(beam_size=2, eos_token=4), max_steps=2)
 
 
+def test_integer_arguments_accept_numpy_integers():
+    # Like BeamOptions: any integer type but bool.
+    np = pytest.importorskip("numpy")
+    model = TinyLM(seed=7)
+    options = BeamOptions(beam_size=2)
+    reference = beam_search(model.step_fn(2), options, max_steps=4, batch_size=2)
+    result = beam_search(model.step_fn(2), options, max_steps=np.int64(4), batch_size=np.int32(2))
+    assert torch.equal(result.sequences, reference.sequences)
+    assert result.sequences.shape == (2, 2, 4)
+    for bad in (True, 4.0, np.float64(4), "4"):
+        with pytest.raises(ValueError, match="max_steps"):
+            beam_search(model.step_fn(2), options, max_steps=bad, batch_size=2)
+    with pytest.raises(ValueError, match="batch_size"):
+        beam_search(model.step_fn(1), options, max_steps=4, batch_size=np.bool_(True))
+
+
+def test_sequence_scores_rejects_lengths_outside_the_sequences():
+    lp = torch.randn(3, 5)
+    options = BeamOptions(beam_size=1, length_penalty_alpha=0.6)
+    beamgrad.sequence_scores(lp, torch.tensor([5, 0, 2]), options)  # the full length and empty are fine
+    for lengths in ([6, 0, 2], [5, -1, 2]):
+        with pytest.raises(ValueError, match=r"lengths must be in \[0, 5\]"):
+            beamgrad.sequence_scores(lp, torch.tensor(lengths), options)
+
+
+def test_sequence_scores_length_check_stays_out_of_traced_code():
+    from torch._subclasses.fake_tensor import FakeTensorMode
+
+    lp, lengths = torch.randn(3, 5), torch.tensor([5, 0, 2])
+    options = BeamOptions(beam_size=1, length_penalty_alpha=0.6)
+    expected = beamgrad.sequence_scores(lp, lengths, options)
+    compiled = torch.compile(beamgrad.sequence_scores, fullgraph=True, backend="aot_eager")
+    assert torch.equal(compiled(lp, lengths, options), expected)
+    with FakeTensorMode():  # no values to check
+        assert beamgrad.sequence_scores(torch.randn(3, 5), torch.tensor([9, 0, 2]), options).shape == (3,)
+    batched = torch.vmap(lambda x, n: beamgrad.sequence_scores(x, n, options))(lp[:, None], lengths[:, None])
+    torch.testing.assert_close(batched[:, 0], expected)
+
+
 # ---------------------------------------------------------------------------
 # 32-bit limits: out-of-range integers are errors, not truncated
 # ---------------------------------------------------------------------------

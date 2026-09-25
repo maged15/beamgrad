@@ -19,7 +19,7 @@ from typing import NamedTuple
 
 import torch
 
-from ._options import INT32_MAX, BeamOptions
+from ._options import INT32_MAX, BeamOptions, _is_int
 from ._torch import BeamSearchOutput, StepsLike, _FinalScores, _prepare, backtrack, length_penalty
 
 
@@ -105,9 +105,29 @@ class _PathScores(torch.autograd.Function):
         return (None, None, None, None, None, None, None, *per_step)
 
 
-def _check_int(name: str, value, low: int) -> None:
-    if isinstance(value, bool) or not isinstance(value, int) or not low <= value <= INT32_MAX:
+def _check_int(name: str, value, low: int) -> int:
+    # Any integer (e.g. a NumPy integer) but bool, as BeamOptions accepts.
+    if not _is_int(value) or not low <= value <= INT32_MAX:
         raise ValueError(f"{name} must be an int in [{low}, 2**31 - 1], got {value!r}")
+    return int(value)
+
+
+def _has_values(t: torch.Tensor) -> bool:
+    """Whether ``t``'s values can be read in Python.
+
+    False while compiling, exporting or tracing, and for fake, meta and
+    functorch-wrapped (vmap, grad) tensors, so that value checks stay out of
+    the traced path, as :func:`beamgrad._torch._prepare` keeps them out of
+    Python altogether.
+    """
+    compiling = getattr(torch.compiler, "is_compiling", None)
+    if (compiling is not None and compiling()) or torch.jit.is_tracing():
+        return False
+    from torch._subclasses.fake_tensor import FakeTensor
+
+    if t.device.type == "meta" or isinstance(t, FakeTensor):
+        return False
+    return not torch._C._functorch.is_functorch_wrapped_tensor(t)
 
 
 RescoreFunction = Callable[[torch.Tensor, torch.Tensor], torch.Tensor]
@@ -188,8 +208,8 @@ def beam_search(
     """
     if not isinstance(options, BeamOptions):
         raise TypeError(f"options must be a beamgrad.BeamOptions, got {type(options).__name__}")
-    _check_int("max_steps", max_steps, 1)
-    _check_int("batch_size", batch_size, 1)
+    max_steps = _check_int("max_steps", max_steps, 1)
+    batch_size = _check_int("batch_size", batch_size, 1)
     if rescore_fn is None:
         return _search(step_fn, options, max_steps, batch_size, device, return_log_probs)
     with torch.no_grad():
@@ -202,16 +222,31 @@ def sequence_scores(token_log_probs: torch.Tensor, lengths: torch.Tensor, option
 
     ``token_log_probs[..., t]`` is the log-probability of token ``t`` of a
     sequence given the tokens before it (under teacher forcing), and
-    ``lengths[...]`` its length; entries at or past the length are ignored.
+    ``lengths[...]`` its length, in ``[0, T]`` (``ValueError`` otherwise);
+    entries at or past the length are ignored.
     Returns the summed log-probability divided by the length penalty, with the
     penalty the search uses, so for example a reference sequence can be
     compared with the beams in a structured-margin loss. Differentiable.
+
+    With ``options.eos_token >= 0`` a finished beam's length counts the EOS it
+    emitted, and that token's log-probability is part of its score. So a
+    reference must end with the EOS, and its length and log-probabilities
+    must include it, to be on the same scale (and to be recognised by
+    :func:`beamgrad.losses.structured_margin`).
     """
     if not isinstance(options, BeamOptions):
         raise TypeError(f"options must be a beamgrad.BeamOptions, got {type(options).__name__}")
     T = token_log_probs.shape[-1]
     if tuple(lengths.shape) != tuple(token_log_probs.shape[:-1]):
         raise ValueError(f"lengths must have shape {tuple(token_log_probs.shape[:-1])}, got {tuple(lengths.shape)}")
+    # A length past T would silently score a truncated sequence. Checked only
+    # when the values exist (not while compiling or tracing); on CUDA it reads
+    # one flag back.
+    if _has_values(lengths) and bool(((lengths < 0) | (lengths > T)).any()):
+        raise ValueError(
+            f"lengths must be in [0, {T}] (the last dimension of token_log_probs), "
+            f"got values from {int(lengths.min())} to {int(lengths.max())}"
+        )
     lengths = lengths.to(token_log_probs.device)
     on_path = torch.arange(T, device=token_log_probs.device) < lengths[..., None]
     if token_log_probs.dtype != torch.float64:

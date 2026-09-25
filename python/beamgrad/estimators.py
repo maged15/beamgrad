@@ -108,22 +108,31 @@ class _SoftTopK(torch.autograd.Function):
         valid = scores > _NEG_GUARD
         active = valid.sum(-1, keepdim=True)
         big = torch.finfo(scores.dtype).max
-        lo = torch.where(valid, scores, big).amin(-1, keepdim=True) - 80.0 * temperature
-        hi = torch.where(valid, scores, -big).amax(-1, keepdim=True) + 80.0 * temperature
+        # The same bisection as the C library's (soft_topk_inclusion): theta is
+        # bisected as an offset from the best score, which keeps its precision
+        # when the scores are in the thousands, and it stops once the sum is
+        # within tolerance of k or theta is bracketed to tolerance * temperature
+        # (or to a few ULPs of the offset, where halving no longer moves it).
+        ref = torch.where(valid, scores, -big).amax(-1, keepdim=True)
+        shifted = scores - ref
+        lo = torch.where(valid, shifted, big).amin(-1, keepdim=True) - 80.0 * temperature
+        hi = torch.full_like(lo, 80.0 * temperature)
+        bracket = tolerance * temperature
+        eps = torch.finfo(scores.dtype).eps
         done = active <= k  # every valid candidate is fully in
         for _ in range(max_iters):
             mid = 0.5 * (lo + hi)
-            s = torch.where(valid, torch.sigmoid((scores - mid) / temperature), 0.0).sum(-1, keepdim=True)
+            s = torch.where(valid, torch.sigmoid((shifted - mid) / temperature), 0.0).sum(-1, keepdim=True)
             err = s - k
-            converged = (err.abs() <= tolerance) | ((hi - lo).abs() <= tolerance * mid.abs().clamp(min=1.0))
+            converged = (err.abs() <= tolerance) | (hi - lo <= (4.0 * eps * mid.abs()).clamp(min=bracket))
             newly = converged & ~done
             lo = torch.where(newly, mid, torch.where(done, lo, torch.where(err > 0, mid, lo)))
             hi = torch.where(newly, mid, torch.where(done, hi, torch.where(err > 0, hi, mid)))
             done = done | converged
             if bool(done.all()):
                 break
-        theta = 0.5 * (lo + hi)
-        weights = torch.where(valid, torch.sigmoid((scores - theta) / temperature), 0.0)
+        offset = 0.5 * (lo + hi)
+        weights = torch.where(valid, torch.sigmoid((shifted - offset) / temperature), 0.0)
         return torch.where(active <= k, valid.to(scores.dtype), weights)
 
     @staticmethod
@@ -172,6 +181,15 @@ def relaxed_topk(
     candidate each is, as in the C library's pool (the order of candidates
     with exactly equal scores may differ from it). N-gram blocking and
     repetition penalties are not supported.
+
+    The bisection stops once a step's weights sum to ``K`` within
+    ``tolerance``, or ``theta`` is bracketed to ``tolerance * temperature``
+    (so each weight is within ``tolerance / 8`` of its value at the exact
+    ``theta``), at any magnitude of the scores. From its initial bracket that
+    takes at most ``log2(spread / (tolerance * temperature) + 160 /
+    tolerance)`` halvings, with ``spread`` the range of the pool's scores:
+    21 for the defaults and a pool a few units wide, so ``max_iters=48`` is
+    only a safety cap.
     """
     if options.no_repeat_ngram_size > 0 or options.repetition_penalty > 1.0:
         raise NotImplementedError("relaxed_topk does not support no_repeat_ngram_size or repetition_penalty")

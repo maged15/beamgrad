@@ -289,7 +289,9 @@ DBS_EXPORT int dbs_decode_model_steps_ex(
 /* Decodes a batch [B, T, K, V] straight into caller-owned arrays (no result
  * handles). steps_per_example [B] (values in [1, T]) may be NULL for T steps
  * each; constraints (may be NULL) apply to every example. num_threads <= 0 uses
- * one thread per hardware thread; the calling thread takes part. */
+ * one thread per hardware thread, or only the calling thread when the batch is
+ * small (under 2^19 candidates, B * T * K * V); the calling thread takes part.
+ * The same applies to the other batch functions. */
 DBS_EXPORT int dbs_decode_batch_into(
     DBSDecoderHandle* handle,
     const float* log_probs,

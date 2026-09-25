@@ -124,7 +124,17 @@ DBS_CUDA_EXPORT int dbs_cuda_decode(
  * themselves (one dbs_cuda_decode_step() per step, e.g. to ask a model for each
  * step's rows given the beams chosen so far). Device arrays. Before the first
  * step: raw_scores is 0 for beam 0 and -inf for the others, lengths and
- * finished are 0. */
+ * finished are 0.
+ *
+ * Precondition: within each example, every live, unfinished beam (finite raw
+ * score, finished == 0) has the same length. The step ranks the candidates
+ * that extend those beams by raw score, which equals the CPU's ranking by
+ * length-penalised score only when they share one length penalty. The initial
+ * state and every state a previous dbs_cuda_decode_step() produced satisfy
+ * it. A state that does not, with length_penalty_alpha != 0, may select
+ * different beams than the CPU decoder, and not best first. The state is not
+ * checked, because that would synchronize the stream on every step.
+ * Finished beams may have any length. */
 typedef struct DBSCudaBeamState {
     float* raw_scores;          /* [B, K] cumulative log-probabilities (updated in place) */
     int32_t* lengths;           /* [B, K] hypothesis lengths (updated in place) */
@@ -142,6 +152,7 @@ DBS_CUDA_EXPORT int64_t dbs_cuda_decode_step_workspace_size(const DBSCudaDecodeA
 
 /* One step of the search. log_probs is the step's [B, K, V] rows (row k
  * extends beam k); args->steps must be 1 and args->steps_per_example NULL.
+ * `state` must meet the equal-length precondition of DBSCudaBeamState.
  * Advances `state`, and writes the step's [B, K] tokens, parents, lengths,
  * scores, raw_scores and from_logprob, the invalid_input flags, and (when
  * final_scores is not NULL) the final_* arrays of the beams after this step.

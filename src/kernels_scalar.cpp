@@ -4,6 +4,7 @@
 #include "kernels.hpp"
 
 #include <cstring>
+#include <limits>
 
 namespace dbs {
 
@@ -35,11 +36,12 @@ float sigmoid(float x) {
     return e / (1.0f + e);
 }
 
-float sum_sigmoid_shifted(const float* scores, int n, float theta, float temperature) {
+// sum_i sigmoid(((scores[i] - ref) - offset) / temperature), i.e. at theta = ref + offset.
+float sum_sigmoid_offset(const float* scores, int n, float ref, float offset, float temperature) {
     constexpr float kNegGuard = -1.0e30f;
     float sum = 0.0f;
     for (int i = 0; i < n; ++i) {
-        if (scores[i] > kNegGuard) sum += sigmoid((scores[i] - theta) / temperature);
+        if (scores[i] > kNegGuard) sum += sigmoid(((scores[i] - ref) - offset) / temperature);
     }
     return sum;
 }
@@ -194,12 +196,25 @@ void soft_topk_inclusion(
         return;
     }
 
-    float lo = min_s - 80.0f * temperature;
-    float hi = max_s + 80.0f * temperature;
+    // Bisect theta's offset from the best score, not theta itself: a long
+    // search's scores are in the thousands, where float32 resolves theta only
+    // to about 1e-3, too coarse for weights that move by up to 1 / (4 *
+    // temperature) per unit of theta. The offset keeps full precision.
+    const float ref = max_s;
+    float lo = (min_s - ref) - 80.0f * temperature;
+    float hi = 80.0f * temperature;
+    // Stop once the weights sum to target_k within tolerance, or theta is
+    // bracketed to tolerance * temperature (each weight is then within
+    // tolerance / 8 of its value at the root), or to a few float ULPs of the
+    // offset, where halving no longer moves it. From this bracket that takes
+    // at most log2((max_s - min_s) / (tolerance * temperature) + 160 /
+    // tolerance) iterations: 21 with the defaults and a pool a few units wide.
+    const float bracket = tolerance * temperature;
     for (int it = 0; it < max_iters; ++it) {
         const float mid = 0.5f * (lo + hi);
-        const float err = sum_sigmoid_shifted(scores, n, mid, temperature) - static_cast<float>(target_k);
-        if (std::fabs(err) <= tolerance || std::fabs(hi - lo) <= tolerance * std::max(1.0f, std::fabs(mid))) {
+        const float err = sum_sigmoid_offset(scores, n, ref, mid, temperature) - static_cast<float>(target_k);
+        const float ulps = 4.0f * std::numeric_limits<float>::epsilon() * std::fabs(mid);
+        if (std::fabs(err) <= tolerance || hi - lo <= std::max(bracket, ulps)) {
             lo = hi = mid;
             break;
         }
@@ -207,9 +222,9 @@ void soft_topk_inclusion(
         else hi = mid;
     }
 
-    const float theta = 0.5f * (lo + hi);
+    const float offset = 0.5f * (lo + hi);
     for (int i = 0; i < n; ++i) {
-        out[i] = scores[i] > kNegGuard ? sigmoid((scores[i] - theta) / temperature) : 0.0f;
+        out[i] = scores[i] > kNegGuard ? sigmoid(((scores[i] - ref) - offset) / temperature) : 0.0f;
     }
 }
 

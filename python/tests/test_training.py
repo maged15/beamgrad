@@ -2,6 +2,7 @@
 """search(), sequence_scores(), the training losses and the gradient estimators."""
 
 import ctypes
+import warnings
 
 import pytest
 import torch
@@ -287,3 +288,50 @@ def test_estimators_and_losses_on_cuda():
     assert torch.equal(outs["cpu"][0], outs["cuda"][0])
     torch.testing.assert_close(outs["cpu"][1], outs["cuda"][1], rtol=1e-5, atol=1e-5)
     torch.testing.assert_close(outs["cpu"][2], outs["cuda"][2], rtol=1e-4, atol=1e-5)
+
+
+@pytest.mark.parametrize("offset", [0.0, -1e3, -1e4])
+def test_relaxed_topk_weights_sum_to_k_at_any_score_magnitude(offset):
+    # A long search has cumulative scores in the thousands; the bisection must
+    # still place theta so that each step's weights sum to K.
+    spaced = offset + 0.1 * torch.arange(32, dtype=torch.float32)
+    for scores in (spaced, spaced.flip(0)):
+        weights = est._SoftTopK.apply(scores[None], 4, 0.25, 1e-4, 48)
+        assert abs(float(weights.sum()) - 4) < 1e-2
+    x = random_log_probs(2, 6, 4, 50, seed=12)
+    x[:, 0] += offset  # every hypothesis's score moves by the offset
+    options = BeamOptions(beam_size=4)
+    result = search(x, options)
+    assert float(result.scores.max()) < offset + 1
+    relaxed = est.relaxed_topk(result, options, pool_multiplier=8, temperature=0.25)
+    assert float((relaxed.weights.sum(-1) - 4).abs().max()) < 1e-2
+
+
+def test_structured_margin_warns_about_references_without_eos():
+    # Rows whose best beam is [1, EOS]: the reference must include that EOS.
+    eos = 2
+    x = torch.full((1, 3, 2, 5), -9.0)
+    x[0, 0, 0, 1] = -0.1
+    x[0, 1, :, eos] = -0.1
+    options = BeamOptions(beam_size=2, eos_token=eos)
+    result = search(x, options)
+    assert result.sequences[0, 0].tolist() == [1, eos, -1]
+    with_eos, without_eos = torch.tensor([[1, eos]]), torch.tensor([[1]])
+    assert losses.matches(result.sequences, with_eos)[0, 0]
+    assert not losses.matches(result.sequences, without_eos).any()
+    # Scored as the search scored it, the reference with EOS beats the other
+    # beam by the margin; without EOS, the beam that is the reference is its
+    # own rival and the loss is stuck at the margin.
+    best = result.scores[:, 0].detach()
+    assert losses.structured_margin(result, with_eos, best, eos_token=eos) == 0
+    with pytest.warns(UserWarning, match=r"reference rows \[0\] do not end with eos_token 2"):
+        assert losses.structured_margin(result, without_eos, best, eos_token=eos) == 1.0
+    # Only the offending rows are named; correct references and the default stay silent.
+    two = search(x.expand(2, -1, -1, -1), options)
+    with pytest.warns(UserWarning, match=r"reference rows \[1\] "):
+        losses.structured_margin(two, torch.tensor([[1, eos], [1, -1]]), torch.zeros(2), eos_token=eos)
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        losses.structured_margin(two, torch.tensor([[1, eos], [3, eos]]), torch.zeros(2), eos_token=eos)
+        losses.structured_margin(two, torch.tensor([[1, -1], [1, -1]]), torch.zeros(2))  # no eos_token: no check
+        losses.structured_margin(two, torch.tensor([[1, -1], [1, -1]]), torch.zeros(2), eos_token=-1)

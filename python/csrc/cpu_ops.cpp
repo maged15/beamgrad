@@ -30,6 +30,9 @@
 //        beams after the previous step and their token prefixes), returning
 //        the step's beams, which are also the new state, and their final
 //        scores were the search to end here. Used by beamgrad.beam_search.
+//        On CUDA, every live, unfinished beam of an example must have the
+//        same length, as in any state the search produced (see
+//        DBSCudaBeamState in include/dbs_cuda.h).
 //
 // With validate, a NaN or +inf in any row the search reads raises ValueError.
 //

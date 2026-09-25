@@ -499,6 +499,70 @@ void test_backward_uses_result_beam_size() {
     CHECK(d.grad_log_probs.size() == x.size());
 }
 
+// The [K, t] prefix matrix given to the model at step t, as the decoder used to
+// build it: each beam's path walked back through the trace from step t - 1.
+std::vector<int32_t> walked_prefixes(const DecodeResult& r, int t) {
+    const int K = r.beam_size;
+    std::vector<int32_t> out(static_cast<size_t>(K) * static_cast<size_t>(t));
+    for (int k = 0; k < K; ++k) {
+        int beam = k;
+        for (int s = t - 1; s >= 0; --s) {
+            int32_t token = -1;
+            if (beam >= 0) {
+                const size_t idx = static_cast<size_t>(s) * static_cast<size_t>(K) + static_cast<size_t>(beam);
+                token = r.tokens[idx];
+                beam = r.parents[idx];
+            }
+            out[static_cast<size_t>(k) * static_cast<size_t>(t) + static_cast<size_t>(s)] = token;
+        }
+    }
+    return out;
+}
+
+void test_model_step_prefixes_match_the_walked_paths() {
+    // decode_model_steps maintains the prefixes incrementally; they must be
+    // byte for byte the paths walked back through the trace, with finished
+    // beams (EOS carried forward), dead slots (-1) and constraints.
+    int dead_slots = 0;
+    int carried = 0;
+    for (int trial = 0; trial < 300; ++trial) {
+        const int V = uniform_int(2, 9);
+        BeamOptions opt;
+        opt.beam_size = uniform_int(1, 6);
+        opt.eos_token = uniform_int(0, 2) == 0 ? -1 : uniform_int(0, V - 1);
+        opt.min_length = uniform_int(0, 2);
+        opt.length_penalty_alpha = uniform_int(0, 1) ? 0.0f : 0.7f;
+        const int K = opt.beam_size;
+        const int T = uniform_int(1, 12);
+        DecodeConstraints constraints;
+        constraints.no_repeat_ngram_size = uniform_int(0, 3);
+        constraints.repetition_penalty = uniform_int(0, 1) ? 1.0f : 1.3f;
+        std::vector<std::vector<int32_t>> seen;
+        const ModelStepFunction model = [&](const ModelStepInfo& info, float* rows) {
+            seen.emplace_back(info.prefixes, info.prefixes + static_cast<size_t>(K) * static_cast<size_t>(info.step));
+            for (int k = 0; k < K; ++k) {
+                uint32_t h = 2166136261u + static_cast<uint32_t>(trial);
+                for (int s = 0; s < info.step; ++s) h = (h ^ static_cast<uint32_t>(info.prefixes[static_cast<size_t>(k) * info.step + s] + 7)) * 16777619u;
+                for (int v = 0; v < V; ++v) {
+                    h = (h ^ static_cast<uint32_t>(v)) * 16777619u;
+                    rows[static_cast<size_t>(k) * V + v] = -static_cast<float>(h % 97u) / 16.0f;
+                }
+            }
+        };
+        const BeamSearchDecoder decoder(opt);
+        const DecodeResult r = decoder.decode_model_steps(T, V, model, &constraints, nullptr);
+        CHECK(static_cast<int>(seen.size()) == T);
+        for (int t = 0; t < T; ++t) {
+            CHECK(seen[static_cast<size_t>(t)] == walked_prefixes(r, t));
+        }
+        for (size_t i = 0; i < r.parents.size(); ++i) {
+            dead_slots += r.parents[i] < 0;
+            carried += r.parents[i] >= 0 && !r.from_logprob[i];
+        }
+    }
+    CHECK(dead_slots > 0 && carried > 0);  // both edge cases were exercised
+}
+
 void test_model_steps_match_tensor_decode() {
     // A model whose rows depend on each beam's full prefix: decoding with the
     // callback must equal decoding the rows it produced for the chosen beams.
@@ -674,6 +738,32 @@ void test_length_penalty() {
 
 } // namespace
 
+// The relaxed pool's weights must sum to K whatever the scores' magnitude: a
+// long search has cumulative log-probabilities in the thousands. (The
+// bisection used to stop once theta was known to 1e-4 of its own magnitude,
+// so the sum drifted to 4.3 near -1e3 and 6 near -1e4.)
+void test_soft_topk_sums_to_k_at_any_magnitude() {
+    constexpr int n = 32;
+    constexpr int k = 4;
+    std::mt19937 rng(11);
+    std::normal_distribution<float> spread(0.0f, 1.5f);
+    for (float offset : {0.0f, -1.0e3f, -1.0e4f}) {
+        for (int variant = 0; variant < 12; ++variant) {
+            float scores[n];
+            float out[n];
+            for (int i = 0; i < n; ++i) {
+                // Spaced 0.1 apart (ascending, then descending), then random.
+                const float step = variant == 0 ? 0.1f : -0.1f;
+                scores[i] = variant < 2 ? offset + step * static_cast<float>(i) : offset + spread(rng);
+            }
+            soft_topk_inclusion(scores, out, n, k, 0.25f, 1.0e-4f, 48);
+            double sum = 0.0;
+            for (float w : out) sum += w;
+            CHECK(std::fabs(sum - k) < 1.0e-2);
+        }
+    }
+}
+
 int main() {
     std::cout << "kernel paths:";
     for (KernelPath p : simd_paths()) std::cout << ' ' << kernel_path_name(p);
@@ -687,9 +777,11 @@ int main() {
     test_validation_covers_the_rows_read();
     test_backward_uses_result_beam_size();
     test_model_steps_match_tensor_decode();
+    test_model_step_prefixes_match_the_walked_paths();
     test_length_penalty();
     test_step_matches_decode();
     test_path_gradient_matches_dense();
+    test_soft_topk_sums_to_k_at_any_magnitude();
     std::cout << "dbs_internal_tests passed\n";
     return 0;
 }

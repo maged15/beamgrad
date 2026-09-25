@@ -45,12 +45,14 @@ The `Makefile` wraps the common invocations: `make test`, `make cuda`,
 
 ```bash
 pip install torch                                # the build compiles against it
+pip install "setuptools>=77" wheel "packaging>=24.2"   # build tools (see below)
 pip install --no-build-isolation -e ".[test]"    # editable, with test extras
 pytest python/tests
 ```
 
 `--no-build-isolation` makes the extension compile against the PyTorch you
-will import. On Windows, build from a Visual Studio developer prompt (x64)
+will import. It also means the build uses the installed build tools:
+`setuptools>=77` needs `packaging>=24.2`. On Windows, build from a Visual Studio developer prompt (x64)
 with `DISTUTILS_USE_SDK=1` set. `BEAMGRAD_CUDA` controls the CUDA operators: `auto` (default)
 builds them when a CUDA toolkit (`nvcc`, `CUDA_HOME`) and a CUDA-enabled
 PyTorch are present, `1` requires them, `0` skips them. `TORCH_CUDA_ARCH_LIST`
@@ -77,7 +79,10 @@ Release and Debug builds.
 finite-difference gradients, path/score consistency, EOS/min-length/length
 penalty, constraints, variable steps, validation, `torch.compile`, fake
 tensors, `torch.vmap`, `torch.func`), the ctypes bindings, JAX (values, gradients, `jit`,
-`vmap`, validation), and exact CUDA-vs-CPU parity (when a GPU is available).
+`vmap`, validation), exact CUDA-vs-CPU parity (when a GPU is available), and
+`beamgrad.hf` against tiny random `transformers` models (Llama, GPT-2; when
+`transformers` is installed): the same beams as `generate()`, re-scoring that
+reproduces the search's scores, and the same gradient both ways.
 
 Sanitizers and fuzzing:
 
@@ -88,13 +93,31 @@ cmake -S . -B build-fuzz -DDBS_BUILD_FUZZER=ON -DDBS_ENABLE_SANITIZERS=ON \
 cmake --build build-fuzz && ./build-fuzz/dbs_fuzz -max_total_time=300
 ```
 
+The harness (`tests/fuzz_dbs.cpp`) derives every choice from the input. It
+covers `dbs_decode` with a relaxed pool and both backward passes (with
+selected-weight, relaxed-pool and final-score gradients),
+`dbs_decode_constrained_ex` (banned and forced tokens, `min_length`, n-gram
+blocking, repetition penalty), `dbs_decode_typed` (F16, BF16),
+`dbs_decode_batch_into` then `dbs_backward_batch_into` on a trace it may
+corrupt, and `dbs_decode_batch_variable`.
+
+Besides the sanitizers, it checks that:
+- every call returns `DBS_OK` or `DBS_ERROR_INVALID_ARGUMENT`;
+- the sparse backward equals the dense one;
+- F16/BF16 input decodes exactly like the same values in float32;
+- a corrupted trace is rejected exactly when it is out of range.
+
+`dbs_fuzz` compiles its own instrumented copy of the library, so coverage
+guides the fuzzer through the library, not just the harness.
+
 ## Continuous integration
 
 - **CI** (every push and pull request): C++ on Linux (GCC and Clang with
   warnings as errors, plus a static build), macOS and Windows; ASan/UBSan,
   TSan and a fuzz smoke run; an nvcc build of libdbs_cuda and of the Python
   CUDA operators in a CUDA 12.6 container; the Python package on Linux, macOS
-  and Windows with the newest PyTorch, and on Linux with the oldest supported
+  and Windows with the newest PyTorch (with JAX and `transformers` on Linux,
+  Python 3.13), and on Linux with the oldest supported
   versions (Python 3.10, PyTorch 2.4, JAX 0.4.20); lint and version metadata.
 - **GPU**: the CUDA tests and benchmark on a self-hosted GPU runner. It is
   enabled by the repository variable `BEAMGRAD_GPU_RUNNER=true` and a runner
@@ -106,6 +129,8 @@ cmake --build build-fuzz && ./build-fuzz/dbs_fuzz -max_total_time=300
 ```bash
 ./build/dbs_bench                               # C ABI microbenchmark matrix
 ./build/dbs_bench 16 8 32000 4 20               # T K V B repeats
+./build/dbs_bench model-steps                   # dbs_decode_model_steps_ex, long searches
+./build/dbs_bench batch-threads                 # batch decode: automatic threads vs one
 python benchmarks/benchmark.py --device all     # PyTorch API vs a torch.topk beam search
 python benchmarks/hf_beam_search.py --train     # beam_search on a Hugging Face LM vs generate()
 python benchmarks/hf_training_memory.py --check # training-step memory per gradient mode

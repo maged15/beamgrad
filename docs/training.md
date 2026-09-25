@@ -105,7 +105,10 @@ Which to use:
   Beam-search optimisation (Wiseman & Rush, 2016) uses this form. Put
   `reference_scores` on the beams' scale with
   `beamgrad.sequence_scores(teacher_forced_token_log_probs, lengths,
-  options)`, which applies the same length penalty.
+  options)`, which applies the same length penalty. With an EOS token, the
+  references must end with it and their lengths must count it, as the
+  beams' do. A reference without it never matches a beam, so the loss
+  cannot reach zero; pass `eos_token=options.eos_token` to be warned.
 - **`minimum_risk(result, costs, temperature)`** is the expected cost under
   `softmax(scores / temperature)` over the final beams. This is minimum-risk
   training (Shen et al., 2016). For translation, use 1 − sentence BLEU

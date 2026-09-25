@@ -221,8 +221,15 @@ if(DBS_BUILD_FUZZER)
   if(NOT CMAKE_CXX_COMPILER_ID MATCHES "Clang")
     message(FATAL_ERROR "DBS_BUILD_FUZZER requires Clang (libFuzzer)")
   endif()
-  add_executable(dbs_fuzz tests/fuzz_dbs.cpp)
-  target_link_libraries(dbs_fuzz PRIVATE dbs)
+  # The harness with its own copy of the library, all instrumented, so that
+  # libFuzzer is guided by coverage of the code under test and not only of the
+  # harness. The shared libdbs stays uninstrumented.
+  add_executable(dbs_fuzz tests/fuzz_dbs.cpp ${DBS_CORE_SOURCES})
+  target_include_directories(dbs_fuzz PRIVATE include src)
+  target_compile_definitions(dbs_fuzz PRIVATE DBS_STATIC)
+  dbs_set_warnings(dbs_fuzz)
+  dbs_set_fp_model(dbs_fuzz)
+  target_link_libraries(dbs_fuzz PRIVATE Threads::Threads)
   target_compile_options(dbs_fuzz PRIVATE -fsanitize=fuzzer)
   target_link_options(dbs_fuzz PRIVATE -fsanitize=fuzzer)
 endif()

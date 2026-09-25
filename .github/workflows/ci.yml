@@ -133,6 +133,10 @@ jobs:
       - name: Install JAX
         if: matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
         run: python -m pip install "jax[cpu]"
+      # python/tests/test_hf_transformers.py (tiny random models, no downloads)
+      - name: Install transformers
+        if: matrix.os == 'ubuntu-latest' && matrix.python == '3.13'
+        run: python -m pip install transformers
       - name: Test
         shell: bash
         run: cd "$RUNNER_TEMP" && python -m pytest "$GITHUB_WORKSPACE/python/tests" -q

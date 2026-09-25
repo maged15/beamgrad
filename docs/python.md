@@ -210,6 +210,11 @@ ignored) divided by the search's length penalty. This puts a
 teacher-forced reference sequence on the same scale as the final beam
 scores. Differentiable.
 
+`lengths` must be in `[0, T]`. A longer length would silently score a
+truncated sequence, so it raises `ValueError`. The check reads the lengths
+(one flag from the GPU) and is skipped while compiling or tracing and for
+fake tensors.
+
 ## `length_penalty(lengths, alpha) -> Tensor`
 
 `((5 + max(lengths, 1)) / 6) ** alpha` in float32, bit-identical to the
@@ -219,7 +224,7 @@ penalty the CPU and CUDA engines use.
 
 | function | loss |
 |---|---|
-| `structured_margin(result, reference, reference_scores, margin=1.0, reduction="mean")` | `max(0, margin + best non-reference beam's score − reference_scores)` with `reference_scores` of shape `[B]`; zero when the reference wins by the margin |
+| `structured_margin(result, reference, reference_scores, margin=1.0, reduction="mean", *, eos_token=None)` | `max(0, margin + best non-reference beam's score − reference_scores)` with `reference_scores` of shape `[B]`; zero when the reference wins by the margin. References must end with the EOS the search emits (and `sequence_scores` lengths must count it), or they never match a beam; `eos_token=options.eos_token` warns about rows that do not |
 | `minimum_risk(result, costs, temperature=1.0, reduction="mean")` | `Σ_k softmax(scores / temperature)_k · costs[:, k]`; dead beams get no probability and their costs are ignored (even NaN), examples without live beams give 0 |
 | `matches(sequences, reference)` | `[B, K]` bool, beam `k` equals the `-1`-padded reference `[B, T']` |
 

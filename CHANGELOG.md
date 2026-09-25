@@ -1,5 +1,87 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- `losses.structured_margin(..., eos_token=)`: when given (and `>= 0`),
+  warns with the row numbers of references that do not end with that EOS.
+  A finished beam ends with the EOS it emitted, so such a reference never
+  matches a beam. Its own copy among the beams then becomes the rival, and
+  the loss can never reach zero. The requirement (references and
+  `sequence_scores` lengths include the EOS) is now documented. The default
+  (`None`) behaves as before.
+
+### Changed
+
+- Model-step decoding (`dbs_decode_model_steps`, `_ex`, `_with_workspace`)
+  builds each step's `[K, t]` prefix matrix from the previous step's. It
+  copies each beam's parent row and appends one token, where it used to walk
+  every path back through the trace. The prefixes are byte for byte the
+  same. Best of 30 runs on this machine (`dbs_bench model-steps`, V = 32):
+  T = 1024 went from 3.6 ms to 0.55 ms at K = 4, and from 15.1 ms to 2.9 ms
+  at K = 16; T = 256, K = 4 went from 268 µs to 88 µs.
+- Batch functions with `num_threads <= 0` (automatic) run a batch under 2^19
+  candidates (B·T·K·V; B·T·K for `dbs_backward_batch_into`) on the calling
+  thread instead of starting a thread per core. For such batches that took
+  longer than the work itself. An 8 × 8 × 4 × 1000 decode went from 95 µs
+  to 51 µs, a 4 × 4 × 4 × 256 decode from 35 µs to 6 µs; batches of 1M
+  candidates and more are unchanged (`dbs_bench batch-threads`). An
+  explicit thread count is still honoured, capped at the batch size.
+- The libFuzzer harness covers `dbs_decode_constrained_ex`, the relaxed pool
+  with both backward passes, `dbs_decode_typed` (F16, BF16),
+  `dbs_decode_batch_into` with `dbs_backward_batch_into` on corrupted traces,
+  and `dbs_decode_batch_variable`. It checks results as well as crashes:
+  status codes, sparse vs dense gradients, typed vs float32 input, and
+  rejection of out-of-range traces. `dbs_fuzz` now compiles its own
+  coverage-instrumented copy of the library. Before, only the harness was
+  instrumented, so libFuzzer got no coverage feedback from the library.
+
+### Documentation
+
+- The README's `generate()` parity claim is qualified as the benchmark
+  measures it. All `K` beams are bit-identical in float32 with EOS
+  suppressed and `length_penalty=0`. With EOS the two searches differ by
+  design (finished hypotheses stay in beamgrad's slots but go to a separate
+  pool in `transformers`), and only the best beam is compared.
+- `docs/algorithm.md` has a "What beamgrad is and isn't" section, linked
+  from the README. It says:
+  - the default gradient is that of teacher-forced re-scoring of the
+    selected beams;
+  - only `relaxed_topk` relaxes the selection;
+  - how beamgrad relates to beam-search optimisation, minimum risk training
+    and continuous relaxations of beam search.
+- CONTRIBUTING.md, `docs/development.md` and `docs/installation.md`: builds
+  with `--no-build-isolation` need `setuptools>=77`, `wheel` and
+  `packaging>=24.2` installed first.
+- `dbs_cuda_decode_step` (`include/dbs_cuda.h`, `docs/cuda.md`) requires every
+  live, unfinished beam of an example to have the same length: the CUDA scan
+  ranks by raw score. States produced by the search always satisfy this. A
+  hand-built state that does not, with a length penalty, can select
+  different beams than the CPU. The precondition is documented, not checked,
+  since a check would synchronize the stream on every step.
+
+### Fixed
+
+- `beam_search` rejected NumPy integers for `max_steps` and `batch_size`,
+  although `BeamOptions` accepts them. Any integer but `bool` is now
+  accepted.
+- `sequence_scores` accepted lengths past the sequences' last dimension, and
+  negative lengths, silently scoring a truncated sequence. It now raises
+  `ValueError`. The check is skipped while compiling or tracing and for fake
+  tensors, so `sequence_scores` stays traceable.
+- The relaxed top-k pool's weights did not sum to `K` when the scores were
+  large (a long search's cumulative log-probabilities). The bisection
+  stopped once `theta` was known to `soft_topk_tolerance` of its own
+  magnitude. For 32 candidates 0.1 apart with `K = 4` and temperature 0.25,
+  the weights summed to 4.29 near −1,000 and 4.64 near −5,000; a 64-step
+  Python `relaxed_topk` search near −1,500 summed to 1.88 instead of 2. The
+  bisection now stops when `theta` is bracketed to `tolerance × temperature`,
+  and it bisects `theta` as an offset from the best score, so the sums stay
+  within about 1e-4 of `K` at any magnitude. This applies to the C library
+  (`relaxed_pool_multiplier`) and to `beamgrad.estimators.relaxed_topk`
+  alike. The default of 48 iterations is unchanged; about 21 are needed.
+
 ## 2.0.0 (2026-09-25)
 
 The project is renamed **beamgrad** (previously `differentiable-beam-search-cuda`

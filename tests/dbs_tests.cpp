@@ -3,11 +3,13 @@
 
 #include "check.hpp"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdint>
 #include <iostream>
 #include <limits>
 #include <cstring>
+#include <thread>
 #include <vector>
 
 static DBSOptionsC test_options() {
@@ -90,6 +92,36 @@ static void test_relaxed_pool_gradient_closed_form() {
     }
     dbs_free_backward(b);
     dbs_free_result(r);
+    dbs_destroy(h);
+}
+
+// Automatic threading (num_threads <= 0) runs a small batch on the calling
+// thread, where starting threads would cost more than the work; an explicit
+// thread count is honoured, capped at the batch size.
+static void test_small_batches_run_on_one_thread() {
+    DBSOptionsC opt = test_options();
+    opt.relaxed_pool_multiplier = 0;
+    DBSDecoderHandle* h = nullptr;
+    CHECK(dbs_create_ex(opt, &h) == 0);
+    const int K = opt.beam_size;
+    auto threads_used = [&](int B, int T, int V, int num_threads) {
+        std::vector<float> x(static_cast<size_t>(B) * T * K * V, -1.0f);
+        for (size_t i = 0; i < x.size(); ++i) x[i] = -static_cast<float>((i * 7919) % 1000) / 100.0f;
+        std::vector<float> final_scores(static_cast<size_t>(B) * K);
+        DBSDecodeOutputsC out{};
+        out.final_scores = final_scores.data();
+        CHECK(dbs_decode_batch_into(h, x.data(), B, T, V, nullptr, nullptr, num_threads, &out) == 0);
+        DBSStatsC stats{};
+        CHECK(dbs_get_stats(h, &stats) == 0);
+        return stats.used_batch_threads;
+    };
+    CHECK(threads_used(4, 4, 16, 0) == 1);  // 512 candidates: one thread
+    CHECK(threads_used(4, 4, 16, 3) == 3);  // explicit: honoured
+    CHECK(threads_used(2, 4, 16, 8) == 2);  // capped at the batch size
+    // Enough work for threads: one per hardware thread, capped at the batch size.
+    const int hardware = static_cast<int>(std::thread::hardware_concurrency());
+    const int expected = std::max(1, std::min(4, hardware));
+    CHECK(threads_used(4, 64, 1024, 0) == expected);  // 4 * 64 * 2 * 1024 = 524288 candidates
     dbs_destroy(h);
 }
 
@@ -945,6 +977,7 @@ int main() {
     test_sparse_gradient_matches_finite_difference();
     test_relaxed_pool_gradient_closed_form();
     test_batch_decode();
+    test_small_batches_run_on_one_thread();
     test_default_backward_is_sparse();
     test_model_step_decode();
     test_advanced_constraints_no_repeat();

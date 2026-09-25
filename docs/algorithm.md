@@ -124,7 +124,11 @@ test suite checks them against the C library):
   sigmoid "k-hot"
   relaxation of membership in the top `K`:
   `r_i = sigmoid((score_i - theta) / soft_topk_temperature)`, with `theta`
-  found by bisection so that `sum_i r_i = K`. Its gradient is obtained by
+  found by bisection so that `sum_i r_i = K`. The bisection stops once the
+  sum is within `soft_topk_tolerance` of `K` or `theta` is bracketed to
+  `soft_topk_tolerance × soft_topk_temperature`. It bisects `theta`'s offset
+  from the best candidate's score, so this accuracy holds for scores in the
+  thousands too. Its gradient is obtained by
   implicit differentiation through `theta`:
   `d r_i = a_i / tau * (g_i - sum_j g_j a_j / sum_j a_j)` with
   `a_i = r_i (1 - r_i)`.
@@ -149,3 +153,57 @@ final scores or the final-score gradient.
   it which previous beam each row continues. The scores are then those of the
   stacked rows, so the gradient above applies unchanged, and reaches the
   model through every row a final beam's path used.
+
+## What beamgrad is and isn't
+
+**The default gradient is not new.** `final_scores`, `search` and
+`beam_search` differentiate each selected beam's length-penalised
+log-probability, `s_k = (sum_t log p(y_t | y_<t)) / penalty(length_k)`, with
+the selection held fixed. That is the gradient you get by scoring the
+returned beams again under teacher forcing and differentiating that score.
+`beam_search(..., rescore_fn=...)` computes it exactly that way, and the
+tests check that both routes agree, up to floating-point differences between
+incremental and parallel evaluation. With dropout the two passes draw
+different masks.
+
+What beamgrad adds is engineering:
+- an exact, deterministic beam search that selects the same beams with
+  bit-identical scores on every CPU kernel and on the GPU, fast enough to
+  run inside training;
+- training through it in bounded memory: per-step gradients, or re-scoring
+  with activation checkpointing (see [training.md](training.md));
+- operators that work with `torch.compile`, `torch.export`, `torch.vmap` and
+  `torch.func`.
+
+**Only the relaxed top-k differentiates the selection.**
+`beamgrad.estimators.relaxed_topk`, and the C library's relaxed pool
+(`relaxed_pool_multiplier`), replace "kept by the search" with a standard
+sigmoid top-k relaxation: `r_i = sigmoid((s_i - theta) / tau)` with
+`sum_i r_i = K`, differentiated implicitly through `theta`. That sends
+gradient to candidates the search pruned. Everything else treats the
+selection as fixed: final scores, `path_scores` and `selected_softmax`.
+The search itself always stays hard, so the model only ever sees the beams
+that were actually selected.
+
+**Related work.**
+
+- *Beam-search optimisation.* Wiseman and Rush, "Sequence-to-Sequence
+  Learning as Beam-Search Optimization", EMNLP 2016. It trains with a
+  margin between the gold sequence and the beam, and restarts the search
+  from the gold prefix when that prefix falls off the beam (a LaSO-style
+  update). `losses.structured_margin` is the sequence-level margin against
+  the final beams, without restarts.
+- *Minimum risk training.* Shen et al., "Minimum Risk Training for Neural
+  Machine Translation", ACL 2016. It minimises the expected cost of
+  candidate outputs under the model's distribution renormalised over a
+  candidate set. `losses.minimum_risk` does this over the final beams of
+  the search. Edunov et al., "Classical Structured Prediction Losses for
+  Sequence to Sequence Learning", NAACL 2018, compares these sequence-level
+  losses, including mixing them with the token-level loss.
+- *Continuous relaxations of beam search.* Goyal, Neubig, Dyer and
+  Berg-Kirkpatrick, "A Continuous Relaxation of Beam Search for End-to-end
+  Training of Neural Sequence Models", AAAI 2018. It replaces the hard
+  top-k inside the search with a soft one, so decoding itself becomes
+  differentiable and soft beams feed the next step. beamgrad does not relax
+  the search. `relaxed_topk` relaxes only the membership weights that a loss
+  sees.

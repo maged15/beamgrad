@@ -57,6 +57,19 @@ monotone function of the raw score, and ordering by `(raw descending,
 index ascending)` is exactly the CPU's order. Carry-forward candidates have
 other lengths, so they are merged in step 3 with the full comparator.
 
+This makes equal lengths a precondition of the step API. `dbs_cuda_decode_step`
+takes the beam state from the caller (`DBSCudaBeamState`), and within each
+example every live, unfinished beam in it must have the same length. The
+initial state and every state a previous step produced satisfy this, so
+`dbs_cuda_decode`, `beamgrad.beam_search` and any loop that feeds each step's
+state into the next are unaffected. A hand-built state that violates it, with
+`length_penalty_alpha != 0`, can select different beams than the CPU decoder,
+and not best first. For example, beams of lengths 1 and 5 with α = 3 come back
+in the opposite order to the CPU's. The step does not check this: it would
+need a device-side check and a stream synchronization on every step, and the
+existing synchronization (validating per-example arrays) only happens when
+such arrays are passed.
+
 **Why the numbers match bit for bit.** Every floating-point operation that
 feeds a result uses an explicitly rounded intrinsic (`__fadd_rn`,
 `__fmul_rn`, ...), so nothing is fused into a multiply-add, and the length

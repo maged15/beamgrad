@@ -252,7 +252,17 @@ std::vector<float> convert_to_f32(const void* data, int data_type, size_t count)
     return out;
 }
 
-int thread_count(int requested, int items) {
+// Below this much work, starting threads costs more than it saves. Work is the
+// candidates a decode scans (B * T * K * V) or the trace entries a backward
+// walks (B * T * K). On an 8-thread x86-64 machine one thread is faster up to
+// about 256k candidates and slower from about 1M (`dbs_bench batch-threads`).
+constexpr size_t kMinThreadedWork = size_t{1} << 19;
+
+// Threads for `items` independent examples: an explicit request, capped at the
+// number of examples; or, for requested <= 0, one per hardware thread, except
+// a single one when the work is small.
+int thread_count(int requested, int items, size_t work) {
+    if (requested <= 0 && work < kMinThreadedWork) return 1;
     const int hardware = std::max(1, static_cast<int>(std::thread::hardware_concurrency()));
     return std::max(1, std::min(items, requested > 0 ? requested : hardware));
 }
@@ -626,11 +636,11 @@ extern "C" DBS_EXPORT int dbs_decode_batch(
         const size_t stride = dbs::checked_mul_size(
             dbs::checked_mul_size(static_cast<size_t>(steps), static_cast<size_t>(decoder.options().beam_size), "batch stride overflow"),
             static_cast<size_t>(vocab_size), "batch stride overflow");
-        (void)dbs::checked_mul_size(stride, static_cast<size_t>(batch_size), "batch size overflow");
+        const size_t work = dbs::checked_mul_size(stride, static_cast<size_t>(batch_size), "batch size overflow");
 
         auto br = std::make_unique<DBSBatchResultHandle>();
         br->results.resize(static_cast<size_t>(batch_size));
-        const int threads = thread_count(num_threads, batch_size);
+        const int threads = thread_count(num_threads, batch_size, work);
         parallel_for(batch_size, threads, [&](int b) {
             try {
                 br->results[static_cast<size_t>(b)].result =
@@ -670,11 +680,11 @@ extern "C" DBS_EXPORT int dbs_decode_batch_variable(
         const auto start = std::chrono::steady_clock::now();
         const size_t step_stride = dbs::checked_mul_size(static_cast<size_t>(max_beam_size), static_cast<size_t>(vocab_size), "variable batch stride overflow");
         const size_t input_stride = dbs::checked_mul_size(step_stride, static_cast<size_t>(max_steps), "variable batch stride overflow");
-        (void)dbs::checked_mul_size(input_stride, static_cast<size_t>(batch_size), "variable batch size overflow");
+        const size_t work = dbs::checked_mul_size(input_stride, static_cast<size_t>(batch_size), "variable batch size overflow");
 
         auto br = std::make_unique<DBSBatchResultHandle>();
         br->results.resize(static_cast<size_t>(batch_size));
-        const int threads = thread_count(num_threads, batch_size);
+        const int threads = thread_count(num_threads, batch_size, work);
         parallel_for(batch_size, threads, [&](int b) {
             try {
                 const int steps = steps_per_example ? steps_per_example[b] : max_steps;
@@ -726,11 +736,11 @@ extern "C" DBS_EXPORT int dbs_decode_batch_into(
         const int K = decoder.options().beam_size;
         const size_t trace_stride = dbs::checked_mul_size(static_cast<size_t>(steps), static_cast<size_t>(K), "batch stride overflow");
         const size_t input_stride = dbs::checked_mul_size(trace_stride, static_cast<size_t>(vocab_size), "batch stride overflow");
-        (void)dbs::checked_mul_size(input_stride, static_cast<size_t>(batch_size), "batch size overflow");
+        const size_t work = dbs::checked_mul_size(input_stride, static_cast<size_t>(batch_size), "batch size overflow");
         const std::vector<int32_t> steps_b = steps_for(steps_per_example, batch_size, steps);
         const dbs::DecodeConstraints shared = constraints_c ? from_c_constraints(*constraints_c) : dbs::DecodeConstraints{};
 
-        const int threads = thread_count(num_threads, batch_size);
+        const int threads = thread_count(num_threads, batch_size, work);
         parallel_for(batch_size, threads, [&](int b) {
             const size_t bs = static_cast<size_t>(b);
             const size_t off = bs * trace_stride;
@@ -795,9 +805,10 @@ extern "C" DBS_EXPORT int dbs_backward_batch_into(
         const size_t trace_stride = dbs::checked_mul_size(static_cast<size_t>(steps), static_cast<size_t>(K), "batch stride overflow");
         const size_t grad_stride = dbs::checked_mul_size(trace_stride, static_cast<size_t>(vocab_size), "batch stride overflow");
         (void)dbs::checked_mul_size(grad_stride, static_cast<size_t>(batch_size), "batch size overflow");
+        const size_t work = trace_stride * static_cast<size_t>(batch_size);  // no larger than the product above
         const std::vector<int32_t> steps_b = steps_for(steps_per_example, batch_size, steps);
 
-        parallel_for(batch_size, thread_count(num_threads, batch_size), [&](int b) {
+        parallel_for(batch_size, thread_count(num_threads, batch_size, work), [&](int b) {
             const size_t bs = static_cast<size_t>(b);
             dbs::TraceView trace;
             trace.steps = steps_b[bs];
