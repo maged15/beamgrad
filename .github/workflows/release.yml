@@ -81,7 +81,15 @@ jobs:
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "beamgrad $GITHUB_REF_NAME" --notes-file notes.md --verify-tag
+        run: |
+          # A release published from the web UI (which creates the tag) keeps its
+          # title and notes; the built files are attached to it.
+          if gh release view "$GITHUB_REF_NAME" --repo "$GITHUB_REPOSITORY" > /dev/null 2>&1; then
+            gh release upload "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --clobber
+          else
+            gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "beamgrad $GITHUB_REF_NAME" \
+              --notes-file notes.md --verify-tag
+          fi
 
   pypi:
     needs: sdist
