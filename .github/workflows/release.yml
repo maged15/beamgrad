@@ -52,6 +52,11 @@ jobs:
       id-token: write
       attestations: write
     steps:
+      # Before the downloads: checkout empties the workspace.
+      - uses: actions/checkout@v7
+        with:
+          sparse-checkout: CHANGELOG.md
+          sparse-checkout-cone-mode: false
       - uses: actions/download-artifact@v8
         with:
           name: sdist
@@ -64,10 +69,19 @@ jobs:
       - uses: actions/attest-build-provenance@v4
         with:
           subject-path: dist/*
+      - name: Release notes from CHANGELOG.md
+        run: |
+          # The section of this version: from its "## X.Y.Z" heading to the next "## ".
+          awk -v v="${GITHUB_REF_NAME#v}" '
+            /^## / { if (found) exit; if (index($0, "## " v " ") == 1 || $0 == "## " v) { found = 1; next } }
+            found' CHANGELOG.md > notes.md
+          test -s notes.md || { echo "CHANGELOG.md has no section for ${GITHUB_REF_NAME#v}"; exit 1; }
+          printf '\n## Installation\n\nPick the wheel for your platform, PyTorch version and CUDA variant from the assets below (see [docs/installation.md](https://github.com/%s/blob/%s/docs/installation.md)), or build from source against your PyTorch:\n\n```bash\npip install --no-build-isolation "git+https://github.com/%s@%s"\n```\n' \
+            "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" "$GITHUB_REPOSITORY" "$GITHUB_REF_NAME" >> notes.md
       - name: Create GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "$GITHUB_REF_NAME" --generate-notes
+        run: gh release create "$GITHUB_REF_NAME" dist/* --repo "$GITHUB_REPOSITORY" --title "beamgrad $GITHUB_REF_NAME" --notes-file notes.md --verify-tag
 
   pypi:
     needs: sdist

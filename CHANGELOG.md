@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.0.0 (unreleased)
+## 2.0.0 (2026-09-25)
 
 The project is renamed **beamgrad** (previously `differentiable-beam-search-cuda`
 and the `dbs-torch` Python package). The C library keeps its name, `libdbs`,
