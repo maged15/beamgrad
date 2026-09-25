@@ -164,3 +164,39 @@ def test_torch_compile():
     final_scores(a, options).sum().backward()
     compiled(b).sum().backward()
     assert torch.equal(a.grad, b.grad)
+
+
+def test_beam_search_matches_cpu():
+    torch.manual_seed(0)
+    embed, head = torch.nn.Embedding(20, 8), torch.nn.Linear(8, 19)
+
+    def step_on(device):
+        def step(beams):
+            # Rows are computed on the CPU from the beam state, then moved, so
+            # both searches see identical rows.
+            prefix = beams.sequences.cpu().clamp(min=0)
+            h = embed(torch.full(prefix.shape[:2], 19)) + embed(prefix).sum(2)
+            return head(torch.tanh(h)).log_softmax(-1).to(device)
+
+        return step
+
+    options = BeamOptions(
+        beam_size=5, eos_token=3, length_penalty_alpha=0.6, no_repeat_ngram_size=2, repetition_penalty=1.3
+    )
+    cpu = beamgrad.beam_search(step_on("cpu"), options, max_steps=7, batch_size=3)
+    cpu.scores.sum().backward()
+    cpu_grad = head.weight.grad.clone()
+    head.weight.grad = None
+    gpu = beamgrad.beam_search(step_on("cuda"), options, max_steps=7, batch_size=3)
+    assert gpu.scores.is_cuda and gpu.sequences.is_cuda
+    gpu.scores.sum().backward()
+    assert torch.equal(gpu.sequences.cpu(), cpu.sequences)
+    assert torch.equal(gpu.scores.detach().cpu(), cpu.scores.detach())
+    assert_same_decode(gpu.trace, cpu.trace)
+    assert torch.equal(head.weight.grad, cpu_grad)
+
+
+def test_step_counts_beyond_int32_are_rejected():
+    x = random_log_probs(2, 4, 3, 10).cuda()
+    with pytest.raises(ValueError, match="steps"):
+        decode(x, BeamOptions(beam_size=3), steps=torch.tensor([4, 2**32 + 1], device="cuda"))

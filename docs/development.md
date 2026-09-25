@@ -11,7 +11,7 @@ python/csrc/        PyTorch operators (CPU, CUDA) and the bundled-libdbs shim
 python/tests/       Python tests
 tests/              C/C++ tests, emulated CUDA parity tests, fuzz harness
 examples/           runnable Python and C examples
-benchmarks/         C microbenchmark and PyTorch benchmark
+benchmarks/         C microbenchmark, PyTorch benchmark, Hugging Face comparison
 abi/                exported-symbol manifests checked by ctest
 docs/               documentation
 ```
@@ -107,10 +107,18 @@ cmake --build build-fuzz && ./build-fuzz/dbs_fuzz -max_total_time=300
 ./build/dbs_bench                               # C ABI microbenchmark matrix
 ./build/dbs_bench 16 8 32000 4 20               # T K V B repeats
 python benchmarks/benchmark.py --device all     # PyTorch API vs a torch.topk beam search
+python benchmarks/hf_beam_search.py --train     # beam_search on a Hugging Face LM vs generate()
 ```
 
 `benchmark.py` also asserts that beamgrad's scores match the reference, and
-`--csv` records results with the environment.
+`--csv` records results with the environment. `hf_beam_search.py` (needs
+`transformers` and a GPU) drives an open-weights causal LM (default
+`Qwen/Qwen2.5-0.5B`) with `beamgrad.beam_search` and with `transformers`'
+`generate(num_beams=...)`, and reports whether they return the same beams,
+their speed, and a short fine-tuning run through the search. In float32 the
+beams and scores are identical. In bfloat16 the logits often tie exactly, and
+the two break ties differently (beamgrad by parent slot then token id,
+`torch.topk` in an unspecified order); the script counts those prompts.
 
 ## Releasing
 

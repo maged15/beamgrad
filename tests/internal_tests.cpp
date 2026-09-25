@@ -533,6 +533,82 @@ void test_model_steps_match_tensor_decode() {
     }
 }
 
+void test_step_matches_decode() {
+    // Stepping through the rows of a tensor, with the prefixes tracked by the
+    // caller, must select exactly what decode() selects.
+    int cases = 0;
+    for (int trial = 0; trial < 600; ++trial) {
+        BeamOptions opt;
+        opt.beam_size = uniform_int(1, 6);
+        const int K = opt.beam_size;
+        const int V = uniform_int(2, 40);
+        const int T = uniform_int(1, 8);
+        opt.eos_token = uniform_int(0, 2) == 0 ? -1 : uniform_int(0, V - 1);
+        opt.min_length = uniform_int(0, 3);
+        opt.length_penalty_alpha = uniform_int(0, 1) ? 0.0f : uniform_float(0.1f, 1.5f);
+        opt.validate_inputs = 0;
+        std::vector<float> x(static_cast<size_t>(T) * K * V);
+        for (float& v : x) v = uniform_int(0, 9) == 0 ? -kInf : -0.25f * static_cast<float>(uniform_int(0, 12));
+        std::vector<uint8_t> banned(static_cast<size_t>(V));
+        for (uint8_t& b : banned) b = uniform_int(0, 5) == 0;
+        DecodeConstraints c;
+        c.banned_tokens = uniform_int(0, 1) ? banned.data() : nullptr;
+        const float penalties[] = {1.0f, 1.0f, 1.2f, 2.5f};
+        c.repetition_penalty = penalties[uniform_int(0, 3)];
+        c.no_repeat_ngram_size = uniform_int(0, 4);
+        c.token_filter = uniform_int(0, 3) == 0 ? hash_filter : nullptr;
+
+        for (KernelPath path : {KernelPath::Scalar, simd_paths().empty() ? KernelPath::Scalar : simd_paths().front()}) {
+            KernelScope scope(path);
+            const BeamSearchDecoder decoder(opt);
+            const DecodeResult expected = decoder.decode_constrained(x.data(), T, V, &c);
+
+            std::vector<float> raw(static_cast<size_t>(K), -kInf);
+            raw[0] = 0.0f;
+            std::vector<int32_t> lengths(static_cast<size_t>(K), 0);
+            std::vector<uint8_t> finished(static_cast<size_t>(K), 0);
+            std::vector<int32_t> paths(static_cast<size_t>(K) * T, -1), next(paths.size());
+            std::vector<int32_t> tok(static_cast<size_t>(K)), par(tok.size()), len(tok.size());
+            std::vector<float> sc(tok.size()), rs(tok.size());
+            std::vector<uint8_t> flp(tok.size());
+            std::vector<float> final_scores(tok.size());
+            bool ok = true;
+            for (int t = 0; t < T; ++t) {
+                TraceOutputs out;
+                out.tokens = tok.data();
+                out.parents = par.data();
+                out.lengths = len.data();
+                out.scores = sc.data();
+                out.raw_scores = rs.data();
+                out.from_logprob = flp.data();
+                decoder.step(x.data() + static_cast<size_t>(t) * K * V, V, t, &c, raw.data(), lengths.data(), finished.data(),
+                             paths.data(), T, out, t == T - 1 ? final_scores.data() : nullptr);
+                for (int k = 0; k < K; ++k) {
+                    const size_t e = static_cast<size_t>(t) * K + k;
+                    ok = ok && tok[k] == expected.tokens[e] && par[k] == expected.parents[e] && len[k] == expected.lengths[e] &&
+                         bits(sc[k]) == bits(expected.scores[e]) && bits(rs[k]) == bits(expected.raw_scores[e]) &&
+                         flp[k] == expected.from_logprob[e];
+                    int32_t* dst = &next[static_cast<size_t>(k) * T];
+                    if (par[k] < 0) {
+                        std::fill(dst, dst + T, -1);
+                    } else {
+                        std::copy_n(&paths[static_cast<size_t>(par[k]) * T], T, dst);
+                        if (flp[k]) dst[t] = tok[k];
+                    }
+                }
+                paths.swap(next);
+            }
+            ok = ok && same_floats(raw, expected.final_raw_scores) && same_floats(final_scores, expected.final_scores);
+            if (!ok) {
+                std::cerr << "step() differs from decode() on " << kernel_path_name(path) << " (trial " << trial << ")\n";
+                std::abort();
+            }
+            ++cases;
+        }
+    }
+    std::cout << "  step interface: " << cases << " stepped decodes equal decode()\n";
+}
+
 void test_length_penalty() {
     // Within one float ulp of pow() on the exponents and lengths decoders use.
     for (float alpha : {0.1f, 0.25f, 0.5f, 0.6f, 0.7f, 1.0f, 1.3f, 2.0f, 3.7f}) {
@@ -568,6 +644,7 @@ int main() {
     test_backward_uses_result_beam_size();
     test_model_steps_match_tensor_decode();
     test_length_penalty();
+    test_step_matches_decode();
     std::cout << "dbs_internal_tests passed\n";
     return 0;
 }

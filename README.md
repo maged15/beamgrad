@@ -19,16 +19,35 @@ on what the decoder actually produces.
 import torch
 import beamgrad
 
-# log_probs[b, t, k] is the next-token distribution for beam k at step t.
-log_probs = model(...).log_softmax(-1)                  # [B, T, K, V], CPU or CUDA
+# An autoregressive model: next-token log-probabilities for each beam's prefix.
+def step(beams):                                                # beams.sequences: [B, K, t] tokens so far
+    return model(src, beams.sequences).log_softmax(-1)         # [B, K, V]
 
-options = beamgrad.BeamOptions(beam_size=4, eos_token=2, length_penalty_alpha=0.6)
-scores = beamgrad.final_scores(log_probs, options)     # [B, K], best beam first
-loss = torch.relu(scores[:, 1] - scores[:, 0] + 1.0).mean()
-loss.backward()                                         # gradients reach log_probs and the model
+options = beamgrad.BeamOptions(beam_size=4, eos_token=EOS)
+result = beamgrad.beam_search(step, options, max_steps=T, batch_size=B)
+# result.scores: [B, K], best first, differentiable w.r.t. the model
+# result.sequences: [B, K, T] tokens of each beam, -1 after it ends
 
-trace = beamgrad.decode(log_probs, options)             # tokens, parents, lengths, scores, ...
-best = beamgrad.backtrack(trace)[:, 0]                  # [B, T] best sequence per example
+# Structured margin: the reference must beat the best beam that is not the reference.
+gold_score = model.sequence_log_prob(src, gold)                 # [B], teacher-forced; gold is [B, T], -1-padded
+is_gold = (result.sequences == gold[:, None]).all(-1)          # [B, K]
+rival = result.scores.masked_fill(is_gold, float("-inf")).amax(1)
+loss = torch.relu(rival - gold_score + 1.0).mean()
+loss.backward()                                                 # through the search, into the model
+```
+
+The loss is defined on what beam search actually returns: when the reference
+already wins by the margin it is zero, otherwise it raises the reference and
+lowers the beam that beat it. [`examples/train_lm.py`](examples/train_lm.py)
+is the runnable version, with a GRU whose hidden states follow the beams
+(`beams.parents` reorders them, as it would a key/value cache).
+
+If the next-token distributions of every beam are already in a
+`[B, T, K, V]` tensor, score and decode it directly:
+
+```python
+scores = beamgrad.final_scores(log_probs, options)             # [B, K], differentiable
+best = beamgrad.backtrack(beamgrad.decode(log_probs, options))[:, 0]   # [B, T] best sequence
 ```
 
 ## Features
@@ -41,6 +60,12 @@ best = beamgrad.backtrack(trace)[:, 0]                  # [B, T] best sequence p
   the path that produced it (see [how it works](docs/algorithm.md)). The
   gradients match the C reference bit for bit and agree with finite
   differences.
+- **Drives real models.** `beam_search` runs an autoregressive model inside
+  the search, one step at a time, reordering its cache by each beam's parent.
+  On Qwen2.5-0.5B and Qwen3-0.6B it returns the same beams, with bit-identical
+  scores, as `transformers`' `generate(num_beams=...)` in float32, at the same
+  speed ([benchmarks/hf_beam_search.py](benchmarks/hf_beam_search.py)), and
+  fine-tunes the model through the search.
 - **Native everywhere.** CPU kernels are multi-threaded across the batch and
   pick AVX-512, AVX2, SSE4.2 or NEON at runtime. A CUDA engine runs forward
   and backward on the GPU for beams up to 1024, on PyTorch's stream and
@@ -147,16 +172,16 @@ The complete version, with error handling, is
 | [docs/c-api.md](docs/c-api.md) | C API reference, CUDA C API, ABI policy |
 | [docs/cuda.md](docs/cuda.md) | CUDA engine design, limits, testing without a GPU |
 | [docs/development.md](docs/development.md) | building, testing, benchmarking, releasing |
-| [examples/](examples) | quickstart, training through beam search, C usage |
+| [examples/](examples) | quickstart, training a model through beam search, C usage |
 
 ## Scope and limitations
 
 - Gradients are **surrogate** gradients. They are exact for a fixed beam
   selection and do not model how the selection itself would change.
-- `final_scores` consumes a precomputed `[T, K, V]` tensor. When each row
-  depends on its beam's prefix, the model has to produce those rows during
-  decoding: the C ABI's `dbs_decode_model_steps_ex` asks a callback for each
-  step's rows and tells it which beam each row continues.
+- The model runs inside the search, one step at a time (`beam_search`), and
+  the graph of every step is kept until the backward pass. Memory therefore
+  grows with `T × K` model evaluations, as with any backpropagation through
+  generation.
 - CUDA supports beams up to 1024 and about 268M candidates (`K × V`) per step.
 
 ## Contributing

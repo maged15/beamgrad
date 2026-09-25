@@ -87,3 +87,15 @@ def test_shape_errors():
         bjax.final_scores(jnp.zeros((3, 4)), BeamOptions(beam_size=2))
     with pytest.raises(ValueError):
         bjax.final_scores(jnp.zeros((3, 4, 8)), BeamOptions(beam_size=2))
+
+
+def test_step_counts_beyond_int32_are_rejected():
+    x = jnp.asarray(random_log_probs(2, 4, 3, 10, seed=3))
+    options = BeamOptions(beam_size=3)
+    with pytest.raises(ValueError, match="steps"):
+        bjax.final_scores(x, options, steps=np.array([4, 2**32 + 1], dtype=np.int64))
+    with pytest.raises(TypeError, match="integers"):
+        bjax.final_scores(x, options, steps=np.array([4.0, 2.0]))
+    # Traced values cannot be checked eagerly; out-of-range ones fail in the library.
+    with pytest.raises(Exception, match="steps"):
+        jax.jit(lambda y, s: bjax.final_scores(y, options, steps=s))(x, jnp.asarray([4, 0])).block_until_ready()

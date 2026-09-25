@@ -9,6 +9,14 @@ three functions are added and one no-op stub is removed (see below).
 
 ### Highlights
 
+- **Training a model through beam search.** `beamgrad.beam_search(step_fn,
+  options, max_steps)` runs an autoregressive model inside the search: each
+  step asks the model for the next-token distributions of the beams chosen so
+  far (with each beam's parent slot, to reorder a key/value cache), and the
+  returned scores are differentiable with respect to the model. Driving
+  Qwen2.5-0.5B and Qwen3-0.6B, it returns the same beams with bit-identical
+  scores as `transformers`' `generate(num_beams=...)` in float32, at the same
+  speed (`benchmarks/hf_beam_search.py`).
 - **Native CUDA engine.** Beam search and its backward pass run entirely on
   the GPU for beams up to 1024, with GNMT length penalty, EOS carry-forward,
   `min_length` and variable-length batches. It selects the same beams, with
@@ -34,6 +42,17 @@ three functions are added and one no-op stub is removed (see below).
 
 ### Added
 
+- `beamgrad.beam_search`, `BeamState`, `BeamSearchResult`: beam search that
+  drives a model step by step, on CPU or CUDA, without stacking or copying the
+  per-step rows. `torch.ops.beamgrad.decode_step` (one step from an explicit
+  beam state), the C++ `BeamSearchDecoder::step`, and the CUDA C API's
+  `dbs_cuda_decode_step` / `DBSCudaBeamState` /
+  `dbs_cuda_decode_step_workspace_size` underneath; stepping through the rows
+  of a tensor selects exactly what the full decode selects.
+- `examples/train_lm.py`: a GRU language model trained so that reference
+  sequences win beam search by a margin, and
+  `benchmarks/hf_beam_search.py`: parity, speed and training on a Hugging
+  Face causal LM against `generate`.
 - `dbs_cuda_decode` / `dbs_cuda_backward` with workspace-size queries,
   per-example metadata, constraints, NaN/`+inf` flags, optional trace outputs,
   and asynchronous execution (`DBS_CUDA_SYNC_CHECK=1` synchronizes for
@@ -117,6 +136,13 @@ three functions are added and one no-op stub is removed (see below).
 
 ### Fixed
 
+- Integers beyond 32 bits were truncated instead of rejected: `steps=[4,
+  2**32 + 1]` decoded one step for the second example (PyTorch on CPU and
+  CUDA, and JAX with 64-bit arrays), and through JAX's ctypes bindings
+  `min_length=2**32 + 1` became 1 and `no_repeat_ngram_size=2**32 + 1` became
+  1. Step counts are now range-checked before they are narrowed, non-integer
+  step counts are rejected, and `BeamOptions` rejects integer options outside
+  the 32-bit range.
 - `torch.func.grad`, `vjp` and `jacrev` (and `vmap` of them) failed on
   `final_scores`: the autograd formula registered with `torch.library` is an
   `autograd.Function` without a separate `setup_context`, which `torch.func`

@@ -120,6 +120,42 @@ DBS_CUDA_EXPORT int dbs_cuda_decode(
     int64_t workspace_bytes,
     void* stream);
 
+/* The beams of a search between steps, for callers that run the search loop
+ * themselves (one dbs_cuda_decode_step() per step, e.g. to ask a model for each
+ * step's rows given the beams chosen so far). Device arrays. Before the first
+ * step: raw_scores is 0 for beam 0 and -inf for the others, lengths and
+ * finished are 0. */
+typedef struct DBSCudaBeamState {
+    float* raw_scores;          /* [B, K] cumulative log-probabilities (updated in place) */
+    int32_t* lengths;           /* [B, K] hypothesis lengths (updated in place) */
+    uint8_t* finished;          /* [B, K] non-zero once a beam emitted EOS (updated in place) */
+    const int32_t* prefixes;    /* [B, K, prefix_stride]: row (b, k) starts with the lengths[b, k]
+                                   tokens of beam k's hypothesis. Read only with n-gram blocking or
+                                   a repetition penalty; tokens outside [0, V) are ignored. */
+    int prefix_stride;          /* tokens per prefix row, >= every live beam's length */
+    int reserved0;              /* must be 0 */
+} DBSCudaBeamState;
+
+/* Scratch memory needed by dbs_cuda_decode_step, in bytes, or a negative value
+ * if the arguments are invalid. */
+DBS_CUDA_EXPORT int64_t dbs_cuda_decode_step_workspace_size(const DBSCudaDecodeArgs* args, int prefix_stride);
+
+/* One step of the search. log_probs is the step's [B, K, V] rows (row k
+ * extends beam k); args->steps must be 1 and args->steps_per_example NULL.
+ * Advances `state`, and writes the step's [B, K] tokens, parents, lengths,
+ * scores, raw_scores and from_logprob, the invalid_input flags, and (when
+ * final_scores is not NULL) the final_* arrays of the beams after this step.
+ * Stepping from the initial state through the rows of a [B, T, K, V] tensor
+ * selects exactly what dbs_cuda_decode() selects. */
+DBS_CUDA_EXPORT int dbs_cuda_decode_step(
+    const float* log_probs,
+    const DBSCudaDecodeArgs* args,
+    const DBSCudaBeamState* state,
+    const DBSCudaDecodeOutputs* outputs,
+    void* workspace,
+    int64_t workspace_bytes,
+    void* stream);
+
 /* Surrogate gradient of the final scores. parents, tokens, lengths and
  * from_logprob come from dbs_cuda_decode() with the same args.
  * grad_final_scores is [B, K]; the gradient is accumulated (+=) into

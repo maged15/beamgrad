@@ -20,6 +20,7 @@ namespace {
 
 using Tensor = at::Tensor;
 using DecodeOutputs = std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>;
+using StepOutputs = std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>;
 
 constexpr int64_t kIntMax = std::numeric_limits<int>::max();
 
@@ -32,10 +33,22 @@ void check_status(int status, const char* what) {
     TORCH_CHECK(status == DBS_CUDA_STATUS_OK, "beamgrad CUDA ", what, " failed: ", dbs_cuda_status_string(status));
 }
 
-c10::optional<Tensor> device_steps(const c10::optional<Tensor>& steps, const Tensor& like, int64_t B) {
+c10::optional<Tensor> device_steps(const c10::optional<Tensor>& steps, const Tensor& like, int64_t B, int64_t T) {
     if (!steps.has_value()) return c10::nullopt;
     TORCH_CHECK_VALUE(steps->dim() == 1 && steps->size(0) == B, "steps must have shape [B] = [", B, "]");
-    return steps->to(like.device(), torch::kInt32).contiguous();
+    TORCH_CHECK_VALUE(!steps->is_floating_point() && !steps->is_complex() && steps->scalar_type() != torch::kBool,
+                      "steps must be an integer tensor, got ", steps->scalar_type());
+    // Range-checked before the values are narrowed to int32, where 2^32 + 1
+    // would pass as 1. Reads one flag back (per-example steps synchronize anyway).
+    const Tensor s = steps->to(like.device(), torch::kInt64);
+    if (!s.ge(1).logical_and(s.le(T)).all().item<bool>()) {
+        const Tensor host = s.cpu();
+        const int64_t* p = host.data_ptr<int64_t>();
+        for (int64_t b = 0; b < B; ++b) {
+            TORCH_CHECK_VALUE(p[b] >= 1 && p[b] <= T, "steps[", b, "] = ", p[b], " must be in [1, ", T, "]");
+        }
+    }
+    return s.to(torch::kInt32).contiguous();
 }
 
 DBSCudaDecodeArgs make_args(int64_t B, int64_t T, int64_t K, int64_t V, int64_t eos_token, int64_t min_length,
@@ -84,7 +97,7 @@ DecodeOutputs decode_cuda(
     const c10::cuda::CUDAGuard guard(log_probs.device());
     const Tensor x = log_probs.contiguous();
     const int64_t B = x.size(0), T = x.size(1), K = x.size(2), V = x.size(3);
-    const c10::optional<Tensor> steps_i32 = device_steps(steps, x, B);
+    const c10::optional<Tensor> steps_i32 = device_steps(steps, x, B, T);
     DBSCudaDecodeArgs args = make_args(B, T, K, V, eos_token, min_length, length_penalty_alpha, steps_i32);
     args.no_repeat_ngram_size = static_cast<int>(std::max<int64_t>(0, std::min<int64_t>(no_repeat_ngram_size, kIntMax)));
     args.repetition_penalty = static_cast<float>(repetition_penalty);
@@ -136,6 +149,88 @@ DecodeOutputs decode_cuda(
     return {final_scores, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob};
 }
 
+StepOutputs decode_step_cuda(
+    const Tensor& log_probs,
+    const Tensor& raw_scores,
+    const Tensor& lengths,
+    const Tensor& finished,
+    const Tensor& prefixes,
+    int64_t eos_token,
+    int64_t min_length,
+    double length_penalty_alpha,
+    const c10::optional<Tensor>& banned_tokens,
+    int64_t no_repeat_ngram_size,
+    double repetition_penalty,
+    bool validate) {
+    TORCH_CHECK(log_probs.is_cuda(), "beamgrad::decode_step (CUDA) expects CUDA tensors");
+    TORCH_CHECK_VALUE(log_probs.scalar_type() == torch::kFloat32 && log_probs.dim() == 3,
+                      "log_probs must be a float32 [B, K, V] tensor");
+    const c10::cuda::CUDAGuard guard(log_probs.device());
+    const Tensor x = log_probs.contiguous();
+    const int64_t B = x.size(0), K = x.size(1), V = x.size(2);
+    for (const Tensor* t : {&raw_scores, &lengths, &finished, &prefixes}) {
+        TORCH_CHECK_VALUE(t->device() == x.device(), "the beam state must be on the device of log_probs");
+    }
+    TORCH_CHECK_VALUE(raw_scores.scalar_type() == torch::kFloat32 && raw_scores.sizes() == torch::IntArrayRef({B, K}),
+                      "raw_scores must be a float32 [B, K] tensor");
+    TORCH_CHECK_VALUE(lengths.scalar_type() == torch::kInt32 && lengths.sizes() == torch::IntArrayRef({B, K}),
+                      "lengths must be an int32 [B, K] tensor");
+    TORCH_CHECK_VALUE(finished.scalar_type() == torch::kUInt8 && finished.sizes() == torch::IntArrayRef({B, K}),
+                      "finished must be a uint8 [B, K] tensor");
+    TORCH_CHECK_VALUE(prefixes.scalar_type() == torch::kInt32 && prefixes.dim() == 3 && prefixes.size(0) == B &&
+                          prefixes.size(1) == K && prefixes.size(2) <= kIntMax,
+                      "prefixes must be an int32 [B, K, L] tensor");
+    TORCH_CHECK_VALUE(std::isfinite(length_penalty_alpha) && length_penalty_alpha >= 0.0,
+                      "length_penalty_alpha must be finite and non-negative");
+    TORCH_CHECK_VALUE(std::isfinite(repetition_penalty) && repetition_penalty > 0.0,
+                      "repetition_penalty must be finite and positive");
+    DBSCudaDecodeArgs args = make_args(B, 1, K, V, eos_token, min_length, length_penalty_alpha, c10::nullopt);
+    args.no_repeat_ngram_size = static_cast<int>(std::max<int64_t>(0, std::min<int64_t>(no_repeat_ngram_size, kIntMax)));
+    args.repetition_penalty = static_cast<float>(repetition_penalty);
+    Tensor banned;
+    if (banned_tokens.has_value()) {
+        banned = banned_tokens->to(x.device(), torch::kUInt8).contiguous();
+        TORCH_CHECK_VALUE(banned.dim() == 1 && banned.size(0) == V, "banned_tokens must be a [V] mask");
+        args.banned_tokens = banned.data_ptr<uint8_t>();
+    }
+
+    // The state is advanced in copies, so the inputs are left untouched.
+    Tensor raw = raw_scores.contiguous().clone();
+    Tensor len = lengths.contiguous().clone();
+    Tensor fin = finished.contiguous().clone();
+    const Tensor pre = prefixes.contiguous();
+    Tensor tokens = torch::empty({B, K}, x.options().dtype(torch::kInt32));
+    Tensor parents = torch::empty({B, K}, x.options().dtype(torch::kInt32));
+    Tensor scores = torch::empty({B, K}, x.options());
+    Tensor final_scores = torch::empty({B, K}, x.options());
+    Tensor from_logprob = torch::empty({B, K}, x.options().dtype(torch::kUInt8));
+    Tensor invalid = validate ? torch::empty({B}, x.options().dtype(torch::kUInt8)) : Tensor();
+
+    DBSCudaDecodeOutputs out{};
+    out.tokens = tokens.data_ptr<int32_t>();
+    out.parents = parents.data_ptr<int32_t>();
+    out.scores = scores.data_ptr<float>();
+    out.from_logprob = from_logprob.data_ptr<uint8_t>();
+    out.final_scores = final_scores.data_ptr<float>();
+    out.invalid_input = validate ? invalid.data_ptr<uint8_t>() : nullptr;
+    const DBSCudaBeamState state{raw.data_ptr<float>(), len.data_ptr<int32_t>(), fin.data_ptr<uint8_t>(),
+                                 pre.numel() > 0 ? pre.data_ptr<int32_t>() : nullptr, static_cast<int>(pre.size(2)), 0};
+    const int64_t ws_bytes = dbs_cuda_decode_step_workspace_size(&args, state.prefix_stride);
+    Tensor ws = workspace(ws_bytes, x);
+    check_status(dbs_cuda_decode_step(x.data_ptr<float>(), &args, &state, &out, ws.data_ptr(), ws_bytes,
+                                      at::cuda::getCurrentCUDAStream().stream()),
+                 "decode_step");
+    if (validate) {
+        const Tensor flags = invalid.cpu();  // one byte per example; synchronizes the stream
+        const uint8_t* f = flags.data_ptr<uint8_t>();
+        for (int64_t b = 0; b < B; ++b) {
+            TORCH_CHECK_VALUE(f[b] == 0, "example ", b, ": log_probs contains NaN or +inf in a row the search reads");
+        }
+    }
+    // The new state's lengths and raw scores are the selected beams'.
+    return {tokens, parents, len, scores, raw, from_logprob, fin, final_scores};
+}
+
 Tensor final_scores_backward_cuda(
     const Tensor& grad_final,
     const Tensor& parents,
@@ -161,7 +256,7 @@ Tensor final_scores_backward_cuda(
                       "grad_final must be a float32 [B, K] tensor on the same device");
     const Tensor par = parents.contiguous(), tok = tokens.contiguous(), len = lengths.contiguous();
     const Tensor flp = from_logprob.contiguous(), g = grad_final.contiguous();
-    const c10::optional<Tensor> steps_i32 = device_steps(steps, par, B);
+    const c10::optional<Tensor> steps_i32 = device_steps(steps, par, B, T);
     const DBSCudaDecodeArgs args = make_args(B, T, K, vocab_size, -1, 0, length_penalty_alpha, steps_i32);
 
     Tensor grad = torch::zeros({B, T, K, vocab_size}, g.options());
@@ -177,6 +272,7 @@ Tensor final_scores_backward_cuda(
 TORCH_LIBRARY_IMPL(beamgrad, CUDA, m) {
     m.impl("decode", &decode_cuda);
     m.impl("final_scores_backward", &final_scores_backward_cuda);
+    m.impl("decode_step", &decode_step_cuda);
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {

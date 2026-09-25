@@ -344,30 +344,33 @@ __global__ void init_state_kernel(DBSCudaDecodeArgs a, float* beam_raw, int32_t*
 // Constraint state of one beam slot: its token prefix (double-buffered across
 // steps), and the tokens whose bits are set in its bitmaps.
 struct ConstraintState {
-    const int32_t* prefix;      // [B, K, T]
+    const int32_t* prefix;      // [B, K, stride]
     const int32_t* prefix_len;  // [B, K]
     uint32_t* blocked;          // [B, K, words]
     uint32_t* penalised;        // [B, K, words]
-    int32_t* marked;            // [B, K, 2T] tokens with bits set
+    int32_t* marked;            // [B, K, 2 * stride] tokens with bits set
     int32_t* marked_count;      // [B, K]
+    int stride;                 // prefix capacity per beam
     int words;
     int ngram;
     int penalise;
 };
 
 // grid = (B). Rebuilds each live beam's blocked and penalised token bitmaps
-// from its prefix, with the same rules as the CPU decoder.
+// from its prefix, with the same rules as the CPU decoder. Prefix tokens
+// outside the vocabulary (only possible in a caller-supplied state, see
+// dbs_cuda_decode_step) are ignored.
 __global__ void constraint_kernel(DBSCudaDecodeArgs a, int t, ConstraintState c, const float* beam_raw) {
     const int b = static_cast<int>(blockIdx.x);
     const int K = a.beam_size;
-    const int T = a.steps;
+    const int V = a.vocab_size;
     const Meta m = load_meta(a, b);
     if (t >= m.steps) return;
     for (int p = static_cast<int>(threadIdx.x); p < m.beam; p += static_cast<int>(blockDim.x)) {
         const int64_t slot = static_cast<int64_t>(b) * K + p;
         uint32_t* blocked = c.blocked + slot * c.words;
         uint32_t* penalised = c.penalised + slot * c.words;
-        int32_t* marked = c.marked + slot * 2 * T;
+        int32_t* marked = c.marked + slot * 2 * c.stride;
         // Clear the bits of the hypothesis that held this slot at the previous step.
         for (int i = 0; i < c.marked_count[slot]; ++i) {
             blocked[marked[i] >> 5] = 0;
@@ -375,11 +378,13 @@ __global__ void constraint_kernel(DBSCudaDecodeArgs a, int t, ConstraintState c,
         }
         int count = 0;
         if (is_finite(beam_raw[slot])) {
-            const int32_t* prefix = c.prefix + slot * T;
-            const int L = c.prefix_len[slot];
+            const int32_t* prefix = c.prefix + slot * c.stride;
+            const int length = c.prefix_len[slot];
+            const int L = length < 0 ? 0 : (length > c.stride ? c.stride : length);
             const int n = c.ngram;
             if (n == 1) {
                 for (int i = 0; i < L; ++i) {
+                    if (prefix[i] < 0 || prefix[i] >= V) continue;
                     blocked[prefix[i] >> 5] |= 1u << (prefix[i] & 31);
                     marked[count++] = prefix[i];
                 }
@@ -388,8 +393,8 @@ __global__ void constraint_kernel(DBSCudaDecodeArgs a, int t, ConstraintState c,
                 for (int i = 0; i + n <= L; ++i) {
                     bool same = true;
                     for (int j = 0; j < n - 1 && same; ++j) same = prefix[i + j] == prefix[suffix_start + j];
-                    if (same) {
-                        const int token = prefix[i + n - 1];
+                    const int token = prefix[i + n - 1];
+                    if (same && token >= 0 && token < V) {
                         blocked[token >> 5] |= 1u << (token & 31);
                         marked[count++] = token;
                     }
@@ -397,6 +402,7 @@ __global__ void constraint_kernel(DBSCudaDecodeArgs a, int t, ConstraintState c,
             }
             if (c.penalise) {
                 for (int i = 0; i < L; ++i) {
+                    if (prefix[i] < 0 || prefix[i] >= V) continue;
                     penalised[prefix[i] >> 5] |= 1u << (prefix[i] & 31);
                     marked[count++] = prefix[i];
                 }
@@ -566,6 +572,7 @@ struct PrefixBuffers {
     const int32_t* prefix_len;
     int32_t* next_prefix;
     int32_t* next_prefix_len;
+    int stride;  // prefix capacity per beam
 };
 
 __device__ __forceinline__ void write_slot(const StepOutputs& o, int64_t slot, const Cand& c) {
@@ -625,7 +632,6 @@ __global__ void select_step_kernel(
     const int b = static_cast<int>(blockIdx.x);
     const int K = a.beam_size;
     const int V = a.vocab_size;
-    const int T = a.steps;
     const Meta m = load_meta(a, b);
     const int64_t slot_base = (static_cast<int64_t>(b) * a.steps + t) * K;
 
@@ -743,9 +749,10 @@ __global__ void select_step_kernel(
             // The new hypothesis' prefix: its parent's, plus the token it emitted.
             const int64_t from = static_cast<int64_t>(b) * K + c.parent;
             const int L = prefixes.prefix_len[from];
-            for (int i = 0; i < L; ++i) prefixes.next_prefix[s * T + i] = prefixes.prefix[from * T + i];
+            const int64_t stride = prefixes.stride;
+            for (int i = 0; i < L; ++i) prefixes.next_prefix[s * stride + i] = prefixes.prefix[from * stride + i];
             const bool append = c.from_logprob && c.token >= 0;
-            if (append) prefixes.next_prefix[s * T + L] = c.token;
+            if (append) prefixes.next_prefix[s * stride + L] = c.token;
             prefixes.next_prefix_len[s] = L + (append ? 1 : 0);
         }
     };
@@ -950,6 +957,7 @@ struct DecodePlan {
     int small_items;     // candidates per thread in the register top-k scan
     int blocks0;         // scan blocks per example
     int words;           // constraint bitmap words per beam
+    int prefix_stride;   // prefix capacity per beam
     int64_t state_raw_offset;
     int64_t state_len_offset;
     int64_t state_ended_offset;
@@ -967,7 +975,9 @@ struct DecodePlan {
     int64_t total_bytes;
 };
 
-DecodePlan make_plan(const DBSCudaDecodeArgs& a) {
+// prefix_stride < 0 plans a full decode, which keeps the beams' prefixes itself
+// (a.steps tokens each); otherwise one step whose prefixes the caller supplies.
+DecodePlan make_plan(const DBSCudaDecodeArgs& a, int prefix_stride = -1) {
     DecodePlan p{};
     const int64_t B = a.batch_size;
     const int64_t K = a.beam_size;
@@ -992,11 +1002,14 @@ DecodePlan make_plan(const DBSCudaDecodeArgs& a) {
     p.status_offset = take(static_cast<int64_t>(sizeof(int)));
     if (constrained(a)) {
         p.words = static_cast<int>(ceil_div(a.vocab_size, 32));
-        for (int i = 0; i < 2; ++i) {
-            p.prefix_offset[i] = take(B * K * T * static_cast<int64_t>(sizeof(int32_t)));
-            p.prefix_len_offset[i] = take(B * K * static_cast<int64_t>(sizeof(int32_t)));
+        p.prefix_stride = prefix_stride < 0 ? a.steps : prefix_stride;
+        if (prefix_stride < 0) {
+            for (int i = 0; i < 2; ++i) {
+                p.prefix_offset[i] = take(B * K * T * static_cast<int64_t>(sizeof(int32_t)));
+                p.prefix_len_offset[i] = take(B * K * static_cast<int64_t>(sizeof(int32_t)));
+            }
         }
-        p.marked_offset = take(B * K * 2 * T * static_cast<int64_t>(sizeof(int32_t)));
+        p.marked_offset = take(B * K * 2 * p.prefix_stride * static_cast<int64_t>(sizeof(int32_t)));
         // Zeroed together: bitmaps and marked counts.
         const int64_t zero_begin = off;
         p.blocked_offset = take(B * K * p.words * static_cast<int64_t>(sizeof(uint32_t)));
@@ -1083,6 +1096,68 @@ void launch_scan(const DecodePlan& plan, const ScanParams& params, int t, const 
     }
 }
 
+// Clears the constraint scratch (bitmaps, marked tokens) and points `cons` and
+// the scan parameters at it; the prefixes are set per step. False if the
+// memset could not be queued.
+bool prepare_constraints(const DecodePlan& plan, const DBSCudaDecodeArgs& a, const Workspace& ws, cudaStream_t stream,
+                         ConstraintState& cons, ScanParams& params) {
+    if (cudaMemsetAsync(ws.at<char>(plan.blocked_offset), 0, static_cast<size_t>(plan.constraint_bytes), stream) != cudaSuccess) {
+        return false;
+    }
+    cons.blocked = ws.at<uint32_t>(plan.blocked_offset);
+    cons.penalised = ws.at<uint32_t>(plan.penalised_offset);
+    cons.marked = ws.at<int32_t>(plan.marked_offset);
+    cons.marked_count = ws.at<int32_t>(plan.marked_count_offset);
+    cons.stride = plan.prefix_stride;
+    cons.words = plan.words;
+    cons.ngram = a.no_repeat_ngram_size;
+    cons.penalise = a.repetition_penalty > 1.0f ? 1 : 0;
+    params.blocked = cons.blocked;
+    params.penalised = cons.penalised;
+    params.words = plan.words;
+    // Computed on the host exactly as the CPU decoder does.
+    params.log_penalty = cons.penalise ? std::log(a.repetition_penalty) : 0.0f;
+    return true;
+}
+
+// Queues the kernels of decode step t; `cons` is null without n-gram blocking
+// or a repetition penalty. Advances the beam state in place.
+void launch_step(const DecodePlan& plan, const ScanParams& params, const ConstraintState* cons,
+                 const PrefixBuffers& prefixes, int t, float* beam_raw, int32_t* beam_len, uint8_t* beam_ended,
+                 uint64_t* keys0, uint64_t* keys1, const StepOutputs& step_out, cudaStream_t stream) {
+    const DBSCudaDecodeArgs& a = params.a;
+    const unsigned int B = static_cast<unsigned int>(a.batch_size);
+    if (cons) {
+        DBS_LAUNCH(constraint_kernel, dim3(B), dim3(kThreads), stream, a, t, *cons, static_cast<const float*>(beam_raw));
+    }
+    launch_scan(plan, params, t, beam_raw, beam_len, beam_ended, keys0, stream);
+    int n = plan.blocks0 * a.beam_size;
+    uint64_t* src = keys0;
+    uint64_t* dst = keys1;
+    while (n > kTile) {
+        const int tiles = static_cast<int>(ceil_div(n, kTile));
+        DBS_LAUNCH(reduce_tiles_kernel, dim3(B, static_cast<unsigned int>(tiles)), dim3(kThreads), stream,
+                   src, n, a.beam_size, dst, tiles);
+        n = tiles * a.beam_size;
+        uint64_t* tmp = src;
+        src = dst;
+        dst = tmp;
+    }
+    DBS_LAUNCH(select_step_kernel, dim3(B), dim3(kThreads), stream,
+               a, t, src, n, beam_raw, beam_len, beam_ended, step_out, prefixes);
+}
+
+StepOutputs step_outputs(const DBSCudaDecodeOutputs& o) {
+    StepOutputs s;
+    s.tokens = o.tokens;
+    s.parents = o.parents;
+    s.lengths = o.lengths;
+    s.scores = o.scores;
+    s.raw_scores = o.raw_scores;
+    s.from_logprob = o.from_logprob;
+    return s;
+}
+
 } // namespace
 
 // ---------------------------------------------------------------------------
@@ -1165,9 +1240,7 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode(
     int32_t* prefix_len[2] = {nullptr, nullptr};
     const bool with_constraints = constrained(a);
     if (with_constraints) {
-        if (cudaMemsetAsync(ws.at<char>(plan.blocked_offset), 0, static_cast<size_t>(plan.constraint_bytes), stream) != cudaSuccess) {
-            return DBS_CUDA_STATUS_LAUNCH_FAILED;
-        }
+        if (!prepare_constraints(plan, a, ws, stream, cons, params)) return DBS_CUDA_STATUS_LAUNCH_FAILED;
         for (int i = 0; i < 2; ++i) {
             prefix[i] = ws.at<int32_t>(plan.prefix_offset[i]);
             prefix_len[i] = ws.at<int32_t>(plan.prefix_len_offset[i]);
@@ -1175,29 +1248,10 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode(
         if (cudaMemsetAsync(prefix_len[0], 0, static_cast<size_t>(beams) * sizeof(int32_t), stream) != cudaSuccess) {
             return DBS_CUDA_STATUS_LAUNCH_FAILED;
         }
-        cons.blocked = ws.at<uint32_t>(plan.blocked_offset);
-        cons.penalised = ws.at<uint32_t>(plan.penalised_offset);
-        cons.marked = ws.at<int32_t>(plan.marked_offset);
-        cons.marked_count = ws.at<int32_t>(plan.marked_count_offset);
-        cons.words = plan.words;
-        cons.ngram = a.no_repeat_ngram_size;
-        cons.penalise = a.repetition_penalty > 1.0f ? 1 : 0;
-        params.blocked = cons.blocked;
-        params.penalised = cons.penalised;
-        params.words = plan.words;
-        // Computed on the host exactly as the CPU decoder does.
-        params.log_penalty = cons.penalise ? std::log(a.repetition_penalty) : 0.0f;
+        prefixes.stride = plan.prefix_stride;
     }
 
-    StepOutputs step_out;
-    step_out.tokens = outputs->tokens;
-    step_out.parents = outputs->parents;
-    step_out.lengths = outputs->lengths;
-    step_out.scores = outputs->scores;
-    step_out.raw_scores = outputs->raw_scores;
-    step_out.from_logprob = outputs->from_logprob;
-
-    const unsigned int B = static_cast<unsigned int>(a.batch_size);
+    const StepOutputs step_out = step_outputs(*outputs);
     for (int t = 0; t < a.steps; ++t) {
         if (with_constraints) {
             cons.prefix = prefix[t & 1];
@@ -1206,27 +1260,69 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode(
             prefixes.prefix_len = prefix_len[t & 1];
             prefixes.next_prefix = prefix[(t + 1) & 1];
             prefixes.next_prefix_len = prefix_len[(t + 1) & 1];
-            DBS_LAUNCH(constraint_kernel, dim3(B), dim3(kThreads), stream, a, t, cons, static_cast<const float*>(beam_raw));
         }
-        launch_scan(plan, params, t, beam_raw, beam_len, beam_ended, keys0, stream);
-        int n = plan.blocks0 * a.beam_size;
-        uint64_t* src = keys0;
-        uint64_t* dst = keys1;
-        while (n > kTile) {
-            const int tiles = static_cast<int>(ceil_div(n, kTile));
-            DBS_LAUNCH(reduce_tiles_kernel, dim3(B, static_cast<unsigned int>(tiles)), dim3(kThreads), stream,
-                       src, n, a.beam_size, dst, tiles);
-            n = tiles * a.beam_size;
-            uint64_t* tmp = src;
-            src = dst;
-            dst = tmp;
-        }
-        DBS_LAUNCH(select_step_kernel, dim3(B), dim3(kThreads), stream,
-                   a, t, src, n, beam_raw, beam_len, beam_ended, step_out, prefixes);
+        launch_step(plan, params, with_constraints ? &cons : nullptr, prefixes, t, beam_raw, beam_len, beam_ended,
+                    keys0, keys1, step_out, stream);
     }
 
     DBS_LAUNCH(finalize_kernel, beam_grid, dim3(kThreads), stream,
                a, beam_raw, beam_len, outputs->final_scores, outputs->final_raw_scores, outputs->final_lengths);
+    return finish(stream);
+}
+
+extern "C" DBS_CUDA_EXPORT int64_t dbs_cuda_decode_step_workspace_size(const DBSCudaDecodeArgs* args, int prefix_stride) {
+    if (!valid_args(args) || args->steps != 1 || args->steps_per_example || prefix_stride < 0) return -1;
+    return make_plan(*args, prefix_stride).total_bytes;
+}
+
+extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_step(
+    const float* log_probs,
+    const DBSCudaDecodeArgs* args,
+    const DBSCudaBeamState* state,
+    const DBSCudaDecodeOutputs* outputs,
+    void* workspace,
+    int64_t workspace_bytes,
+    void* stream_ptr) {
+    if (!log_probs || !valid_args(args) || !state || !outputs) return DBS_CUDA_STATUS_INVALID_ARGUMENT;
+    const DBSCudaDecodeArgs& a = *args;
+    if (a.steps != 1 || a.steps_per_example) return DBS_CUDA_STATUS_INVALID_ARGUMENT;
+    if (!state->raw_scores || !state->lengths || !state->finished || state->prefix_stride < 0 || state->reserved0 != 0) {
+        return DBS_CUDA_STATUS_INVALID_ARGUMENT;
+    }
+    const bool with_constraints = constrained(a);
+    if (with_constraints && state->prefix_stride > 0 && !state->prefixes) return DBS_CUDA_STATUS_INVALID_ARGUMENT;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    const DecodePlan plan = make_plan(a, state->prefix_stride);
+    Workspace ws(workspace, workspace_bytes, plan.total_bytes, stream);
+    if (!ws.ok()) return ws.status();
+
+    const int rc = validate_per_example(a, ws.at<int>(plan.status_offset), stream);
+    if (rc != DBS_CUDA_STATUS_OK) return rc;
+    if (outputs->invalid_input &&
+        cudaMemsetAsync(outputs->invalid_input, 0, static_cast<size_t>(a.batch_size), stream) != cudaSuccess) {
+        return DBS_CUDA_STATUS_LAUNCH_FAILED;
+    }
+
+    ScanParams params{};
+    params.a = a;
+    params.log_probs = log_probs;
+    params.invalid = outputs->invalid_input;
+    ConstraintState cons{};
+    if (with_constraints) {
+        if (!prepare_constraints(plan, a, ws, stream, cons, params)) return DBS_CUDA_STATUS_LAUNCH_FAILED;
+        cons.prefix = state->prefixes;
+        cons.prefix_len = state->lengths;  // live beams' prefixes are exactly their hypotheses
+    }
+    const PrefixBuffers no_prefixes{};  // the caller tracks the prefixes
+    launch_step(plan, params, with_constraints ? &cons : nullptr, no_prefixes, 0, state->raw_scores, state->lengths,
+                state->finished, ws.at<uint64_t>(plan.keys0_offset), ws.at<uint64_t>(plan.keys1_offset),
+                step_outputs(*outputs), stream);
+    if (outputs->final_scores) {
+        const int64_t beams = static_cast<int64_t>(a.batch_size) * a.beam_size;
+        DBS_LAUNCH(finalize_kernel, dim3(static_cast<unsigned int>(ceil_div(beams, kThreads))), dim3(kThreads), stream,
+                   a, state->raw_scores, state->lengths, outputs->final_scores, outputs->final_raw_scores,
+                   outputs->final_lengths);
+    }
     return finish(stream);
 }
 

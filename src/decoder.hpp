@@ -104,6 +104,31 @@ public:
         float* final_raw_scores,
         int32_t* final_lengths) const;
 
+    // One step of the search from an explicit state, for callers that run the
+    // search loop themselves. `rows` is the step's [K, V] log-probabilities
+    // (row k extends beam k). raw_scores, lengths and finished ([K] each) hold
+    // the beams after step - 1 and are updated in place; before step 0 they are
+    // {0, -inf, ...}, zeros and zeros. Row k of `prefixes` (rows prefix_stride
+    // tokens apart) starts with the lengths[k] tokens of beam k's hypothesis; it
+    // is read only with n-gram blocking or a repetition penalty, and tokens
+    // outside the vocabulary are ignored. The step's beams are written to `out`
+    // ([K] arrays; the pool outputs must be null), and, if final_scores is not
+    // null, their final scores ([K], as decode() computes them after its last
+    // step). Stepping from the initial state through the rows of a [T, K, V]
+    // tensor gives exactly decode().
+    void step(
+        const float* rows,
+        int vocab_size,
+        int step,
+        const DecodeConstraints* constraints,
+        float* raw_scores,
+        int32_t* lengths,
+        uint8_t* finished,
+        const int32_t* prefixes,
+        int prefix_stride,
+        const TraceOutputs& out,
+        float* final_scores = nullptr) const;
+
     // Runs the search one step at a time, asking `step_fn` for each step's
     // [K, V] rows given the current beams. O(T) model calls.
     DecodeResult decode_model_steps(
