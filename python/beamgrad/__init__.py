@@ -19,7 +19,7 @@ search and returns differentiable scores of the beams it found.
 
 from ._options import CUDA_MAX_BEAM, BeamOptions
 from ._search import BeamSearchResult, BeamState, beam_search
-from ._torch import BeamSearchOutput, backtrack, cuda_available, decode, final_scores
+from ._torch import BeamSearchOutput, backtrack, cuda_available, decode, final_scores, length_penalty
 from ._version import __version__
 
 __all__ = [
@@ -34,4 +34,5 @@ __all__ = [
     "cuda_available",
     "decode",
     "final_scores",
+    "length_penalty",
 ]

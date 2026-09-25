@@ -10,7 +10,8 @@
 //     banned/forced tokens, min length) against a direct reference
 //     implementation that checks every candidate token against the prefix;
 //   * input validation covers exactly the rows the search reads;
-//   * the length penalty matches pow() and stays defined for huge exponents.
+//   * the length penalty matches pow() and stays defined for huge exponents;
+//   * the per-slot path gradient scatters to exactly the dense gradient.
 #include "decoder.hpp"
 
 #include "check.hpp"
@@ -609,6 +610,49 @@ void test_step_matches_decode() {
     std::cout << "  step interface: " << cases << " stepped decodes equal decode()\n";
 }
 
+void test_path_gradient_matches_dense() {
+    // Scattering the per-slot path gradient into a zero [T, K, V] tensor gives
+    // exactly the dense final-score gradient.
+    for (int trial = 0; trial < 400; ++trial) {
+        BeamOptions opt;
+        opt.beam_size = uniform_int(1, 6);
+        const int K = opt.beam_size;
+        const int V = uniform_int(2, 30);
+        const int T = uniform_int(1, 8);
+        opt.eos_token = uniform_int(0, 2) == 0 ? -1 : uniform_int(0, V - 1);
+        opt.length_penalty_alpha = uniform_int(0, 1) ? 0.0f : uniform_float(0.1f, 1.5f);
+        opt.validate_inputs = 0;
+        std::vector<float> x(static_cast<size_t>(T) * K * V);
+        for (float& v : x) v = uniform_int(0, 9) == 0 ? -kInf : -0.25f * static_cast<float>(uniform_int(0, 12));
+        const DecodeResult r = BeamSearchDecoder(opt).decode(x.data(), T, V);
+        std::vector<float> g(static_cast<size_t>(K));
+        for (float& v : g) v = uniform_float(-2.0f, 2.0f);
+        TraceView trace;
+        trace.steps = T;
+        trace.beam_size = K;
+        trace.vocab_size = V;
+        trace.length_penalty_alpha = opt.length_penalty_alpha;
+        trace.parents = r.parents.data();
+        trace.tokens = r.tokens.data();
+        trace.lengths = r.lengths.data();
+        trace.from_logprob = r.from_logprob.data();
+        std::vector<float> dense(x.size(), 0.0f), draws(static_cast<size_t>(T) * K, 1.0f), scattered(x.size(), 0.0f);
+        final_scores_backward_into(trace, g.data(), dense.data());
+        final_scores_path_gradient(trace, g.data(), draws.data());
+        for (int t = 0; t < T; ++t) {
+            for (int k = 0; k < K; ++k) {
+                const size_t s = static_cast<size_t>(t) * K + k;
+                if (r.parents[s] < 0 || !r.from_logprob[s]) {
+                    CHECK(draws[s] == 0.0f);
+                    continue;
+                }
+                scattered[(static_cast<size_t>(t) * K + r.parents[s]) * V + r.tokens[s]] += draws[s];
+            }
+        }
+        CHECK(same_floats(scattered, dense));
+    }
+}
+
 void test_length_penalty() {
     // Within one float ulp of pow() on the exponents and lengths decoders use.
     for (float alpha : {0.1f, 0.25f, 0.5f, 0.6f, 0.7f, 1.0f, 1.3f, 2.0f, 3.7f}) {
@@ -645,6 +689,7 @@ int main() {
     test_model_steps_match_tensor_decode();
     test_length_penalty();
     test_step_matches_decode();
+    test_path_gradient_matches_dense();
     std::cout << "dbs_internal_tests passed\n";
     return 0;
 }

@@ -458,25 +458,37 @@ BackwardInputs inputs_from(const DecodeResult& fwd) {
     return in;
 }
 
+// Where a backward pass puts the gradient of a log-prob entry: `index` is its
+// flattened [T, K, V] position, `slot` the selected beam (t * K + k) it came
+// from, or -1 for a relaxed-pool candidate.
 struct DenseSink {
     float* grad;
-    void add(int64_t index, float value) const { grad[index] += value; }
+    void add(int64_t index, int64_t, float value) const { grad[index] += value; }
 };
 
 struct SparseSink {
     std::vector<SparseGradEntry>* entries;
-    void add(int64_t index, float value) const { entries->push_back(SparseGradEntry{index, value}); }
+    void add(int64_t index, int64_t, float value) const { entries->push_back(SparseGradEntry{index, value}); }
+};
+
+// One value per selected beam: distinct beams of a step have distinct entries,
+// so this is the dense gradient restricted to the entries the beams used.
+struct SlotSink {
+    float* draws;
+    void add(int64_t, int64_t slot, float value) const {
+        if (slot >= 0) draws[slot] = value;
+    }
 };
 
 // A candidate's raw-score gradient flows to its parent beam and, unless it was
 // carried forward, to the log-prob entry that produced it.
 template <class Sink>
 void scatter(const BackwardInputs& in, const Sink& sink, float* prev_raw_grad, int t, int parent, int token,
-             uint8_t from_logprob, float draw) {
+             uint8_t from_logprob, float draw, int64_t slot) {
     if (parent < 0 || draw == 0.0f) return;
     prev_raw_grad[parent] += draw;
     if (from_logprob && token >= 0) {
-        sink.add((static_cast<int64_t>(t) * in.K + parent) * static_cast<int64_t>(in.V) + token, draw);
+        sink.add((static_cast<int64_t>(t) * in.K + parent) * static_cast<int64_t>(in.V) + token, slot, draw);
     }
 }
 
@@ -521,7 +533,8 @@ void run_backward(
             const int len = std::max(1, static_cast<int>(in.lengths[idx]));
             const float inv_penalty = 1.0f / gnmt_length_penalty(len, in.alpha);
             const float draw = next_raw_grad[static_cast<size_t>(k)] + drank * inv_penalty;
-            scatter(in, sink, prev_raw_grad.data(), t, parent, in.tokens[idx], in.from_logprob[idx], draw);
+            scatter(in, sink, prev_raw_grad.data(), t, parent, in.tokens[idx], in.from_logprob[idx], draw,
+                    static_cast<int64_t>(idx));
         }
 
         // Relaxed pool: implicit differentiation through the bisection threshold.
@@ -548,7 +561,7 @@ void run_backward(
                     if (drank == 0.0f) continue;
                     const int len = std::max(1, static_cast<int>(in.pool_lengths[idx]));
                     const float inv_penalty = 1.0f / gnmt_length_penalty(len, in.alpha);
-                    scatter(in, sink, prev_raw_grad.data(), t, parent, in.pool_tokens[idx], in.pool_from_logprob[idx],
+                    scatter(in, sink, prev_raw_grad.data(), t, parent, in.pool_tokens[idx], in.pool_from_logprob[idx], -1,
                             drank * inv_penalty);
                 }
             }
@@ -774,13 +787,16 @@ BackwardResult BeamSearchDecoder::backward_sparse(
     return out;
 }
 
-void final_scores_backward_into(const TraceView& trace, const float* grad_final_scores, float* grad_log_probs) {
+namespace {
+
+// Backward inputs of a trace, after checking that its indexes stay in range.
+BackwardInputs trusted_trace(const TraceView& trace, const float* grad_final_scores, const void* out) {
     const int T = trace.steps;
     const int K = trace.beam_size;
     const int V = trace.vocab_size;
     if (T <= 0 || K <= 0 || V <= 0) throw std::invalid_argument("trace dimensions must be positive");
-    if (!trace.parents || !trace.tokens || !trace.lengths || !trace.from_logprob || !grad_final_scores || !grad_log_probs) {
-        throw std::invalid_argument("trace, grad_final_scores and grad_log_probs cannot be null");
+    if (!trace.parents || !trace.tokens || !trace.lengths || !trace.from_logprob || !grad_final_scores || !out) {
+        throw std::invalid_argument("trace, grad_final_scores and the output cannot be null");
     }
     const size_t n = static_cast<size_t>(T) * static_cast<size_t>(K);
     for (size_t i = 0; i < n; ++i) {
@@ -799,8 +815,22 @@ void final_scores_backward_into(const TraceView& trace, const float* grad_final_
     in.tokens = trace.tokens;
     in.lengths = trace.lengths;
     in.from_logprob = trace.from_logprob;
+    return in;
+}
+
+} // namespace
+
+void final_scores_backward_into(const TraceView& trace, const float* grad_final_scores, float* grad_log_probs) {
+    const BackwardInputs in = trusted_trace(trace, grad_final_scores, grad_log_probs);
     AlignedFloatVector grad_initial;
     run_backward(in, nullptr, nullptr, grad_final_scores, DenseSink{grad_log_probs}, grad_initial);
+}
+
+void final_scores_path_gradient(const TraceView& trace, const float* grad_final_scores, float* draws) {
+    const BackwardInputs in = trusted_trace(trace, grad_final_scores, draws);
+    std::fill(draws, draws + static_cast<size_t>(in.T) * static_cast<size_t>(in.K), 0.0f);
+    AlignedFloatVector grad_initial;
+    run_backward(in, nullptr, nullptr, grad_final_scores, SlotSink{draws}, grad_initial);
 }
 
 } // namespace dbs

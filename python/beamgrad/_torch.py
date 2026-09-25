@@ -153,6 +153,18 @@ def _decode_step_fake(
     )
 
 
+@torch.library.register_fake("beamgrad::length_penalty")
+def _length_penalty_fake(lengths, length_penalty_alpha):
+    return lengths.new_empty(lengths.shape, dtype=torch.float32)
+
+
+@torch.library.register_fake("beamgrad::final_scores_path_gradient")
+def _final_scores_path_gradient_fake(
+    grad_final, parents, tokens, lengths, from_logprob, steps, vocab_size, length_penalty_alpha
+):
+    return grad_final.new_empty(parents.shape, dtype=torch.float32)
+
+
 @torch.library.register_fake("beamgrad::final_scores_backward")
 def _final_scores_backward_fake(
     grad_final, parents, tokens, lengths, from_logprob, steps, vocab_size, length_penalty_alpha
@@ -347,6 +359,19 @@ class _FinalScores(torch.autograd.Function):
             ctx.length_penalty_alpha,
         )
         return grad, None, None, None
+
+
+def length_penalty(lengths: torch.Tensor, alpha: float) -> torch.Tensor:
+    """The GNMT length penalty ``((5 + max(length, 1)) / 6) ** alpha``, as float32.
+
+    Bit for bit the value the search divides raw scores by, on CPU or CUDA, so
+    a reference sequence's score can be put on the scale of the beams' scores:
+    ``gold_log_prob / length_penalty(gold_length, options.length_penalty_alpha)``.
+    """
+    alpha = float(alpha)
+    if not torch.is_tensor(lengths):
+        lengths = torch.as_tensor(lengths)
+    return torch.ops.beamgrad.length_penalty(lengths, alpha)
 
 
 def final_scores(log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike = None) -> torch.Tensor:

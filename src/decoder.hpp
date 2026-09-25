@@ -160,4 +160,11 @@ private:
 // grad_log_probs [T, K, V]. Checks that the trace indexes stay in range.
 void final_scores_backward_into(const TraceView& trace, const float* grad_final_scores, float* grad_log_probs);
 
+// The same gradient restricted to the entries the selected beams used: draws
+// [T, K] gets, for slot k of step t, the gradient of its log-prob entry (0 for
+// carried-forward and dead slots). Scattering draws[t, k] to entry
+// (t, parents[t, k], tokens[t, k]) of a zero [T, K, V] tensor gives exactly
+// final_scores_backward_into's result.
+void final_scores_path_gradient(const TraceView& trace, const float* grad_final_scores, float* draws);
+
 } // namespace dbs

@@ -267,11 +267,63 @@ Tensor final_scores_backward_cuda(
     return grad;
 }
 
+Tensor final_scores_path_gradient_cuda(
+    const Tensor& grad_final,
+    const Tensor& parents,
+    const Tensor& tokens,
+    const Tensor& lengths,
+    const Tensor& from_logprob,
+    const c10::optional<Tensor>& steps,
+    int64_t vocab_size,
+    double length_penalty_alpha) {
+    TORCH_CHECK(parents.is_cuda(), "beamgrad::final_scores_path_gradient (CUDA) expects CUDA tensors");
+    TORCH_CHECK_VALUE(parents.dim() == 3 && parents.scalar_type() == torch::kInt32, "parents must be an int32 [B, T, K] tensor");
+    const c10::cuda::CUDAGuard guard(parents.device());
+    const int64_t B = parents.size(0), T = parents.size(1), K = parents.size(2);
+    for (const Tensor* t : {&tokens, &lengths}) {
+        TORCH_CHECK_VALUE(t->device() == parents.device() && t->sizes() == parents.sizes() && t->scalar_type() == torch::kInt32,
+                          "tokens and lengths must be int32 [B, T, K] tensors on the same device");
+    }
+    TORCH_CHECK_VALUE(from_logprob.device() == parents.device() && from_logprob.sizes() == parents.sizes() &&
+                          from_logprob.scalar_type() == torch::kUInt8,
+                      "from_logprob must be a uint8 [B, T, K] tensor on the same device");
+    TORCH_CHECK_VALUE(grad_final.device() == parents.device() && grad_final.scalar_type() == torch::kFloat32 &&
+                          grad_final.dim() == 2 && grad_final.size(0) == B && grad_final.size(1) == K,
+                      "grad_final must be a float32 [B, K] tensor on the same device");
+    const Tensor par = parents.contiguous(), tok = tokens.contiguous(), len = lengths.contiguous();
+    const Tensor flp = from_logprob.contiguous(), g = grad_final.contiguous();
+    const c10::optional<Tensor> steps_i32 = device_steps(steps, par, B, T);
+    const DBSCudaDecodeArgs args = make_args(B, T, K, vocab_size, -1, 0, length_penalty_alpha, steps_i32);
+
+    Tensor draws = torch::empty({B, T, K}, g.options());
+    check_status(dbs_cuda_path_gradient(&args, par.data_ptr<int32_t>(), tok.data_ptr<int32_t>(), len.data_ptr<int32_t>(),
+                                        flp.data_ptr<uint8_t>(), g.data_ptr<float>(), draws.data_ptr<float>(),
+                                        at::cuda::getCurrentCUDAStream().stream()),
+                 "path gradient");
+    return draws;
+}
+
+Tensor length_penalty_cuda(const Tensor& lengths, double alpha) {
+    TORCH_CHECK(lengths.is_cuda(), "beamgrad::length_penalty (CUDA) expects a CUDA tensor");
+    TORCH_CHECK_VALUE(!lengths.is_floating_point() && !lengths.is_complex() && lengths.scalar_type() != torch::kBool,
+                      "lengths must be an integer tensor");
+    TORCH_CHECK_VALUE(std::isfinite(alpha) && alpha >= 0.0, "length_penalty_alpha must be finite and non-negative");
+    const c10::cuda::CUDAGuard guard(lengths.device());
+    const Tensor len = lengths.clamp(0, kIntMax).to(torch::kInt32).contiguous();
+    Tensor out = torch::empty(len.sizes(), len.options().dtype(torch::kFloat32));
+    check_status(dbs_cuda_length_penalty(len.data_ptr<int32_t>(), len.numel(), static_cast<float>(alpha),
+                                         out.data_ptr<float>(), at::cuda::getCurrentCUDAStream().stream()),
+                 "length penalty");
+    return out;
+}
+
 } // namespace
 
 TORCH_LIBRARY_IMPL(beamgrad, CUDA, m) {
     m.impl("decode", &decode_cuda);
     m.impl("final_scores_backward", &final_scores_backward_cuda);
+    m.impl("final_scores_path_gradient", &final_scores_path_gradient_cuda);
+    m.impl("length_penalty", &length_penalty_cuda);
     m.impl("decode_step", &decode_step_cuda);
 }
 

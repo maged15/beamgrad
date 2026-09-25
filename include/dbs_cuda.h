@@ -175,6 +175,25 @@ DBS_CUDA_EXPORT int dbs_cuda_backward(
     int64_t workspace_bytes,
     void* stream);
 
+/* out[i] = ((5 + max(lengths[i], 1)) / 6)^alpha, the GNMT length penalty,
+ * bit for bit as the search computes it on the CPU and the GPU. */
+DBS_CUDA_EXPORT int dbs_cuda_length_penalty(const int32_t* lengths, int64_t count, float alpha, float* out, void* stream);
+
+/* The same gradient restricted to the entries the selected beams used: draws
+ * [B, T, K] gets, for slot k of step t, the gradient of the log-prob entry it
+ * used (0 for carried-forward and dead slots). Scattering draws[b, t, k] to
+ * entry (b, t, parents[b, t, k], tokens[b, t, k]) of a zero [B, T, K, V]
+ * tensor gives exactly dbs_cuda_backward's result, without materialising it. */
+DBS_CUDA_EXPORT int dbs_cuda_path_gradient(
+    const DBSCudaDecodeArgs* args,
+    const int32_t* parents,
+    const int32_t* tokens,
+    const int32_t* lengths,
+    const uint8_t* from_logprob,
+    const float* grad_final_scores,
+    float* draws,
+    void* stream);
+
 #ifdef __cplusplus
 }
 #endif

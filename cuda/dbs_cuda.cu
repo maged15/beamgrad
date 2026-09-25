@@ -810,6 +810,13 @@ __global__ void finalize_kernel(
     if (final_lengths) final_lengths[i] = length;
 }
 
+// One thread per entry: the GNMT length penalty of each length, as the search uses it.
+__global__ void length_penalty_kernel(const int32_t* __restrict__ lengths, int64_t count, float alpha,
+                                      float* __restrict__ out) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i < count) out[i] = length_penalty(lengths[i], alpha);
+}
+
 // grid = (B). Mirrors the CPU backward with only grad_final_scores supplied.
 // Per step, each thread handles some beams: it computes the beam's raw-score
 // gradient, writes its log-prob entry (distinct beams of a step have distinct
@@ -822,7 +829,8 @@ __global__ void backward_kernel(
     const int32_t* __restrict__ lengths,
     const uint8_t* __restrict__ from_logprob,
     const float* __restrict__ grad_final_scores,
-    float* __restrict__ grad_log_probs) {
+    float* __restrict__ grad_log_probs,
+    float* __restrict__ draws) {
     __shared__ float grad_a[kMaxBeam];
     __shared__ float grad_b[kMaxBeam];
     __shared__ float draw[kMaxBeam];
@@ -856,8 +864,12 @@ __global__ void backward_kernel(
                     if (d != 0.0f) {
                         const int token = tokens[slot];
                         if (from_logprob[slot] && token >= 0 && token < V) {
-                            const int64_t g = ((static_cast<int64_t>(b) * a.steps + t) * K + parent) * V + token;
-                            grad_log_probs[g] = __fadd_rn(grad_log_probs[g], d);
+                            if (draws) {
+                                draws[slot] = d;  // the entry's gradient, kept per slot
+                            } else {
+                                const int64_t g = ((static_cast<int64_t>(b) * a.steps + t) * K + parent) * V + token;
+                                grad_log_probs[g] = __fadd_rn(grad_log_probs[g], d);
+                            }
                         }
                         key = static_cast<uint32_t>(parent) * static_cast<uint32_t>(Kb) + static_cast<uint32_t>(k);
                     }
@@ -1345,6 +1357,39 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_backward(
     const DBSCudaDecodeArgs& a = *args;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     DBS_LAUNCH(backward_kernel, dim3(static_cast<unsigned int>(a.batch_size)), dim3(kBackwardThreads), stream,
-               a, parents, tokens, lengths, from_logprob, grad_final_scores, grad_log_probs);
+               a, parents, tokens, lengths, from_logprob, grad_final_scores, grad_log_probs, static_cast<float*>(nullptr));
+    return finish(stream);
+}
+
+extern "C" DBS_CUDA_EXPORT int dbs_cuda_length_penalty(
+    const int32_t* lengths, int64_t count, float alpha, float* out, void* stream_ptr) {
+    if (count < 0 || (count > 0 && (!lengths || !out)) || !std::isfinite(alpha) || alpha < 0.0f) {
+        return DBS_CUDA_STATUS_INVALID_ARGUMENT;
+    }
+    if (count == 0) return DBS_CUDA_STATUS_OK;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    DBS_LAUNCH(length_penalty_kernel, dim3(static_cast<unsigned int>(ceil_div(count, kThreads))), dim3(kThreads), stream,
+               lengths, count, alpha, out);
+    return finish(stream);
+}
+
+extern "C" DBS_CUDA_EXPORT int dbs_cuda_path_gradient(
+    const DBSCudaDecodeArgs* args,
+    const int32_t* parents,
+    const int32_t* tokens,
+    const int32_t* lengths,
+    const uint8_t* from_logprob,
+    const float* grad_final_scores,
+    float* draws,
+    void* stream_ptr) {
+    if (!valid_args(args) || !parents || !tokens || !lengths || !from_logprob || !grad_final_scores || !draws) {
+        return DBS_CUDA_STATUS_INVALID_ARGUMENT;
+    }
+    const DBSCudaDecodeArgs& a = *args;
+    cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
+    const size_t slots = static_cast<size_t>(a.batch_size) * a.steps * a.beam_size;
+    if (cudaMemsetAsync(draws, 0, slots * sizeof(float), stream) != cudaSuccess) return DBS_CUDA_STATUS_LAUNCH_FAILED;
+    DBS_LAUNCH(backward_kernel, dim3(static_cast<unsigned int>(a.batch_size)), dim3(kBackwardThreads), stream,
+               a, parents, tokens, lengths, from_logprob, grad_final_scores, static_cast<float*>(nullptr), draws);
     return finish(stream);
 }

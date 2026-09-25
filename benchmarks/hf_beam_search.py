@@ -30,6 +30,7 @@ import time
 import torch
 
 import beamgrad
+from beamgrad.hf import CausalLMStep
 
 PROMPTS = [
     "The capital of France is",
@@ -41,52 +42,6 @@ PROMPTS = [
     "To make a cup of tea, first",
     "The largest planet in the solar system is",
 ]
-
-
-class CausalLMStep:
-    """A beamgrad step function for a Hugging Face causal LM.
-
-    Step 0 runs the (left-padded) prompts, replicated for each beam slot; later
-    steps feed each beam's last token. The key/value cache is reordered by
-    `beams.parents` before every step, so each slot continues the right
-    hypothesis. Rows are float32 log-softmaxed logits, as `generate` uses.
-    """
-
-    def __init__(self, model, input_ids: torch.Tensor, attention_mask: torch.Tensor, beams: int):
-        self.model = model
-        self.B, self.K = input_ids.shape[0], beams
-        self.input_ids = input_ids.repeat_interleave(beams, 0)
-        self.mask = attention_mask.repeat_interleave(beams, 0)
-        self.cache = None
-
-    def __call__(self, beams: beamgrad.BeamState) -> torch.Tensor:
-        # Model inputs as generate() prepares them (positions, cache positions), so
-        # that the logits are the same in low precision too.
-        if beams.step == 0:
-            positions = (self.mask.cumsum(-1) - 1).masked_fill(self.mask == 0, 1)
-            out = self.model(
-                input_ids=self.input_ids,
-                attention_mask=self.mask,
-                position_ids=positions,
-                cache_position=torch.arange(self.mask.shape[1], device=self.mask.device),
-                use_cache=True,
-                logits_to_keep=1,
-            )
-        else:
-            slots = torch.arange(self.B, device=beams.parents.device)[:, None] * self.K
-            self.cache.reorder_cache((slots + beams.parents.clamp(min=0)).flatten())
-            self.mask = torch.cat([self.mask, self.mask.new_ones(self.mask.shape[0], 1)], dim=1)
-            out = self.model(
-                input_ids=beams.tokens.clamp(min=0).view(-1, 1),
-                attention_mask=self.mask,
-                position_ids=self.mask.sum(-1, keepdim=True) - 1,
-                cache_position=torch.tensor([self.mask.shape[1] - 1], device=self.mask.device),
-                past_key_values=self.cache,
-                use_cache=True,
-                logits_to_keep=1,
-            )
-        self.cache = out.past_key_values
-        return out.logits[:, -1].float().log_softmax(-1).view(self.B, self.K, -1)
 
 
 def timed(fn, repeats: int):

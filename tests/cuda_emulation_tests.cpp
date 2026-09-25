@@ -207,6 +207,17 @@ int run_case(const Case& c, uint32_t seed) {
     std::vector<float> grad(x.size(), 0.0f);
     CHECK(dbs_cuda_backward(&args, g.parents.data(), g.tokens.data(), g.lengths.data(), g.from_logprob.data(),
                             grad_final.data(), grad.data(), nullptr, 0, nullptr) == DBS_CUDA_STATUS_OK);
+    // The per-slot path gradient scatters to exactly the dense gradient.
+    std::vector<float> draws(BTK, 7.0f);
+    CHECK(dbs_cuda_path_gradient(&args, g.parents.data(), g.tokens.data(), g.lengths.data(), g.from_logprob.data(),
+                                 grad_final.data(), draws.data(), nullptr) == DBS_CUDA_STATUS_OK);
+    std::vector<float> scattered(x.size(), 0.0f);
+    for (size_t s = 0; s < BTK; ++s) {
+        if (g.parents[s] < 0 || !g.from_logprob[s]) continue;
+        const size_t bt = s / static_cast<size_t>(c.K);
+        scattered[(bt * c.K + static_cast<size_t>(g.parents[s])) * c.V + static_cast<size_t>(g.tokens[s])] += draws[s];
+    }
+    const bool path_ok = std::memcmp(scattered.data(), grad.data(), grad.size() * sizeof(float)) == 0;
 
     int mismatches = 0;
     auto report = [&](const char* what, int b, int t, int k) {
@@ -317,6 +328,10 @@ int run_case(const Case& c, uint32_t seed) {
         dbs_free_backward(bw);
         dbs_free_result(r);
         dbs_destroy(h);
+    }
+    if (!path_ok) {
+        std::fprintf(stderr, "  path gradient differs from the dense gradient (B=%d T=%d K=%d V=%d)\n", c.B, c.T, c.K, c.V);
+        ++mismatches;
     }
     // The step interface has no per-example step counts.
     if (!c.variable) mismatches += check_step_api(c, x, args, g, invalid);
