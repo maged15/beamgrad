@@ -2,6 +2,16 @@
 
 ## Unreleased
 
+### Added
+
+- `losses.structured_margin(..., eos_token=)`: when given (and `>= 0`),
+  warns with the row numbers of references that do not end with that EOS.
+  A finished beam ends with the EOS it emitted, so such a reference never
+  matches a beam. Its own copy among the beams then becomes the rival, and
+  the loss can never reach zero. The requirement (references and
+  `sequence_scores` lengths include the EOS) is now documented. The default
+  (`None`) behaves as before.
+
 ### Fixed
 
 - The relaxed top-k pool's weights did not sum to `K` when the scores were

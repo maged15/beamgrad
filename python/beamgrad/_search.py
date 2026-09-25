@@ -206,6 +206,12 @@ def sequence_scores(token_log_probs: torch.Tensor, lengths: torch.Tensor, option
     Returns the summed log-probability divided by the length penalty, with the
     penalty the search uses, so for example a reference sequence can be
     compared with the beams in a structured-margin loss. Differentiable.
+
+    With ``options.eos_token >= 0`` a finished beam's length counts the EOS it
+    emitted, and that token's log-probability is part of its score. So a
+    reference must end with the EOS, and its length and log-probabilities
+    must include it, to be on the same scale (and to be recognised by
+    :func:`beamgrad.losses.structured_margin`).
     """
     if not isinstance(options, BeamOptions):
         raise TypeError(f"options must be a beamgrad.BeamOptions, got {type(options).__name__}")
