@@ -264,12 +264,41 @@ def test_steps_per_example():
         {"beam_size": 2, "min_length": -1},
         {"beam_size": 2, "length_penalty_alpha": -0.5},
         {"beam_size": 2, "length_penalty_alpha": float("nan")},
+        {"beam_size": 2, "length_penalty_alpha": "0.6"},
+        {"beam_size": 2, "length_penalty_alpha": True},
+        {"beam_size": 2, "length_penalty_alpha": 10**400},
+        {"beam_size": 2, "repetition_penalty": "1.5"},
         {"beam_size": 2, "validate_inputs": 1},
     ],
 )
 def test_invalid_options(kwargs):
     with pytest.raises(ValueError):
         BeamOptions(**kwargs)
+
+
+def test_options_are_stored_as_plain_python_values():
+    np = pytest.importorskip("numpy")
+    options = BeamOptions(
+        beam_size=np.int64(3),
+        eos_token=np.int32(2),
+        min_length=np.int16(1),
+        length_penalty_alpha=np.float32(0.5),
+        banned_tokens=np.array([4, 5]),
+        no_repeat_ngram_size=np.uint8(2),
+        repetition_penalty=2,
+    )
+    assert options == BeamOptions(3, 2, 1, 0.5, True, (4, 5), 2, 2.0)
+    for name in ("beam_size", "eos_token", "min_length", "no_repeat_ngram_size"):
+        assert type(getattr(options, name)) is int, name
+    assert type(options.length_penalty_alpha) is float and type(options.repetition_penalty) is float
+    assert all(type(t) is int for t in options.banned_tokens)
+    assert BeamOptions(beam_size=2, banned_tokens=torch.tensor([7, 1])).banned_tokens == (7, 1)
+    with pytest.raises(ValueError, match="banned_tokens"):
+        BeamOptions(beam_size=2, banned_tokens=np.array([1.0, 2.0]))
+    # The options work everywhere, including the C library's struct.
+    x = random_log_probs(4, 3, 9)
+    assert torch.equal(final_scores(x, options), final_scores(x, BeamOptions(3, 2, 1, 0.5, True, (4, 5), 2, 2.0)))
+    assert options_to_c(options).beam_size == 3
 
 
 def test_invalid_inputs():

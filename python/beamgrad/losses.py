@@ -82,6 +82,11 @@ def structured_margin(
         reduction: ``"mean"``, ``"sum"`` or ``"none"``.
     """
     scores, sequences = _batched(result)
+    B = scores.shape[0]
+    reference_scores = torch.as_tensor(reference_scores)
+    # [B, 1] would broadcast against the [B] rivals into a [B, B] loss.
+    if tuple(reference_scores.shape) != (B,) and not (result.scores.dim() == 1 and reference_scores.dim() == 0):
+        raise ValueError(f"reference_scores must have shape [B] = [{B}], got {tuple(reference_scores.shape)}")
     rivals = scores.masked_fill(matches(sequences, reference), float("-inf"))
     best_rival = rivals.amax(1)
     loss = torch.relu(margin + best_rival - reference_scores)
@@ -100,7 +105,8 @@ def minimum_risk(
 
     ``costs[b, k]`` is the cost of beam ``k`` (e.g. 1 - BLEU against the
     reference; no gradient needed). Dead beams (``-inf`` scores) get no
-    probability. Lower temperatures concentrate the distribution on the best
+    probability and their costs are ignored, so any value, even NaN, will do
+    there. Lower temperatures concentrate the distribution on the best
     beams; Shen et al. (2016) sharpen with ``temperature = 1 / 5e-3`` on
     unnormalised log-probabilities.
     """
@@ -116,5 +122,7 @@ def minimum_risk(
     # and backward; give it constant logits instead and no loss.
     logits = torch.where(any_live, logits, torch.zeros_like(logits))
     probs = torch.softmax(logits, dim=-1)
-    loss = (probs * costs.to(probs.dtype)).sum(-1) * any_live[:, 0]
+    # Masked rather than multiplied by their zero probability: 0 * NaN is NaN.
+    costs = torch.where(live, costs.to(probs), 0.0)
+    loss = (probs * costs).sum(-1) * any_live[:, 0]
     return _reduce(loss, reduction)

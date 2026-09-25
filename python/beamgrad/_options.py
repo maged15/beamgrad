@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import math
+import numbers
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -15,8 +16,21 @@ CUDA_MAX_BEAM = 1024
 INT32_MAX = 2**31 - 1
 
 
+# numbers.Integral and numbers.Real include NumPy's scalar types. bool is an
+# int subclass, but True is not a count or an exponent.
 def _is_int(value) -> bool:
-    return isinstance(value, int) and not isinstance(value, bool)
+    return isinstance(value, numbers.Integral) and not isinstance(value, bool)
+
+
+def _finite_float(value) -> float | None:
+    """``value`` as a float if it is a finite real number, else ``None``."""
+    if not isinstance(value, numbers.Real) or isinstance(value, bool):
+        return None
+    try:
+        result = float(value)
+    except OverflowError:  # an int beyond the float range
+        return None
+    return result if math.isfinite(result) else None
 
 
 @dataclass(frozen=True)
@@ -47,7 +61,8 @@ class BeamOptions:
         repetition_penalty: Values above 1 subtract ``log(repetition_penalty)``
             from the log-probability of every token already in the beam's
             prefix. The gradient of such a token's entry is unchanged (the
-            penalty is a constant shift).
+            penalty is a constant shift). Values in ``(0, 1]`` disable it
+            (unlike ``transformers``, values below 1 do not favour repeats).
     """
 
     beam_size: int
@@ -60,30 +75,41 @@ class BeamOptions:
     repetition_penalty: float = 1.0
 
     def __post_init__(self) -> None:
+        # Every field is checked, then stored as a plain int, float or tuple of
+        # ints, so NumPy scalars are accepted and nothing else leaks through.
         if not _is_int(self.beam_size) or not 1 <= self.beam_size <= INT32_MAX:
             raise ValueError(f"beam_size must be a positive int (at most 2**31 - 1), got {self.beam_size!r}")
         if not _is_int(self.eos_token) or not -1 <= self.eos_token <= INT32_MAX:
             raise ValueError(f"eos_token must be -1 (disabled) or a token id, got {self.eos_token!r}")
         if not _is_int(self.min_length) or not 0 <= self.min_length <= INT32_MAX:
             raise ValueError(f"min_length must be a non-negative int (at most 2**31 - 1), got {self.min_length!r}")
-        alpha = float(self.length_penalty_alpha)
-        if not math.isfinite(alpha) or alpha < 0.0:
-            raise ValueError(f"length_penalty_alpha must be finite and non-negative, got {self.length_penalty_alpha!r}")
+        alpha = _finite_float(self.length_penalty_alpha)
+        if alpha is None or alpha < 0.0:
+            raise ValueError(
+                f"length_penalty_alpha must be a finite, non-negative number, got {self.length_penalty_alpha!r}"
+            )
         if not isinstance(self.validate_inputs, bool):
             raise ValueError(f"validate_inputs must be a bool, got {self.validate_inputs!r}")
         if self.banned_tokens is not None:
-            if isinstance(self.banned_tokens, (str, bytes)) or not isinstance(self.banned_tokens, Iterable):
+            banned = self.banned_tokens
+            if hasattr(banned, "tolist"):  # a NumPy array or a tensor
+                banned = banned.tolist()
+            if isinstance(banned, (str, bytes)) or not isinstance(banned, Iterable):
                 raise ValueError(f"banned_tokens must be a sequence of token ids, got {self.banned_tokens!r}")
-            banned = tuple(self.banned_tokens)
+            banned = tuple(banned)
             if any(not _is_int(t) or not 0 <= t <= INT32_MAX for t in banned):
-                raise ValueError(f"banned_tokens must hold non-negative token ids, got {banned!r}")
-            object.__setattr__(self, "banned_tokens", banned or None)
+                raise ValueError(f"banned_tokens must hold non-negative int token ids, got {banned!r}")
+            object.__setattr__(self, "banned_tokens", tuple(int(t) for t in banned) or None)
         if not _is_int(self.no_repeat_ngram_size) or not 0 <= self.no_repeat_ngram_size <= INT32_MAX:
             value = self.no_repeat_ngram_size
             raise ValueError(f"no_repeat_ngram_size must be a non-negative int (at most 2**31 - 1), got {value!r}")
-        penalty = float(self.repetition_penalty)
-        if not math.isfinite(penalty) or penalty <= 0.0:
-            raise ValueError(f"repetition_penalty must be finite and positive, got {self.repetition_penalty!r}")
+        penalty = _finite_float(self.repetition_penalty)
+        if penalty is None or penalty <= 0.0:
+            raise ValueError(f"repetition_penalty must be a finite, positive number, got {self.repetition_penalty!r}")
+        for name in ("beam_size", "eos_token", "min_length", "no_repeat_ngram_size"):
+            object.__setattr__(self, name, int(getattr(self, name)))
+        object.__setattr__(self, "length_penalty_alpha", alpha)
+        object.__setattr__(self, "repetition_penalty", penalty)
 
     def banned_ids(self, vocab_size: int) -> tuple[int, ...] | None:
         """The banned token ids, checked against ``vocab_size``, or ``None``."""

@@ -33,7 +33,10 @@ beamgrad.BeamOptions(
 )
 ```
 
-A frozen dataclass; invalid values raise `ValueError` on construction.
+A frozen dataclass; invalid values raise `ValueError` on construction. NumPy
+integer and float scalars are accepted, as are arrays or tensors of
+`banned_tokens`; every field is stored as a plain Python `int`, `float` or
+tuple of `int`s.
 
 `validate_inputs` raises `ValueError` if a row the search reads (the row of a
 live, unfinished beam, including banned or masked tokens) contains NaN or
@@ -45,6 +48,8 @@ known to be clean. `-inf` is always allowed and marks impossible tokens.
 The constraints work the same on CPU, CUDA and JAX.
 `repetition_penalty` subtracts `log(repetition_penalty)` from a repeated
 token's log-probability; that shift is a constant, so gradients are unchanged.
+Values in `(0, 1]` disable it: unlike `transformers`' `repetition_penalty`,
+values below 1 do not favour repeated tokens.
 
 ## `final_scores(log_probs, options, steps=None)`
 
@@ -207,15 +212,15 @@ scores. Differentiable.
 
 ## `length_penalty(lengths, alpha) -> Tensor`
 
-`((5 + lengths) / 6) ** alpha` in float32, bit-identical to the penalty the
-CPU and CUDA engines use.
+`((5 + max(lengths, 1)) / 6) ** alpha` in float32, bit-identical to the
+penalty the CPU and CUDA engines use.
 
 ## `beamgrad.losses`
 
 | function | loss |
 |---|---|
-| `structured_margin(result, reference, reference_scores, margin=1.0, reduction="mean")` | `max(0, margin + best non-reference beam's score − reference_scores)`; zero when the reference wins by the margin |
-| `minimum_risk(result, costs, temperature=1.0, reduction="mean")` | `Σ_k softmax(scores / temperature)_k · costs[:, k]`; dead beams get no probability, examples without live beams give 0 |
+| `structured_margin(result, reference, reference_scores, margin=1.0, reduction="mean")` | `max(0, margin + best non-reference beam's score − reference_scores)` with `reference_scores` of shape `[B]`; zero when the reference wins by the margin |
+| `minimum_risk(result, costs, temperature=1.0, reduction="mean")` | `Σ_k softmax(scores / temperature)_k · costs[:, k]`; dead beams get no probability and their costs are ignored (even NaN), examples without live beams give 0 |
 | `matches(sequences, reference)` | `[B, K]` bool, beam `k` equals the `-1`-padded reference `[B, T']` |
 
 ## `beamgrad.estimators`
@@ -244,7 +249,8 @@ import `transformers`):
   function. It runs the left-padded prompts once, then one token per beam per
   step, reordering the key/value cache by `beams.parents`. Its inputs match
   `generate()`'s, so a float32 model returns the same beams as
-  `generate(num_beams=K)`.
+  `generate(num_beams=K)`. Each search restarts from the prompts, so one
+  instance can drive several searches.
 - `CausalLMRescorer(model, input_ids, attention_mask, chunk_size=256,
   gradient_checkpointing=False)`: a `rescore_fn`. It runs one teacher-forced
   pass over prompt + beam and projects to the vocabulary in checkpointed

@@ -37,6 +37,8 @@ class CausalLMStep:
     the float32 log-softmax of the logits, as ``generate()`` computes them, and
     the model inputs match ``generate()``'s, so a float32 model gives the same
     beams as ``model.generate(num_beams=K)`` (see ``benchmarks/hf_beam_search.py``).
+    Every search starts over from the prompts at step 0, so one instance can
+    drive several searches.
 
     Args:
         model: The causal LM.
@@ -49,12 +51,14 @@ class CausalLMStep:
         self.model = model
         self.batch_size, self.beam_size = input_ids.shape[0], beam_size
         self.input_ids = input_ids.repeat_interleave(beam_size, 0)
-        self.mask = attention_mask.repeat_interleave(beam_size, 0)
+        self.prompt_mask = attention_mask.repeat_interleave(beam_size, 0)
+        self.mask = self.prompt_mask  # grows by one column per step
         self.cache = None
 
     def __call__(self, beams: BeamState) -> torch.Tensor:
         B, K = self.batch_size, self.beam_size
         if beams.step == 0:
+            self.mask, self.cache = self.prompt_mask, None  # the previous search's cache is freed first
             out = self.model(
                 input_ids=self.input_ids,
                 attention_mask=self.mask,

@@ -99,6 +99,19 @@ def test_structured_margin():
     assert not losses.matches(result.sequences, torch.cat([reference, reference[:, :1]], 1))[0, 0]
 
 
+def test_structured_margin_checks_the_reference_scores_shape():
+    result = search(random_log_probs(3, 4, 3, 7, seed=4), BeamOptions(beam_size=3))
+    reference = torch.full((3, 4), 6)
+    # [B, 1] (e.g. a keepdim sum) would broadcast into a [B, B] loss.
+    with pytest.raises(ValueError, match="reference_scores"):
+        losses.structured_margin(result, reference, torch.zeros(3, 1))
+    with pytest.raises(ValueError, match="reference_scores"):
+        losses.structured_margin(result, reference, torch.zeros(()))
+    unbatched = search(random_log_probs(4, 3, 7, seed=4), BeamOptions(beam_size=3))
+    loss = losses.structured_margin(unbatched, reference[:1], torch.tensor(-30.0), reduction="none")
+    assert loss.shape == (1,) and loss.item() > 0
+
+
 def test_minimum_risk_and_dead_examples():
     x = random_log_probs(2, 3, 4, 5, seed=5).requires_grad_(True)
     result = search(x, BeamOptions(beam_size=4))
@@ -112,6 +125,25 @@ def test_minimum_risk_and_dead_examples():
     dead = result._replace(scores=result.scores.detach().clone().index_fill_(0, torch.tensor([1]), float("-inf")))
     y = losses.minimum_risk(dead, costs, reduction="none")
     assert y[1] == 0 and torch.isfinite(y).all()
+
+
+def test_minimum_risk_ignores_the_costs_of_dead_beams():
+    # One step over 3 tokens leaves 3 of 6 beams live.
+    x = random_log_probs(2, 1, 6, 3, seed=6).requires_grad_(True)
+    result = search(x, BeamOptions(beam_size=6))
+    live = torch.isfinite(result.scores)
+    assert live.sum(-1).tolist() == [3, 3]
+    costs = torch.tensor([[0.1, 0.5, 0.9], [0.3, 0.2, 0.7]])
+    # A cost function may give anything for a dead beam's empty hypothesis.
+    padded = torch.cat([costs, torch.tensor([[float("nan"), float("inf"), -float("inf")]] * 2)], 1)
+    loss = losses.minimum_risk(result, padded)
+    expected = (torch.softmax(result.scores[:, :3], -1) * costs).sum(-1).mean()
+    torch.testing.assert_close(loss, expected)
+    loss.backward()
+    assert torch.isfinite(x.grad).all()
+    # And for an example without any live beam.
+    dead = result._replace(scores=result.scores.detach().clone().index_fill_(0, torch.tensor([1]), float("-inf")))
+    assert losses.minimum_risk(dead, padded, reduction="none")[1] == 0
 
 
 # ---------------------------------------------------------------------------
