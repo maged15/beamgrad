@@ -216,6 +216,27 @@ def test_gradients_of_every_output_match_finite_differences(from_logits):
         assert math.isclose(numeric, xg.grad.flatten()[i].item(), abs_tol=5e-3), i
 
 
+@pytest.mark.parametrize("from_logits", [False, True])
+def test_gradients_with_steps_per_example(from_logits):
+    # Padding steps get no gradient; each example's gradient is the one it gets alone.
+    x = random_logits(4, 6, 3, 19, seed=29)
+    if not from_logits:
+        x = torch.log_softmax(x, -1)
+    steps = [6, 2, 4, 1]
+    xg = x.clone().requires_grad_(True)
+    weighted_loss(decode(xg, OPTIONS, steps=steps, from_logits=from_logits), seed=3).backward()
+    for b, n in enumerate(steps):
+        assert torch.all(xg.grad[b, n:] == 0)
+        alone = x[b : b + 1, :n].clone().requires_grad_(True)
+        trace = decode(alone, OPTIONS, from_logits=from_logits)
+        final = torch.where(torch.isfinite(trace.final_scores), trace.final_scores, 0.0).sum()
+        final.backward()
+        together = x.clone().requires_grad_(True)
+        full = decode(together, OPTIONS, steps=steps, from_logits=from_logits).final_scores[b]
+        torch.where(torch.isfinite(full), full, 0.0).sum().backward()
+        assert torch.equal(together.grad[b, :n], alone.grad[0])
+
+
 def test_final_scores_gradient_is_unchanged():
     # decode_backward with only the final scores' gradient is the old operator's result, bit for bit.
     x = torch.log_softmax(random_logits(3, 5, 4, 21, seed=17), -1)

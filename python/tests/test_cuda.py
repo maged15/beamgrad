@@ -280,3 +280,21 @@ def test_row_logsumexp_matches_cpu():
     gpu = torch.ops.beamgrad.decode_ex(x.cuda(), True, *args)
     for a, b in zip(cpu, gpu, strict=True):
         assert torch.equal(b.cpu(), a)
+
+
+@pytest.mark.parametrize("from_logits", [False, True])
+def test_differentiable_decode_with_steps_matches_cpu(from_logits):
+    options = BeamOptions(beam_size=3, eos_token=2, length_penalty_alpha=0.6)
+    x = torch.randn(4, 6, 3, 40, generator=torch.Generator().manual_seed(1)) * 3.0
+    if not from_logits:
+        x = torch.log_softmax(x, -1)
+    steps = [6, 2, 4, 1]
+    cpu = x.clone().requires_grad_(True)
+    gpu = x.cuda().requires_grad_(True)
+    a = decode(cpu, options, steps=steps, from_logits=from_logits)
+    b = decode(gpu, options, steps=steps, from_logits=from_logits)
+    for name in a._fields:
+        assert torch.equal(getattr(b, name).detach().cpu(), getattr(a, name).detach()), name
+    score_loss(a).backward()
+    score_loss(b).backward()
+    assert torch.equal(gpu.grad.cpu(), cpu.grad)
