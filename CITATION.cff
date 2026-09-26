@@ -5,7 +5,7 @@ type: software
 authors:
   - family-names: Amr
     given-names: Maged
-version: 2.2.0
+version: 2.2.1
 license: MIT
 repository-code: "https://github.com/maged15/beamgrad"
 keywords:

@@ -51,7 +51,7 @@ extern "C" {
 #define DBS_ABI_VERSION 10
 #define DBS_VERSION_MAJOR 2
 #define DBS_VERSION_MINOR 2
-#define DBS_VERSION_PATCH 0
+#define DBS_VERSION_PATCH 1
 
 #define DBS_OK 0
 #define DBS_ERROR_INVALID_ARGUMENT (-1)

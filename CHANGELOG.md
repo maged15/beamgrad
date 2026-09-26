@@ -1,6 +1,18 @@
 # Changelog
 
-## Unreleased
+## 2.2.1 (2026-09-26)
+
+Fixes and improvements from running beamgrad 2.2.0 on a real LLM:
+- `pip install beamgrad` no longer fails when the CUDA operators cannot be
+  built: it warns and installs without them;
+- `BeamOptions(eos_token=...)` takes several end-of-sequence tokens, as
+  Qwen and Llama 3 need;
+- `beamgrad.hf.CausalLMStep` runs each prompt once per example rather than
+  once per beam: 3× faster than `generate()` on 2,048-token prompts, with
+  less than half its peak memory;
+- a fully fine-tuned Qwen2.5-0.5B experiment is in `experiments/`.
+
+The C ABI is unchanged (version 10): every new function is an addition.
 
 ### Added
 
@@ -15,15 +27,6 @@
   it is `dbs_cuda_decode_ex2` and `dbs_cuda_decode_step_ex2`
   (`DBSCudaSearchOptions`, up to 16 extra tokens). The operators
   `beamgrad::decode_ex` and `decode_step` take `extra_eos=[]`.
-
-- `beamgrad.hf.CausalLMStep(share_prompt=True)`, the new default, runs each
-  prompt once per example rather than once per beam, and copies its
-  key/value cache to the beams. With 2,048-token prompts (Qwen2.5-0.5B,
-  batch 8, 4 beams) a search takes 916 ms and 3.4 GiB instead of
-  `generate()`'s 2,759 ms and 7.8 GiB. It returns the same beams as before,
-  with scores that can differ in the last bits (the prompt runs at another
-  batch size); `share_prompt=False` keeps the previous behaviour and its
-  bit-identical parity with `generate()`.
 - `experiments/qwen-multi30k`: minimum-risk training through `beam_search`
   on a fully fine-tuned Qwen2.5-0.5B-Instruct. It beat continued supervised
   fine-tuning by +0.72 BLEU on 7 of 8 seeds (p = 0.023). Against
@@ -35,6 +38,17 @@
   off the repetition penalty of instruct models' generation configs (which
   made `generate()` a different search), checks both prompt modes, and times
   long prompts (`--long-prompt`).
+
+### Changed
+
+- `beamgrad.hf.CausalLMStep(share_prompt=True)`, the new default, runs each
+  prompt once per example rather than once per beam, and copies its
+  key/value cache to the beams. With 2,048-token prompts (Qwen2.5-0.5B,
+  batch 8, 4 beams) a search takes 916 ms and 3.4 GiB instead of
+  `generate()`'s 2,759 ms and 7.8 GiB. It returns the same beams as before,
+  with scores that can differ in the last bits (the prompt runs at another
+  batch size); `share_prompt=False` keeps the previous behaviour and its
+  bit-identical parity with `generate()`.
 
 ### Fixed
 
