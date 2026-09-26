@@ -50,8 +50,8 @@ extern "C" {
 
 #define DBS_ABI_VERSION 10
 #define DBS_VERSION_MAJOR 2
-#define DBS_VERSION_MINOR 1
-#define DBS_VERSION_PATCH 1
+#define DBS_VERSION_MINOR 2
+#define DBS_VERSION_PATCH 0
 
 #define DBS_OK 0
 #define DBS_ERROR_INVALID_ARGUMENT (-1)
@@ -322,6 +322,82 @@ DBS_EXPORT int dbs_backward_batch_into(
     const float* grad_final_scores,
     int num_threads,
     float* grad_log_probs
+);
+
+/* Extended outputs of dbs_decode_batch_into_ex: everything DBSDecodeOutputsC
+ * holds, plus the relaxed pool's trace and the rows' logsumexp. Any pointer
+ * may be NULL; the pool arrays need relaxed_pool_multiplier >= 1. */
+typedef struct DBSDecodeOutputsExC {
+    DBSDecodeOutputsC base;       /* as for dbs_decode_batch_into; base.final_scores is required */
+    int32_t* pool_parents;        /* [B, T, P], P = K * relaxed_pool_multiplier: the P best candidates per step */
+    int32_t* pool_tokens;         /* [B, T, P] */
+    int32_t* pool_lengths;        /* [B, T, P] */
+    float* pool_scores;           /* [B, T, P] length-penalised ranking scores */
+    float* pool_raw_scores;       /* [B, T, P] cumulative log-probabilities */
+    uint8_t* pool_from_logprob;   /* [B, T, P] */
+    float* row_lse;               /* [B, T, K] with from_logits: logsumexp of each row the search read, 0 elsewhere */
+    void* reserved[4];            /* must be NULL */
+} DBSDecodeOutputsExC;
+
+/* Like dbs_decode_batch_into, for inputs of any DBSDataTypeC (16-bit rows are
+ * converted one at a time, for the beams that are expanded) and, with
+ * from_logits non-zero, for logits: each row the search reads is normalised
+ * on the fly to log-probabilities (x - logsumexp(row), computed the same way,
+ * bit for bit, on every CPU kernel path and the GPU). */
+DBS_EXPORT int dbs_decode_batch_into_ex(
+    DBSDecoderHandle* handle,
+    const void* inputs,
+    int data_type,
+    int from_logits,
+    int batch_size,
+    int steps,
+    int vocab_size,
+    const int32_t* steps_per_example,
+    const DBSAdvancedConstraintsC* constraints,
+    int num_threads,
+    const DBSDecodeOutputsExC* outputs
+);
+
+/* Inputs of dbs_backward_batch_into_ex: a batch's decode trace, the gradients
+ * of a loss with respect to any of its outputs (NULL for zero), and, when it
+ * was decoded from logits, the logits and the decode's row_lse. */
+typedef struct DBSBackwardInputsC {
+    int batch_size;
+    int steps;                         /* T */
+    int vocab_size;                    /* V */
+    int pool_size;                     /* P, or 0 without pool gradients */
+    const int32_t* steps_per_example;  /* [B] or NULL, as passed to the decode */
+    const int32_t* parents;            /* [B, T, K] */
+    const int32_t* tokens;             /* [B, T, K] */
+    const int32_t* lengths;            /* [B, T, K] */
+    const uint8_t* from_logprob;       /* [B, T, K] */
+    const int32_t* pool_parents;       /* [B, T, P], needed with pool gradients */
+    const int32_t* pool_tokens;
+    const int32_t* pool_lengths;
+    const uint8_t* pool_from_logprob;
+    const float* grad_final_scores;      /* [B, K] */
+    const float* grad_final_raw_scores;  /* [B, K] */
+    const float* grad_scores;            /* [B, T, K] */
+    const float* grad_raw_scores;        /* [B, T, K] */
+    const float* grad_pool_scores;       /* [B, T, P] */
+    const float* grad_pool_raw_scores;   /* [B, T, P] */
+    const void* logits;                /* [B, T, K, V] of logits_type, or NULL if the decode read log-probs */
+    int logits_type;                   /* DBSDataTypeC of logits */
+    const float* row_lse;              /* [B, T, K] the decode's row_lse, with logits */
+    void* reserved[4];                 /* must be NULL */
+} DBSBackwardInputsC;
+
+/* The surrogate gradient of sum(grad_x * x) over every output x given in
+ * `inputs`, accumulated (+=) into grad_inputs [B, T, K, V] (float32; the
+ * caller normally zero-fills it first). Each output is differentiated along
+ * the path of tokens that produced it, holding the selection fixed. With
+ * logits, every row with a path gradient g receives the log-softmax gradient
+ * g - softmax(row) * sum(g) in full. */
+DBS_EXPORT int dbs_backward_batch_into_ex(
+    DBSDecoderHandle* handle,
+    const DBSBackwardInputsC* inputs,
+    int num_threads,
+    float* grad_inputs
 );
 
 DBS_EXPORT int dbs_decode_batch(

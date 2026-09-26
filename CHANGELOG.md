@@ -1,5 +1,63 @@
 # Changelog
 
+## 2.2.0 (2026-09-26)
+
+Decoding from logits and from float16/bfloat16 rows, on every backend, and
+gradients of every decode output:
+- `final_scores`, `decode` and `search` (and `beamgrad.jax.final_scores`)
+  take `from_logits=True`. The search is the one over `log_softmax(logits)`,
+  computed on the fly, and the gradient flows through the log-softmax;
+- float16 and bfloat16 rows are read as they are, without a float32 copy;
+- `decode` is differentiable: its final, per-step and raw scores carry the
+  path gradient;
+- the C library and the CUDA engine have the same features as additions
+  (`_ex` functions), and CPU and GPU agree bit for bit.
+
+The C ABI is unchanged (version 10): every new function is an addition.
+
+### Added
+
+- Decoding from logits in the C library. `dbs_decode_batch_into_ex` takes
+  logits (`from_logits`) and normalises each row the search reads on the
+  fly, with a deterministic logsumexp that every CPU kernel path computes
+  bit for bit. It also takes fp16/bf16 input and returns the relaxed pool's
+  trace and each row's logsumexp (`DBSDecodeOutputsExC`).
+- `dbs_backward_batch_into_ex` (`DBSBackwardInputsC`): the gradient of any
+  decode output (final, per-step and pool scores and raw scores), through
+  the logits' log-softmax when the batch was decoded from logits. Both new
+  functions are additions; ABI 10 is unchanged.
+- The same on the GPU. `dbs_cuda_decode_ex` and `dbs_cuda_decode_step_ex`
+  read fp16 and bf16 rows directly, and logits (`from_logits`), and return
+  each row's logsumexp. `dbs_cuda_backward_ex` (`DBSCudaBackwardInputs`)
+  differentiates the final, per-step and raw scores, through the log-softmax
+  from logits. The results equal the CPU's `_ex` functions bit for bit (the
+  relaxed pool stays CPU-only).
+- PyTorch and JAX: `final_scores`, `decode` and `search` take
+  `from_logits=True` (`beamgrad.jax.final_scores` too). The search is then
+  the one over `log_softmax(logits)`, without materialising it, and the
+  gradient flows through the log-softmax. The operators are
+  `torch.ops.beamgrad.decode_ex` and `decode_backward`.
+- `beamgrad.decode` is differentiable: when the input requires grad, its
+  final, per-step and raw scores carry the path gradient. A loss can use any
+  of them.
+
+### Changed
+
+- `dbs_decode_typed` and `dbs_decode_batch_typed` convert 16-bit rows one at
+  a time, only for the beams that are expanded, instead of converting the
+  whole input first.
+- The selected-beam softmax weights and the relaxed pool's sigmoid use the
+  library's deterministic `exp`. Their values can differ from 2.1.1's in the
+  last bits.
+- `dbs_cuda_backward_workspace_size` returns the scratch that
+  `dbs_cuda_backward_ex` needs from logits, instead of 0. `dbs_cuda_backward`
+  still needs none.
+- float16 and bfloat16 inputs are read as they are, on CPU and CUDA, instead
+  of being copied to float32 first. The results are the same.
+- `beamgrad.decode`'s scores now require grad when its input does (they were
+  always detached). Call it under `torch.no_grad()`, or on a detached input,
+  where that matters, for example before `.numpy()`.
+
 ## 2.1.1 (2026-09-26)
 
 Closes the gaps left by 2.1.0 and its review:

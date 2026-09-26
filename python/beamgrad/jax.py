@@ -18,7 +18,15 @@ import jax
 import jax.numpy as jnp
 import numpy as np
 
-from ._ctypes import DBSDecodeOutputsC, check, constraints_to_c, load_library, options_to_c
+from ._ctypes import (
+    DTYPE_F32,
+    DBSBackwardInputsC,
+    DBSDecodeOutputsExC,
+    check,
+    constraints_to_c,
+    load_library,
+    options_to_c,
+)
 from ._options import BeamOptions
 
 __all__ = ["final_scores"]
@@ -55,7 +63,7 @@ def _fold_steps(steps: np.ndarray | None, lead: tuple[int, ...], n: int) -> np.n
     return np.ascontiguousarray(np.broadcast_to(np.asarray(steps), lead).reshape(n), dtype=np.int32)
 
 
-def _host_decode(x, steps, options: BeamOptions, lib_path: str | None):
+def _host_decode(x, steps, options: BeamOptions, from_logits: bool, lib_path: str | None):
     x = np.asarray(x, dtype=np.float32)
     lead, (T, K, V) = x.shape[:-3], x.shape[-3:]
     n = math.prod(lead)
@@ -73,17 +81,21 @@ def _host_decode(x, steps, options: BeamOptions, lib_path: str | None):
     tokens = np.empty((n, T, K), dtype=np.int32)
     lengths = np.empty((n, T, K), dtype=np.int32)
     from_logprob = np.empty((n, T, K), dtype=np.uint8)
-    out = DBSDecodeOutputsC()
-    out.final_scores = _ptr(final)
-    out.parents = _ptr(parents)
-    out.tokens = _ptr(tokens)
-    out.lengths = _ptr(lengths)
-    out.from_logprob = _ptr(from_logprob)
+    row_lse = np.empty((n, T, K), dtype=np.float32)
+    out = DBSDecodeOutputsExC()
+    out.base.final_scores = _ptr(final)
+    out.base.parents = _ptr(parents)
+    out.base.tokens = _ptr(tokens)
+    out.base.lengths = _ptr(lengths)
+    out.base.from_logprob = _ptr(from_logprob)
+    out.row_lse = _ptr(row_lse)
 
     decoder = _Decoder(options, lib_path)
-    status = decoder.lib.dbs_decode_batch_into(
+    status = decoder.lib.dbs_decode_batch_into_ex(
         decoder.handle,
         _ptr(x),
+        DTYPE_F32,
+        int(from_logits),
         n,
         T,
         V,
@@ -99,28 +111,48 @@ def _host_decode(x, steps, options: BeamOptions, lib_path: str | None):
         tokens.reshape(*lead, T, K),
         lengths.reshape(*lead, T, K),
         from_logprob.reshape(*lead, T, K),
+        row_lse.reshape(*lead, T, K),
     )
 
 
 def _host_backward(
-    parents, tokens, lengths, from_logprob, steps, g, vocab_size: int, options: BeamOptions, lib_path: str | None
+    parents,
+    tokens,
+    lengths,
+    from_logprob,
+    row_lse,
+    logits,
+    steps,
+    g,
+    vocab_size: int,
+    options: BeamOptions,
+    from_logits: bool,
+    lib_path: str | None,
 ):
     parents = np.asarray(parents, dtype=np.int32)
     lead, (T, K) = parents.shape[:-2], parents.shape[-2:]
     n = math.prod(lead)
 
-    def flat(a, dtype):
-        return np.ascontiguousarray(np.broadcast_to(np.asarray(a, dtype=dtype), (*lead, T, K)).reshape(n, T, K))
+    def flat(a, dtype, shape=(T, K)):
+        return np.ascontiguousarray(np.broadcast_to(np.asarray(a, dtype=dtype), (*lead, *shape)).reshape(n, *shape))
 
     trace = [flat(parents, np.int32), flat(tokens, np.int32), flat(lengths, np.int32), flat(from_logprob, np.uint8)]
-    g = np.ascontiguousarray(np.broadcast_to(np.asarray(g, dtype=np.float32), (*lead, K)).reshape(n, K))
+    g = flat(g, np.float32, (K,))
     steps = _fold_steps(steps, lead, n)
     grad = np.zeros((n, T, K, vocab_size), dtype=np.float32)
 
+    inputs = DBSBackwardInputsC()
+    inputs.batch_size, inputs.steps, inputs.vocab_size = n, T, vocab_size
+    inputs.steps_per_example = _ptr(steps)
+    inputs.parents, inputs.tokens, inputs.lengths, inputs.from_logprob = (_ptr(a) for a in trace)
+    inputs.grad_final_scores = _ptr(g)
+    if from_logits:  # the log-softmax's part of the gradient needs the logits and their logsumexp
+        logits = flat(logits, np.float32, (T, K, vocab_size))
+        row_lse = flat(row_lse, np.float32)
+        inputs.logits, inputs.logits_type, inputs.row_lse = _ptr(logits), DTYPE_F32, _ptr(row_lse)
+
     decoder = _Decoder(options, lib_path)
-    status = decoder.lib.dbs_backward_batch_into(
-        decoder.handle, n, T, vocab_size, _ptr(steps), *(_ptr(a) for a in trace), _ptr(g), 0, _ptr(grad)
-    )
+    status = decoder.lib.dbs_backward_batch_into_ex(decoder.handle, ctypes.byref(inputs), 0, _ptr(grad))
     check(decoder.lib, decoder.handle, status)
     return grad.reshape(*lead, T, K, vocab_size)
 
@@ -146,14 +178,17 @@ def _steps_array(steps, batch: int, max_steps: int):
     return jnp.asarray(host.astype(np.int32))
 
 
-def final_scores(log_probs, options: BeamOptions, steps=None, lib_path: str | None = None):
+def final_scores(
+    log_probs, options: BeamOptions, steps=None, lib_path: str | None = None, *, from_logits: bool = False
+):
     """Final beam scores for ``[T, K, V]`` or ``[B, T, K, V]`` log-probabilities.
 
     Same semantics, options and gradients as :func:`beamgrad.final_scores`,
-    including ``steps`` (``[B]`` steps per example, batched input only). NaN or
-    ``+inf`` in a row the search reads fails the call when
-    ``options.validate_inputs`` is set (inside ``jit``, JAX reports the error
-    raised by the host callback).
+    including ``steps`` (``[B]`` steps per example, batched input only) and
+    ``from_logits`` (the rows are logits, normalised on the fly, with the
+    gradient through the log-softmax). NaN or ``+inf`` in a row the search
+    reads fails the call when ``options.validate_inputs`` is set (inside
+    ``jit``, JAX reports the error raised by the host callback).
     """
     if not isinstance(options, BeamOptions):
         raise TypeError(f"options must be a beamgrad.BeamOptions, got {type(options).__name__}")
@@ -171,27 +206,27 @@ def final_scores(log_probs, options: BeamOptions, steps=None, lib_path: str | No
     options.banned_ids(V)  # checks the banned ids against the vocabulary
     x = x.astype(jnp.float32)  # differentiable: gradients return in the input dtype
 
+    from_logits = bool(from_logits)
     trace_shapes = (
         jax.ShapeDtypeStruct((B, K), jnp.float32),
         jax.ShapeDtypeStruct((B, T, K), jnp.int32),
         jax.ShapeDtypeStruct((B, T, K), jnp.int32),
         jax.ShapeDtypeStruct((B, T, K), jnp.int32),
         jax.ShapeDtypeStruct((B, T, K), jnp.uint8),
+        jax.ShapeDtypeStruct((B, T, K), jnp.float32),  # row_lse (zeros without logits)
     )
 
     def forward(y, s):
         return jax.pure_callback(
-            lambda a, b: _host_decode(a, b, options, lib_path), trace_shapes, y, s, **_CALLBACK_BATCHING
+            lambda a, b: _host_decode(a, b, options, from_logits, lib_path), trace_shapes, y, s, **_CALLBACK_BATCHING
         )
 
-    def backward(parents, tokens, lengths, from_logprob, s, g):
+    def backward(trace, logits, s, g):
         return jax.pure_callback(
-            lambda *args: _host_backward(*args, V, options, lib_path),
+            lambda *args: _host_backward(*args, V, options, from_logits, lib_path),
             jax.ShapeDtypeStruct((B, T, K, V), jnp.float32),
-            parents,
-            tokens,
-            lengths,
-            from_logprob,
+            *trace,
+            logits,
             s,
             g,
             **_CALLBACK_BATCHING,
@@ -203,11 +238,12 @@ def final_scores(log_probs, options: BeamOptions, steps=None, lib_path: str | No
 
     def scores_fwd(y, s):
         final, *trace = forward(y, s)
-        return final, (*trace, s)
+        # The logits are kept only when the backward needs them.
+        return final, (tuple(trace), y if from_logits else jnp.zeros((), jnp.float32), s)
 
     def scores_bwd(residuals, g):
-        *trace, s = residuals
-        return backward(*trace, s, g), None
+        trace, logits, s = residuals
+        return backward(trace, logits, s, g), None
 
     scores.defvjp(scores_fwd, scores_bwd)
     # Steps travel as an array (T when not given), so one code path serves both.

@@ -10,7 +10,10 @@
 //     multi-level reductions and the maximum beam size;
 //   * dbs_cuda_decode_step, stepped through the same rows, must select exactly
 //     what dbs_cuda_decode selects;
-//   * the NaN/+inf flags must point at the examples that have them.
+//   * the NaN/+inf flags must point at the examples that have them;
+//   * dbs_cuda_decode_ex and dbs_cuda_backward_ex (fp16/bf16 rows, logits,
+//     gradients of every score output) must equal dbs_decode_batch_into_ex and
+//     dbs_backward_batch_into_ex bit for bit.
 // Exits with 77 (skipped) when no CUDA device is available.
 #include "dbs.h"
 #include "dbs_cuda.h"
@@ -359,6 +362,213 @@ int test_invalid_input_flags() {
     return ok ? 0 : 1;
 }
 
+uint16_t to_bf16_bits(float x) {
+    uint32_t u;
+    std::memcpy(&u, &x, sizeof(u));
+    return static_cast<uint16_t>(u >> 16);
+}
+
+// Truncating float -> fp16; any encoding will do, both backends read the same bits.
+uint16_t to_f16_bits(float x) {
+    uint32_t u;
+    std::memcpy(&u, &x, sizeof(u));
+    const uint32_t sign = (u >> 16) & 0x8000u;
+    if ((u & 0x7fffffffu) > 0x7f800000u) return static_cast<uint16_t>(sign | 0x7e00u);
+    const int32_t exp = static_cast<int32_t>((u >> 23) & 0xffu) - 127 + 15;
+    if (exp <= 0) return static_cast<uint16_t>(sign);
+    if (exp >= 31) return static_cast<uint16_t>(sign | 0x7c00u);
+    return static_cast<uint16_t>(sign | (static_cast<uint32_t>(exp) << 10) | ((u & 0x7fffffu) >> 13));
+}
+
+// dbs_cuda_decode_ex / dbs_cuda_backward_ex against the CPU's batch _ex API.
+int run_ex_case(const Case& c, int dtype, int from_logits, unsigned seed) {
+    std::mt19937 rng(seed);
+    const size_t n = static_cast<size_t>(c.B) * c.T * c.K * c.V;
+    const size_t tk = static_cast<size_t>(c.B) * c.T * c.K;
+    const size_t bk = static_cast<size_t>(c.B) * c.K;
+    std::vector<float> x(n);
+    std::normal_distribution<float> normal(0.0f, 3.0f);
+    std::uniform_int_distribution<int> level(0, 3);
+    for (float& v : x) {
+        v = c.ties ? -0.5f * static_cast<float>(level(rng)) : normal(rng);
+        if (!from_logits) v -= 12.0f;
+    }
+    for (size_t i = 0; i < n; i += 1 + rng() % 97) x[i] = -std::numeric_limits<float>::infinity();
+    const size_t elem = dtype == DBS_CUDA_DTYPE_F32 ? 4 : 2;
+    std::vector<uint8_t> data(n * elem);
+    for (size_t i = 0; i < n; ++i) {
+        if (dtype == DBS_CUDA_DTYPE_F32) {
+            std::memcpy(&data[i * 4], &x[i], 4);
+        } else {
+            const uint16_t h = dtype == DBS_CUDA_DTYPE_F16 ? to_f16_bits(x[i]) : to_bf16_bits(x[i]);
+            std::memcpy(&data[i * 2], &h, 2);
+        }
+    }
+    std::vector<uint8_t> banned(static_cast<size_t>(c.V), 0);
+    if (c.banned) {
+        for (uint8_t& b : banned) b = rng() % 11 == 0;
+    }
+    std::vector<int32_t> steps(static_cast<size_t>(c.B), c.T);
+    if (c.variable_steps) {
+        for (int32_t& s : steps) s = 1 + static_cast<int32_t>(rng() % c.T);
+    }
+
+    DBSOptionsC opt{};
+    opt.beam_size = c.K;
+    opt.eos_token = c.eos;
+    opt.min_length = c.min_length;
+    opt.length_penalty_alpha = c.alpha;
+    opt.validate_inputs = 1;
+    DBSDecoderHandle* handle = nullptr;
+    CHECK(dbs_create_ex(opt, &handle) == DBS_OK);
+    DBSAdvancedConstraintsC constraints{};
+    constraints.min_length = -1;
+    constraints.no_repeat_ngram_size = c.ngram;
+    constraints.repetition_penalty = c.penalty;
+    constraints.banned_tokens = c.banned ? banned.data() : nullptr;
+    std::vector<float> final_scores(bk), final_raw(bk), scores(tk), raw_scores(tk), row_lse(tk);
+    std::vector<int32_t> final_lengths(bk), tokens(tk), parents(tk), lengths(tk);
+    std::vector<uint8_t> from_logprob(tk);
+    DBSDecodeOutputsExC cpu_out{};
+    cpu_out.base = DBSDecodeOutputsC{final_scores.data(), final_raw.data(), final_lengths.data(), tokens.data(),
+                                     parents.data(),      lengths.data(),   scores.data(),        raw_scores.data(),
+                                     from_logprob.data()};
+    cpu_out.row_lse = row_lse.data();
+    CHECK(dbs_decode_batch_into_ex(handle, data.data(), dtype, from_logits, c.B, c.T, c.V,
+                                   c.variable_steps ? steps.data() : nullptr, &constraints, 0, &cpu_out) == DBS_OK);
+
+    const DeviceBuffer<uint8_t> d_data(data), d_banned(banned);
+    const DeviceBuffer<int32_t> d_steps(steps);
+    const DeviceBuffer<float> d_final(bk), d_final_raw(bk), d_scores(tk), d_raw(tk), d_lse(tk);
+    const DeviceBuffer<int32_t> d_final_len(bk), d_tokens(tk), d_parents(tk), d_lengths(tk);
+    const DeviceBuffer<uint8_t> d_from_logprob(tk), d_invalid(static_cast<size_t>(c.B));
+    DBSCudaDecodeArgs args{};
+    args.batch_size = c.B;
+    args.steps = c.T;
+    args.beam_size = c.K;
+    args.vocab_size = c.V;
+    args.eos_token = c.eos;
+    args.min_length = c.min_length;
+    args.length_penalty_alpha = c.alpha;
+    args.no_repeat_ngram_size = c.ngram;
+    args.repetition_penalty = c.penalty;
+    args.steps_per_example = c.variable_steps ? d_steps.get() : nullptr;
+    args.banned_tokens = c.banned ? d_banned.get() : nullptr;
+    const DBSCudaDecodeOutputs gpu_out{d_final.get(),  d_final_raw.get(), d_final_len.get(), d_tokens.get(),
+                                       d_parents.get(), d_lengths.get(),  d_scores.get(),    d_raw.get(),
+                                       d_from_logprob.get(), d_invalid.get()};
+    CHECK(dbs_cuda_decode_ex(d_data.get(), dtype, from_logits, &args, &gpu_out, d_lse.get(), nullptr, 0, nullptr) ==
+          DBS_CUDA_STATUS_OK);
+    CUDA_CHECK(cudaDeviceSynchronize());
+
+    int mismatches = 0;
+    auto expect = [&](bool ok, const char* what) {
+        if (!ok) {
+            std::fprintf(stderr, "  _ex mismatch: %s (dtype=%d from_logits=%d)\n", what, dtype, from_logits);
+            ++mismatches;
+        }
+    };
+    expect(same_bits(tokens, d_tokens.to_host()), "tokens");
+    expect(same_bits(parents, d_parents.to_host()), "parents");
+    expect(same_bits(lengths, d_lengths.to_host()), "lengths");
+    expect(same_bits(from_logprob, d_from_logprob.to_host()), "from_logprob");
+    expect(same_bits(scores, d_scores.to_host()), "scores");
+    expect(same_bits(raw_scores, d_raw.to_host()), "raw_scores");
+    expect(same_bits(final_scores, d_final.to_host()), "final_scores");
+    expect(same_bits(final_raw, d_final_raw.to_host()), "final_raw_scores");
+    expect(same_bits(final_lengths, d_final_len.to_host()), "final_lengths");
+    expect(same_bits(row_lse, d_lse.to_host()), "row_lse");
+    expect(same_bits(std::vector<uint8_t>(static_cast<size_t>(c.B), 0), d_invalid.to_host()), "invalid_input flags");
+
+    // Any subset of the score gradients, accumulated onto a common base.
+    std::uniform_real_distribution<float> unit(-1.0f, 1.0f);
+    auto maybe = [&](size_t count) {
+        std::vector<float> v;
+        if (rng() % 3 != 0) {
+            v.resize(count);
+            for (float& g : v) g = unit(rng);
+        }
+        return v;
+    };
+    const std::vector<float> gf = maybe(bk), gfr = maybe(bk), gs = maybe(tk), gr = maybe(tk);
+    std::vector<float> grad(n);
+    for (float& g : grad) g = rng() % 2 ? 0.0f : unit(rng);
+    const DeviceBuffer<float> d_grad(grad);
+    DBSBackwardInputsC cin{};
+    cin.batch_size = c.B;
+    cin.steps = c.T;
+    cin.vocab_size = c.V;
+    cin.steps_per_example = c.variable_steps ? steps.data() : nullptr;
+    cin.parents = parents.data();
+    cin.tokens = tokens.data();
+    cin.lengths = lengths.data();
+    cin.from_logprob = from_logprob.data();
+    cin.grad_final_scores = gf.empty() ? nullptr : gf.data();
+    cin.grad_final_raw_scores = gfr.empty() ? nullptr : gfr.data();
+    cin.grad_scores = gs.empty() ? nullptr : gs.data();
+    cin.grad_raw_scores = gr.empty() ? nullptr : gr.data();
+    cin.logits = from_logits ? data.data() : nullptr;
+    cin.logits_type = dtype;
+    cin.row_lse = from_logits ? row_lse.data() : nullptr;
+    CHECK(dbs_backward_batch_into_ex(handle, &cin, 0, grad.data()) == DBS_OK);
+
+    const DeviceBuffer<float> d_gf(gf), d_gfr(gfr), d_gs(gs), d_gr(gr);
+    DBSCudaBackwardInputs gin{};
+    gin.parents = d_parents.get();
+    gin.tokens = d_tokens.get();
+    gin.lengths = d_lengths.get();
+    gin.from_logprob = d_from_logprob.get();
+    gin.grad_final_scores = gf.empty() ? nullptr : d_gf.get();
+    gin.grad_final_raw_scores = gfr.empty() ? nullptr : d_gfr.get();
+    gin.grad_scores = gs.empty() ? nullptr : d_gs.get();
+    gin.grad_raw_scores = gr.empty() ? nullptr : d_gr.get();
+    gin.logits = from_logits ? d_data.get() : nullptr;
+    gin.logits_type = dtype;
+    gin.row_lse = from_logits ? d_lse.get() : nullptr;
+    const int64_t ws_bytes = dbs_cuda_backward_workspace_size(&args);
+    CHECK(ws_bytes >= 0);
+    const DeviceBuffer<uint8_t> ws(c.user_workspace ? static_cast<size_t>(ws_bytes) : 0);
+    CHECK(dbs_cuda_backward_ex(&args, &gin, d_grad.get(), c.user_workspace ? ws.get() : nullptr,
+                               c.user_workspace ? ws_bytes : 0, nullptr) == DBS_CUDA_STATUS_OK);
+    CUDA_CHECK(cudaDeviceSynchronize());
+    expect(same_bits(grad, d_grad.to_host()), "gradient");
+
+    dbs_destroy(handle);
+    return mismatches;
+}
+
+int test_ex_parity() {
+    const int beams[] = {1, 2, 4, 5, 16, 17, 64, 1024};
+    const int vocabs[] = {2, 31, 256, 1000, 5003, 32000, 50257};
+    int failures = 0;
+    for (unsigned seed = 0; seed < 60; ++seed) {
+        std::mt19937 rng(seed * 104729u + 7u);
+        Case c{};
+        c.K = beams[rng() % (sizeof(beams) / sizeof(beams[0]))];
+        c.V = vocabs[rng() % (sizeof(vocabs) / sizeof(vocabs[0]))];
+        if (static_cast<int64_t>(c.K) * c.V > 1000000) c.V = 1000000 / c.K;
+        c.B = 1 + static_cast<int>(rng() % 3);
+        c.T = 1 + static_cast<int>(rng() % 6);
+        c.eos = rng() % 3 == 0 ? -1 : static_cast<int>(rng() % c.V);
+        c.min_length = static_cast<int>(rng() % 3);
+        c.alpha = rng() % 2 ? 0.0f : 0.3f * static_cast<float>(rng() % 5);
+        c.ngram = rng() % 3 == 0 ? 1 + static_cast<int>(rng() % 3) : 0;
+        c.penalty = rng() % 3 == 0 ? 1.5f : 1.0f;
+        c.ties = rng() % 3 == 0;
+        c.banned = rng() % 3 == 0;
+        c.variable_steps = rng() % 3 == 0;
+        c.user_workspace = rng() % 2 == 0;
+        const int dtype = static_cast<int>(seed % 3);
+        const int from_logits = static_cast<int>((seed / 3) % 2);
+        if (run_ex_case(c, dtype, from_logits, seed) != 0) {
+            std::fprintf(stderr, "_ex case %u failed: B=%d T=%d K=%d V=%d eos=%d dtype=%d from_logits=%d\n", seed, c.B,
+                         c.T, c.K, c.V, c.eos, dtype, from_logits);
+            ++failures;
+        }
+    }
+    return failures;
+}
+
 } // namespace
 
 int main() {
@@ -369,7 +579,7 @@ int main() {
     cudaDeviceProp prop{};
     CUDA_CHECK(cudaGetDeviceProperties(&prop, 0));
     std::printf("device: %s\n", prop.name);
-    const int failures = test_randomized_parity() + test_step_api_parity() + test_invalid_input_flags();
+    const int failures = test_randomized_parity() + test_step_api_parity() + test_invalid_input_flags() + test_ex_parity();
     if (failures != 0) {
         std::fprintf(stderr, "dbs_cuda_device_tests: %d failures\n", failures);
         return 1;

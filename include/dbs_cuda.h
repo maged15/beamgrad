@@ -16,6 +16,13 @@
 // dbs_backward() on the CPU with only grad_final_scores supplied, and is
 // deterministic (no atomics).
 //
+// The _ex functions extend both: dbs_cuda_decode_ex() and
+// dbs_cuda_decode_step_ex() read float32, fp16 or bf16 rows, and log-probs or
+// logits (normalised on the fly); dbs_cuda_backward_ex() differentiates any of
+// the decode's score outputs, through the log-softmax when the inputs were
+// logits. They match dbs_decode_batch_into_ex() and
+// dbs_backward_batch_into_ex() on the CPU bit for bit.
+//
 // All tensor pointers are device pointers to dense row-major data. log_probs
 // and grad_log_probs are float32 [B, T, K, V], where T and K are the (maximum)
 // steps and beam size; per-step outputs are [B, T, K] and per-beam outputs are
@@ -99,8 +106,8 @@ DBS_CUDA_EXPORT const char* dbs_cuda_status_string(int status);
 DBS_CUDA_EXPORT int dbs_cuda_set_synchronization(int synchronize);
 DBS_CUDA_EXPORT int dbs_cuda_get_synchronization(void);
 
-/* Scratch memory needed by dbs_cuda_decode / dbs_cuda_backward, in bytes, or a
- * negative value if the arguments are invalid. */
+/* Scratch memory needed by dbs_cuda_decode(_ex) / dbs_cuda_backward(_ex), in
+ * bytes, or a negative value if the arguments are invalid. */
 DBS_CUDA_EXPORT int64_t dbs_cuda_decode_workspace_size(const DBSCudaDecodeArgs* args);
 DBS_CUDA_EXPORT int64_t dbs_cuda_backward_workspace_size(const DBSCudaDecodeArgs* args);
 
@@ -146,8 +153,8 @@ typedef struct DBSCudaBeamState {
     int reserved0;              /* must be 0 */
 } DBSCudaBeamState;
 
-/* Scratch memory needed by dbs_cuda_decode_step, in bytes, or a negative value
- * if the arguments are invalid. */
+/* Scratch memory needed by dbs_cuda_decode_step(_ex), in bytes, or a negative
+ * value if the arguments are invalid. */
 DBS_CUDA_EXPORT int64_t dbs_cuda_decode_step_workspace_size(const DBSCudaDecodeArgs* args, int prefix_stride);
 
 /* One step of the search. log_probs is the step's [B, K, V] rows (row k
@@ -182,6 +189,80 @@ DBS_CUDA_EXPORT int dbs_cuda_backward(
     const uint8_t* from_logprob,
     const float* grad_final_scores,
     float* grad_log_probs,
+    void* workspace,
+    int64_t workspace_bytes,
+    void* stream);
+
+/* Element types of the input rows (the values of DBSDataTypeC in dbs.h). */
+#define DBS_CUDA_DTYPE_F32 0
+#define DBS_CUDA_DTYPE_F16 1
+#define DBS_CUDA_DTYPE_BF16 2
+
+/* dbs_cuda_decode for inputs [B, T, K, V] of data_type (DBS_CUDA_DTYPE_*),
+ * read and converted to float32 exactly as they are scanned. With from_logits
+ * non-zero the inputs are logits: each row the search reads is normalised on
+ * the fly to log-probabilities, x - logsumexp(row), with the CPU decoder's
+ * deterministic logsumexp, so the result equals dbs_decode_batch_into_ex's
+ * bit for bit. row_lse (optional, device float32 [B, T, K]) receives the
+ * logsumexp of every row the search read (-inf for a row without a finite
+ * logit), and 0 for the other rows and without from_logits; the backward
+ * needs it. dbs_cuda_decode(log_probs, ...) is
+ * dbs_cuda_decode_ex(log_probs, DBS_CUDA_DTYPE_F32, 0, ...). */
+DBS_CUDA_EXPORT int dbs_cuda_decode_ex(
+    const void* inputs,
+    int data_type,
+    int from_logits,
+    const DBSCudaDecodeArgs* args,
+    const DBSCudaDecodeOutputs* outputs,
+    float* row_lse,
+    void* workspace,
+    int64_t workspace_bytes,
+    void* stream);
+
+/* dbs_cuda_decode_step for a step's [B, K, V] inputs of data_type, as
+ * dbs_cuda_decode_ex reads them; row_lse (optional) is [B, K]. */
+DBS_CUDA_EXPORT int dbs_cuda_decode_step_ex(
+    const void* inputs,
+    int data_type,
+    int from_logits,
+    const DBSCudaDecodeArgs* args,
+    const DBSCudaBeamState* state,
+    const DBSCudaDecodeOutputs* outputs,
+    float* row_lse,
+    void* workspace,
+    int64_t workspace_bytes,
+    void* stream);
+
+/* Inputs of dbs_cuda_backward_ex: a decode's trace, the gradients of a loss
+ * with respect to any of its score outputs (NULL for zero), and, when it was
+ * decoded from logits, the logits and the decode's row_lse. */
+typedef struct DBSCudaBackwardInputs {
+    const int32_t* parents;              /* [B, T, K] */
+    const int32_t* tokens;               /* [B, T, K] */
+    const int32_t* lengths;              /* [B, T, K] */
+    const uint8_t* from_logprob;         /* [B, T, K] */
+    const float* grad_final_scores;      /* [B, K] or NULL */
+    const float* grad_final_raw_scores;  /* [B, K] or NULL */
+    const float* grad_scores;            /* [B, T, K] or NULL */
+    const float* grad_raw_scores;        /* [B, T, K] or NULL */
+    const void* logits;                  /* [B, T, K, V] of logits_type if decoded from logits, else NULL */
+    int logits_type;                     /* DBS_CUDA_DTYPE_* */
+    int reserved0;                       /* must be 0 */
+    const float* row_lse;                /* [B, T, K] from dbs_cuda_decode_ex; required with logits */
+    void* reserved[4];                   /* must be NULL */
+} DBSCudaBackwardInputs;
+
+/* Surrogate gradient of the given outputs, accumulated (+=) into grad_inputs
+ * (float32 [B, T, K, V], normally zero-filled first). Every output is
+ * differentiated along the path of tokens that produced it, holding the
+ * selection fixed. With logits, each row with a path gradient g receives the
+ * log-softmax gradient g - softmax(row) * sum(g) in full. Deterministic, and
+ * equal to dbs_backward_batch_into_ex bit for bit. `workspace` (at least
+ * dbs_cuda_backward_workspace_size bytes) may be NULL. */
+DBS_CUDA_EXPORT int dbs_cuda_backward_ex(
+    const DBSCudaDecodeArgs* args,
+    const DBSCudaBackwardInputs* inputs,
+    float* grad_inputs,
     void* workspace,
     int64_t workspace_bytes,
     void* stream);

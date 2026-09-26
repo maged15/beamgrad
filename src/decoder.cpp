@@ -30,7 +30,8 @@ public:
         int vocab_size,
         const DecodeConstraints* constraints,
         const TraceOutputs& out,
-        bool with_pool)
+        bool with_pool,
+        bool from_logits = false)
         : opt_(opt),
           c_(constraints),
           out_(out),
@@ -38,6 +39,7 @@ public:
           V_(vocab_size),
           P_(with_pool && opt.relaxed_pool_multiplier > 0 ? opt.beam_size * opt.relaxed_pool_multiplier : opt.beam_size),
           with_pool_(with_pool && opt.relaxed_pool_multiplier > 0),
+          from_logits_(from_logits),
           alpha_(opt.length_penalty_alpha),
           eos_(opt.eos_token),
           min_length_(constraints && constraints->min_length >= 0 ? constraints->min_length : opt.min_length),
@@ -103,8 +105,10 @@ public:
     const int32_t* parents() const noexcept { return parents_.data(); }
     const int32_t* tokens() const noexcept { return tokens_.data(); }
 
-    // rows: this step's [K, V] log-probabilities (row b extends beam b).
-    void step(const float* rows) {
+    // rows: this step's [K, V] rows of `type` (row b extends beam b):
+    // log-probabilities, or logits when decoding from logits. A 16-bit row is
+    // converted only when its beam is expanded.
+    void step(const void* rows, DType type = DType::F32) {
         const int t = t_;
         std::fill(top_.begin(), top_.end(), Candidate{kNegInf, kNegInf, -1, -1, 0, 0});
         const int forced = c_ && c_->forced_tokens ? c_->forced_tokens[t] : -1;
@@ -122,7 +126,20 @@ public:
             }
 
             RowScan s;
-            s.row = rows + static_cast<size_t>(b) * static_cast<size_t>(V_);
+            s.row = row_as_float(rows, type, b);
+            if (from_logits_) {
+                // lp = x - logsumexp(row), computed on the fly by the scan.
+                const LogitStats stats = logit_stats(s.row, V_);
+                if (stats.invalid && opt_.validate_inputs) {
+                    throw std::invalid_argument("logits contain NaN or +inf" + location(t, b));
+                }
+                if (out_.row_lse) {
+                    out_.row_lse[static_cast<size_t>(t - origin_) * static_cast<size_t>(K_) + static_cast<size_t>(b)] = stats.lse;
+                }
+                if (stats.lse == kNegInf) continue;  // no finite logit: nothing to select
+                s.has_offset = true;
+                s.offset = stats.lse;
+            }
             s.banned = c_ ? c_->banned_tokens : nullptr;
             s.parent_raw = parent_raw;
             s.new_length = len_[static_cast<size_t>(b)] + 1;
@@ -209,7 +226,7 @@ private:
                 if (mask_[static_cast<size_t>(v)] & (kBanned | kNgram)) continue;
                 if (s.forced_token >= 0 && v != s.forced_token) continue;
                 if (v == s.masked_token) continue;
-                const float lp = s.row[v];
+                const float lp = row_log_prob(s, v);
                 if (!(lp < kInf) || lp == kNegInf) continue;
                 const float raw = s.parent_raw + (lp - log_penalty_);
                 insert_topk(top_.data(), P_, Candidate{raw * s.inv_penalty, raw, s.parent, v, s.new_length, 1});
@@ -225,7 +242,7 @@ private:
     bool scan_filtered(const RowScan& s, int t, const std::vector<int32_t>& prefix) {
         bool invalid = false;
         for (int v = 0; v < V_; ++v) {
-            const float lp = s.row[v];
+            const float lp = row_log_prob(s, v);
             if (!(lp < kInf)) invalid = true;
             if (s.forced_token >= 0 && v != s.forced_token) continue;
             const uint8_t m = mask_[static_cast<size_t>(v)];
@@ -242,6 +259,16 @@ private:
             insert_topk(top_.data(), P_, Candidate{raw * s.inv_penalty, raw, s.parent, v, s.new_length, 1});
         }
         return invalid;
+    }
+
+    // Row b of a step's rows as floats: a pointer into the input for float32,
+    // otherwise converted into row_buffer_.
+    const float* row_as_float(const void* rows, DType type, int b) {
+        const size_t offset = static_cast<size_t>(b) * static_cast<size_t>(V_);
+        if (type == DType::F32) return static_cast<const float*>(rows) + offset;
+        row_buffer_.resize(static_cast<size_t>(V_));
+        convert_to_float(static_cast<const uint16_t*>(rows) + offset, type, static_cast<size_t>(V_), row_buffer_.data());
+        return row_buffer_.data();
     }
 
     void record_pool(int t) {
@@ -309,6 +336,7 @@ private:
     int V_;
     int P_;  // candidates kept per step: K, or the relaxed pool size
     bool with_pool_;
+    bool from_logits_;
     float alpha_;
     int eos_;
     int min_length_;
@@ -325,6 +353,7 @@ private:
     std::vector<float> selected_scores_;
     std::vector<float> pool_scores_;
     std::vector<Candidate> top_;
+    std::vector<float> row_buffer_;  // one converted 16-bit row
 
     std::vector<uint8_t> mask_;
     std::vector<int32_t> touched_;
@@ -500,12 +529,21 @@ void scatter(const BackwardInputs& in, const Sink& sink, float* prev_raw_grad, i
     }
 }
 
+// The surrogate backward of one decode: every output is differentiated along
+// the path of tokens that produced it, holding the selection fixed. Per step,
+// from the last to the first, a selected beam's raw-score gradient is
+//     draw = next + drank * inv_penalty + g_raw [+ g_final_raw at the last step]
+// with drank = softmax-weight term + g_scores [+ g_final at the last step], and
+// then a pool candidate's is
+//     d = (relaxed term + g_pool_scores) * inv_penalty + g_pool_raw.
+// Terms whose gradient is not given are skipped, so any subset of gradients
+// gives the same bits as before the others existed.
 template <class Sink>
 void run_backward(
     const BackwardInputs& in,
     const float* grad_selected_weights,
     const float* grad_relaxed_weights,
-    const float* grad_final_scores,
+    const OutputGradients& g,
     const Sink& sink,
     AlignedFloatVector& grad_initial_scores) {
     const int T = in.T;
@@ -514,9 +552,13 @@ void run_backward(
     if (grad_selected_weights && !in.weights) {
         throw std::invalid_argument("grad_selected_weights needs the selected-beam weights of the forward result");
     }
-    if (grad_relaxed_weights && P <= 0) {
+    const bool pool_grads = grad_relaxed_weights || g.pool_scores || g.pool_raw_scores;
+    if (pool_grads && P <= 0) {
         throw std::invalid_argument(
-            "grad_relaxed_weights needs a relaxed pool: create the decoder with relaxed_pool_multiplier >= 1");
+            "relaxed-pool gradients need a relaxed pool: create the decoder with relaxed_pool_multiplier >= 1");
+    }
+    if (grad_relaxed_weights && !in.relaxed_weights) {
+        throw std::invalid_argument("grad_relaxed_weights needs the relaxed weights of the forward result");
     }
 
     AlignedFloatVector next_raw_grad(static_cast<size_t>(K), 0.0f);
@@ -526,8 +568,9 @@ void run_backward(
     for (int t = T - 1; t >= 0; --t) {
         std::fill(prev_raw_grad.begin(), prev_raw_grad.end(), 0.0f);
         const size_t base = static_cast<size_t>(t) * static_cast<size_t>(K);
+        const bool last = t == T - 1;
 
-        // Selected beams: final-score and softmax-weight gradients.
+        // Selected beams.
         const float* w = in.weights ? in.weights + base : nullptr;
         const float* gw = grad_selected_weights ? grad_selected_weights + base : nullptr;
         const float weighted_dot = gw ? dot(w, gw, K) : 0.0f;
@@ -537,41 +580,56 @@ void run_backward(
             if (parent < 0) continue;
             float drank = 0.0f;
             if (gw) drank += (w[k] * (gw[k] - weighted_dot)) / in.selected_temperature;
-            if (grad_final_scores && t == T - 1) drank += grad_final_scores[k];
+            if (g.scores) drank += g.scores[idx];
+            if (g.final_scores && last) drank += g.final_scores[k];
             const int len = std::max(1, static_cast<int>(in.lengths[idx]));
             const float inv_penalty = 1.0f / gnmt_length_penalty(len, in.alpha);
-            const float draw = next_raw_grad[static_cast<size_t>(k)] + drank * inv_penalty;
+            float draw = next_raw_grad[static_cast<size_t>(k)] + drank * inv_penalty;
+            if (g.raw_scores) draw += g.raw_scores[idx];
+            if (g.final_raw_scores && last) draw += g.final_raw_scores[k];
             scatter(in, sink, prev_raw_grad.data(), t, parent, in.tokens[idx], in.from_logprob[idx], draw,
                     Slot{static_cast<int64_t>(idx)});
         }
 
-        // Relaxed pool: implicit differentiation through the bisection threshold.
-        if (grad_relaxed_weights) {
+        // Pool candidates: the relaxed weights' implicit gradient through the
+        // bisection threshold, and the pool scores' own gradients.
+        if (pool_grads) {
             const size_t pbase = static_cast<size_t>(t) * static_cast<size_t>(P);
-            const float* r = in.relaxed_weights + pbase;
-            const float* gr = grad_relaxed_weights + pbase;
-            float denom = 0.0f;
-            float numer = 0.0f;
-            for (int p = 0; p < P; ++p) {
-                const float a = r[p] * (1.0f - r[p]);
-                denom += a;
-                numer += gr[p] * a;
-            }
-            if (denom > kEps) {
-                const float center = numer / denom;
-                const float inv_temp = 1.0f / in.soft_topk_temperature;
+            const float* r = grad_relaxed_weights ? in.relaxed_weights + pbase : nullptr;
+            const float* gr = grad_relaxed_weights ? grad_relaxed_weights + pbase : nullptr;
+            bool relaxed = false;
+            float center = 0.0f;
+            float inv_temp = 0.0f;
+            if (r) {
+                float denom = 0.0f;
+                float numer = 0.0f;
                 for (int p = 0; p < P; ++p) {
-                    const size_t idx = pbase + static_cast<size_t>(p);
-                    const int parent = in.pool_parents[idx];
-                    if (parent < 0) continue;
                     const float a = r[p] * (1.0f - r[p]);
-                    const float drank = a * inv_temp * (gr[p] - center);
-                    if (drank == 0.0f) continue;
-                    const int len = std::max(1, static_cast<int>(in.pool_lengths[idx]));
-                    const float inv_penalty = 1.0f / gnmt_length_penalty(len, in.alpha);
-                    scatter(in, sink, prev_raw_grad.data(), t, parent, in.pool_tokens[idx], in.pool_from_logprob[idx],
-                            drank * inv_penalty, kPoolCandidate);
+                    denom += a;
+                    numer += gr[p] * a;
                 }
+                if (denom > kEps) {
+                    relaxed = true;
+                    center = numer / denom;
+                    inv_temp = 1.0f / in.soft_topk_temperature;
+                }
+            }
+            for (int p = 0; p < P; ++p) {
+                const size_t idx = pbase + static_cast<size_t>(p);
+                const int parent = in.pool_parents[idx];
+                if (parent < 0) continue;
+                float drank = 0.0f;
+                if (relaxed) {
+                    const float a = r[p] * (1.0f - r[p]);
+                    drank += a * inv_temp * (gr[p] - center);
+                }
+                if (g.pool_scores) drank += g.pool_scores[idx];
+                const int len = std::max(1, static_cast<int>(in.pool_lengths[idx]));
+                const float inv_penalty = 1.0f / gnmt_length_penalty(len, in.alpha);
+                float d = drank * inv_penalty;
+                if (g.pool_raw_scores) d += g.pool_raw_scores[idx];
+                scatter(in, sink, prev_raw_grad.data(), t, parent, in.pool_tokens[idx], in.pool_from_logprob[idx], d,
+                        kPoolCandidate);
             }
         }
 
@@ -580,28 +638,34 @@ void run_backward(
     grad_initial_scores = next_raw_grad;
 }
 
-void finalize_sparse_entries(std::vector<SparseGradEntry>& entries, BackwardResult& out) {
-    if (entries.empty()) return;
-    // Stable, so entries for one index are summed in the order they were
-    // produced (the dense order) with every standard library.
+// Sorts entries by index and sums those with the same index, in the order they
+// were produced (stable sort, starting from 0 as a dense gradient does), so
+// the values are exactly the dense backward's.
+std::vector<SparseGradEntry> merge_sparse_entries(std::vector<SparseGradEntry>& entries) {
+    std::vector<SparseGradEntry> merged;
+    if (entries.empty()) return merged;
     std::stable_sort(entries.begin(), entries.end(),
                      [](const SparseGradEntry& a, const SparseGradEntry& b) { return a.index < b.index; });
-    out.sparse_logprob_indices.reserve(entries.size());
-    out.sparse_logprob_values.reserve(entries.size());
-    int64_t current = entries[0].index;
-    float sum = 0.0f;
+    SparseGradEntry current{entries[0].index, 0.0f};
     for (const SparseGradEntry& e : entries) {
-        if (e.index == current) {
-            sum += e.value;
-        } else {
-            out.sparse_logprob_indices.push_back(current);
-            out.sparse_logprob_values.push_back(sum);
-            current = e.index;
-            sum = e.value;
+        if (e.index != current.index) {
+            merged.push_back(current);
+            current = SparseGradEntry{e.index, 0.0f};
         }
+        current.value += e.value;
     }
-    out.sparse_logprob_indices.push_back(current);
-    out.sparse_logprob_values.push_back(sum);
+    merged.push_back(current);
+    return merged;
+}
+
+void finalize_sparse_entries(std::vector<SparseGradEntry>& entries, BackwardResult& out) {
+    const std::vector<SparseGradEntry> merged = merge_sparse_entries(entries);
+    out.sparse_logprob_indices.reserve(merged.size());
+    out.sparse_logprob_values.reserve(merged.size());
+    for (const SparseGradEntry& e : merged) {
+        out.sparse_logprob_indices.push_back(e.index);
+        out.sparse_logprob_values.push_back(e.value);
+    }
 }
 
 } // namespace
@@ -650,8 +714,33 @@ DecodeResult BeamSearchDecoder::decode_constrained(
     return result;
 }
 
+DecodeResult BeamSearchDecoder::decode_typed(
+    const void* log_probs,
+    DType type,
+    int steps,
+    int vocab_size,
+    const DecodeConstraints* constraints,
+    int64_t step_stride) const {
+    if (!log_probs) throw std::invalid_argument("log_probs cannot be null");
+    check_decode_args(opt_, steps, vocab_size, constraints);
+    const int64_t row_block = static_cast<int64_t>(opt_.beam_size) * vocab_size;
+    if (step_stride == 0) step_stride = row_block;
+    if (step_stride < row_block) throw std::invalid_argument("step stride is smaller than beam_size * vocab_size");
+
+    DecodeResult result;
+    const TraceOutputs out = allocate_result(result, opt_, steps, vocab_size);
+    BeamSearch search(opt_, vocab_size, constraints, out, /*with_pool=*/true);
+    const char* base = static_cast<const char*>(log_probs);
+    const size_t step_bytes = static_cast<size_t>(step_stride) * dtype_size(type);
+    for (int t = 0; t < steps; ++t) search.step(base + static_cast<size_t>(t) * step_bytes, type);
+    search.finish(result.final_scores.data(), result.final_raw_scores.data(), nullptr);
+    return result;
+}
+
 void BeamSearchDecoder::decode_into(
-    const float* log_probs,
+    const void* log_probs,
+    DType type,
+    bool from_logits,
     int steps,
     int vocab_size,
     const DecodeConstraints* constraints,
@@ -660,11 +749,21 @@ void BeamSearchDecoder::decode_into(
     float* final_raw_scores,
     int32_t* final_lengths) const {
     if (!log_probs) throw std::invalid_argument("log_probs cannot be null");
+    if (trace.weights || trace.relaxed_weights) {
+        throw std::invalid_argument("decode_into does not compute selected-beam or relaxed weights");
+    }
     check_decode_args(opt_, steps, vocab_size, constraints);
-    // The relaxed pool never changes which beams are selected; it is not kept here.
-    BeamSearch search(opt_, vocab_size, constraints, trace, /*with_pool=*/false);
-    const size_t row_block = static_cast<size_t>(opt_.beam_size) * static_cast<size_t>(vocab_size);
-    for (int t = 0; t < steps; ++t) search.step(log_probs + static_cast<size_t>(t) * row_block);
+    // The pool never changes which beams are selected; it is kept only when
+    // the caller asks for it.
+    const bool pool = trace.pool_parents || trace.pool_tokens || trace.pool_lengths || trace.pool_scores ||
+                      trace.pool_raw_scores || trace.pool_from_logprob;
+    if (pool && opt_.relaxed_pool_multiplier <= 0) {
+        throw std::invalid_argument("pool outputs need a relaxed pool: set relaxed_pool_multiplier >= 1");
+    }
+    BeamSearch search(opt_, vocab_size, constraints, trace, pool, from_logits);
+    const char* base = static_cast<const char*>(log_probs);
+    const size_t step_bytes = static_cast<size_t>(opt_.beam_size) * static_cast<size_t>(vocab_size) * dtype_size(type);
+    for (int t = 0; t < steps; ++t) search.step(base + static_cast<size_t>(t) * step_bytes, type);
     search.finish(final_scores, final_raw_scores, final_lengths);
 }
 
@@ -785,7 +884,9 @@ BackwardResult BeamSearchDecoder::backward(
     BackwardResult out;
     out.sparse = false;
     out.grad_log_probs.assign(dense_count, 0.0f);
-    run_backward(inputs_from(fwd), grad_selected_weights, grad_relaxed_weights, grad_final_scores,
+    OutputGradients g;
+    g.final_scores = grad_final_scores;
+    run_backward(inputs_from(fwd), grad_selected_weights, grad_relaxed_weights, g,
                  DenseSink{out.grad_log_probs.data()}, out.grad_initial_scores);
     return out;
 }
@@ -799,7 +900,9 @@ BackwardResult BeamSearchDecoder::backward_sparse(
     out.sparse = true;
     std::vector<SparseGradEntry> entries;
     entries.reserve(static_cast<size_t>(fwd.steps) * static_cast<size_t>(fwd.beam_size + fwd.relaxed_pool_size));
-    run_backward(inputs_from(fwd), grad_selected_weights, grad_relaxed_weights, grad_final_scores,
+    OutputGradients g;
+    g.final_scores = grad_final_scores;
+    run_backward(inputs_from(fwd), grad_selected_weights, grad_relaxed_weights, g,
                  SparseSink{&entries}, out.grad_initial_scores);
     finalize_sparse_entries(entries, out);
     return out;
@@ -807,18 +910,19 @@ BackwardResult BeamSearchDecoder::backward_sparse(
 
 namespace {
 
-// Backward inputs of a trace, after checking that its indexes stay in range.
-BackwardInputs trusted_trace(const TraceView& trace, const float* grad_final_scores, const void* out) {
+// Backward inputs of a trace, after checking that its indexes stay in range
+// (they index the gradient buffer, so they are only trusted in range).
+BackwardInputs trusted_trace(const TraceView& trace) {
     const int T = trace.steps;
     const int K = trace.beam_size;
     const int V = trace.vocab_size;
-    if (T <= 0 || K <= 0 || V <= 0) throw std::invalid_argument("trace dimensions must be positive");
-    if (!trace.parents || !trace.tokens || !trace.lengths || !trace.from_logprob || !grad_final_scores || !out) {
-        throw std::invalid_argument("trace, grad_final_scores and the output cannot be null");
+    const int P = trace.pool_size;
+    if (T <= 0 || K <= 0 || V <= 0 || P < 0) throw std::invalid_argument("trace dimensions must be positive");
+    if (!trace.parents || !trace.tokens || !trace.lengths || !trace.from_logprob) {
+        throw std::invalid_argument("the trace cannot be null");
     }
     const size_t n = static_cast<size_t>(T) * static_cast<size_t>(K);
     for (size_t i = 0; i < n; ++i) {
-        // The trace indexes the gradient buffer, so it is only trusted in range.
         if (trace.parents[i] < -1 || trace.parents[i] >= K || trace.tokens[i] < -1 || trace.tokens[i] >= V ||
             trace.lengths[i] < 0) {
             throw std::invalid_argument("decode trace is out of range (parents, tokens or lengths)");
@@ -833,22 +937,56 @@ BackwardInputs trusted_trace(const TraceView& trace, const float* grad_final_sco
     in.tokens = trace.tokens;
     in.lengths = trace.lengths;
     in.from_logprob = trace.from_logprob;
+    if (P > 0) {
+        if (!trace.pool_parents || !trace.pool_tokens || !trace.pool_lengths || !trace.pool_from_logprob) {
+            throw std::invalid_argument("the pool trace cannot be null when pool_size > 0");
+        }
+        const size_t np = static_cast<size_t>(T) * static_cast<size_t>(P);
+        for (size_t i = 0; i < np; ++i) {
+            if (trace.pool_parents[i] < -1 || trace.pool_parents[i] >= K || trace.pool_tokens[i] < -1 ||
+                trace.pool_tokens[i] >= V || trace.pool_lengths[i] < 0) {
+                throw std::invalid_argument("pool trace is out of range (parents, tokens or lengths)");
+            }
+        }
+        in.P = P;
+        in.pool_parents = trace.pool_parents;
+        in.pool_tokens = trace.pool_tokens;
+        in.pool_lengths = trace.pool_lengths;
+        in.pool_from_logprob = trace.pool_from_logprob;
+    }
     return in;
+}
+
+OutputGradients final_only(const float* grad_final_scores) {
+    OutputGradients g;
+    g.final_scores = grad_final_scores;
+    return g;
 }
 
 } // namespace
 
-void final_scores_backward_into(const TraceView& trace, const float* grad_final_scores, float* grad_log_probs) {
-    const BackwardInputs in = trusted_trace(trace, grad_final_scores, grad_log_probs);
+std::vector<SparseGradEntry> path_gradient(const TraceView& trace, const OutputGradients& grads) {
+    const BackwardInputs in = trusted_trace(trace);
+    std::vector<SparseGradEntry> entries;
+    entries.reserve(static_cast<size_t>(in.T) * static_cast<size_t>(in.K + in.P));
     AlignedFloatVector grad_initial;
-    run_backward(in, nullptr, nullptr, grad_final_scores, DenseSink{grad_log_probs}, grad_initial);
+    run_backward(in, nullptr, nullptr, grads, SparseSink{&entries}, grad_initial);
+    return merge_sparse_entries(entries);
+}
+
+void final_scores_backward_into(const TraceView& trace, const float* grad_final_scores, float* grad_log_probs) {
+    if (!grad_final_scores || !grad_log_probs) throw std::invalid_argument("grad_final_scores and the output cannot be null");
+    const BackwardInputs in = trusted_trace(trace);
+    AlignedFloatVector grad_initial;
+    run_backward(in, nullptr, nullptr, final_only(grad_final_scores), DenseSink{grad_log_probs}, grad_initial);
 }
 
 void final_scores_path_gradient(const TraceView& trace, const float* grad_final_scores, float* draws) {
-    const BackwardInputs in = trusted_trace(trace, grad_final_scores, draws);
+    if (!grad_final_scores || !draws) throw std::invalid_argument("grad_final_scores and the output cannot be null");
+    const BackwardInputs in = trusted_trace(trace);
     std::fill(draws, draws + static_cast<size_t>(in.T) * static_cast<size_t>(in.K), 0.0f);
     AlignedFloatVector grad_initial;
-    run_backward(in, nullptr, nullptr, grad_final_scores, SlotSink{draws}, grad_initial);
+    run_backward(in, nullptr, nullptr, final_only(grad_final_scores), SlotSink{draws}, grad_initial);
 }
 
 } // namespace dbs

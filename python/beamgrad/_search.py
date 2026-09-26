@@ -54,7 +54,7 @@ class BeamSearchResult(NamedTuple):
     scores: torch.Tensor  # [B, K] final length-penalised scores, best first; differentiable
     sequences: torch.Tensor  # [B, K, max_steps] each final beam's tokens (int64), -1 past its length
     lengths: torch.Tensor  # [B, K] int64 hypothesis lengths
-    raw_scores: torch.Tensor  # [B, K] cumulative log-probabilities (no gradient)
+    raw_scores: torch.Tensor  # [B, K] cumulative log-probabilities; differentiable from search(), not beam_search()
     trace: BeamSearchOutput  # the per-step trace, as decode(torch.stack(step_log_probs, 1), options) returns it
     step_log_probs: tuple[torch.Tensor, ...]  # the T [B, K, V] tensors step_fn returned, or () (see return_log_probs)
 
@@ -255,7 +255,9 @@ def sequence_scores(token_log_probs: torch.Tensor, lengths: torch.Tensor, option
     return raw / length_penalty(lengths, options.length_penalty_alpha)
 
 
-def search(log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike = None) -> BeamSearchResult:
+def search(
+    log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike = None, *, from_logits: bool = False
+) -> BeamSearchResult:
     """Beam search over precomputed ``[B, T, K, V]`` rows: scores and trace from one decode.
 
     The same search as :func:`beamgrad.final_scores` and :func:`beamgrad.decode`
@@ -263,11 +265,16 @@ def search(log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike = Non
     like :func:`beam_search`'s: ``scores`` are differentiable (the path
     gradient of ``final_scores``), and ``step_log_probs`` are the input's steps
     (views, not copies). Unbatched ``[T, K, V]`` input gives unbatched results.
+
+    With ``from_logits`` the rows are logits (see :func:`beamgrad.final_scores`).
+    ``step_log_probs`` is then empty: the rows' log-probabilities are never
+    materialised, and :mod:`beamgrad.estimators`, which read them, need
+    ``log_softmax(logits)`` passed without ``from_logits`` instead.
     """
     x, steps_t, banned, unbatched = _prepare(log_probs, options, steps)
     B, T = x.shape[:2]
-    final, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob = _decode_outputs(
-        x, steps_t, banned, options
+    final, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob, _ = _decode_outputs(
+        x, from_logits, steps_t, banned, options
     )
     trace = BeamSearchOutput(
         final_scores=final.detach(),
@@ -290,7 +297,7 @@ def search(log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike = Non
         lengths=trace.final_lengths,
         raw_scores=final_raw,
         trace=trace,
-        step_log_probs=tuple(rows.unbind(1)),
+        step_log_probs=() if from_logits else tuple(rows.unbind(1)),
     )
     if unbatched:
         result = BeamSearchResult(
@@ -299,7 +306,7 @@ def search(log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike = Non
             lengths=trace.final_lengths.squeeze(0),
             raw_scores=final_raw.squeeze(0),
             trace=BeamSearchOutput(*(t.squeeze(0) for t in trace)),
-            step_log_probs=tuple(log_probs.unbind(0)),
+            step_log_probs=() if from_logits else tuple(log_probs.unbind(0)),
         )
     return result
 

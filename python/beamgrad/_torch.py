@@ -1,14 +1,17 @@
 # SPDX-License-Identifier: MIT
 """PyTorch front end: autograd-aware beam search on CPU and CUDA.
 
-The work is done by two operators registered with ``torch.library``:
-``torch.ops.beamgrad.decode`` and ``torch.ops.beamgrad.final_scores_backward``.
-They have fake (meta) implementations, an autograd formula and a vmap rule, so
-they work under ``torch.compile`` (without graph breaks), ``torch.export``,
-fake-tensor tracing and ``torch.vmap``. :func:`final_scores` differentiates
-through an ``autograd.Function`` with a separate ``setup_context``, which
-``torch.func`` transforms (``grad``, ``vjp``, ``jacrev``, ``vmap`` of those)
-require.
+The work is done by operators registered with ``torch.library``:
+``torch.ops.beamgrad.decode_ex`` (float32, float16 or bfloat16 log-probs or
+logits) and ``torch.ops.beamgrad.decode_backward`` (the surrogate gradient of
+any of its score outputs). ``decode`` and ``final_scores_backward``, their
+float32, final-score-only predecessors, remain registered. They have fake
+(meta) implementations, an autograd formula and a vmap rule, so they work
+under ``torch.compile`` (without graph breaks), ``torch.export``, fake-tensor
+tracing and ``torch.vmap``. :func:`final_scores` and :func:`decode`
+differentiate through an ``autograd.Function`` with a separate
+``setup_context``, which ``torch.func`` transforms (``grad``, ``vjp``,
+``jacrev``, ``vmap`` of those) require.
 """
 
 from __future__ import annotations
@@ -136,6 +139,32 @@ def _decode_fake(
     )
 
 
+@torch.library.register_fake("beamgrad::decode_ex")
+def _decode_ex_fake(inputs, from_logits, steps, *options):
+    B, T, K, _ = inputs.shape
+    return (*_decode_fake(inputs, steps, *options), inputs.new_empty((B, T, K), dtype=torch.float32))
+
+
+@torch.library.register_fake("beamgrad::decode_backward")
+def _decode_backward_fake(
+    grad_final_scores,
+    grad_final_raw_scores,
+    grad_scores,
+    grad_raw_scores,
+    parents,
+    tokens,
+    lengths,
+    from_logprob,
+    steps,
+    vocab_size,
+    length_penalty_alpha,
+    logits,
+    row_lse,
+):
+    B, T, K = parents.shape
+    return parents.new_empty((B, T, K, vocab_size), dtype=torch.float32)
+
+
 @torch.library.register_fake("beamgrad::decode_step")
 def _decode_step_fake(
     log_probs,
@@ -212,6 +241,51 @@ def _decode_backward(ctx, grad_final_scores, *unused_grads):
 torch.library.register_autograd("beamgrad::decode", _decode_backward, setup_context=_decode_setup_context)
 
 
+def _save_decode(ctx, x, from_logits, steps, length_penalty_alpha, output):
+    """setup_context of decode_ex: its scores (final and per step, raw and penalised) are differentiable."""
+    _, _, final_lengths, tokens, parents, lengths, _, _, from_logprob, row_lse = output
+    ctx.mark_non_differentiable(final_lengths, tokens, parents, lengths, from_logprob, row_lse)
+    ctx.set_materialize_grads(False)
+    logits, lse = (x, row_lse) if from_logits else (None, None)
+    ctx.save_for_backward(parents, tokens, lengths, from_logprob, steps, logits, lse)
+    ctx.vocab_size = x.shape[-1]
+    ctx.length_penalty_alpha = float(length_penalty_alpha)
+    ctx.input_dtype = x.dtype
+
+
+def _decode_grad(ctx, grad_final, grad_final_raw, _l, _t, _p, _n, grad_scores, grad_raw, _f, _r):
+    """The input gradient of decode_ex's outputs (see _save_decode)."""
+    grads = (grad_final, grad_final_raw, grad_scores, grad_raw)
+    if all(g is None for g in grads):
+        return None
+    parents, tokens, lengths, from_logprob, steps, logits, row_lse = ctx.saved_tensors
+    grad = torch.ops.beamgrad.decode_backward(
+        *(None if g is None else g.to(torch.float32).contiguous() for g in grads),
+        parents,
+        tokens,
+        lengths,
+        from_logprob,
+        steps,
+        ctx.vocab_size,
+        ctx.length_penalty_alpha,
+        logits,
+        row_lse,
+    )
+    return grad.to(ctx.input_dtype)
+
+
+def _decode_ex_setup_context(ctx, inputs, output):
+    x, from_logits, steps, _, _, length_penalty_alpha = inputs[:6]
+    _save_decode(ctx, x, from_logits, steps, length_penalty_alpha, output)
+
+
+def _decode_ex_backward(ctx, *grads):
+    return (_decode_grad(ctx, *grads),) + (None,) * 9
+
+
+torch.library.register_autograd("beamgrad::decode_ex", _decode_ex_backward, setup_context=_decode_ex_setup_context)
+
+
 def _merge_vmap_dim(tensor, dim, size):
     """Moves (or adds) the vmapped dimension to the front and folds it into the batch."""
     tensor = tensor.movedim(dim, 0) if dim is not None else tensor.expand(size, *tensor.shape)
@@ -226,6 +300,26 @@ def _decode_vmap(info, in_dims, log_probs, steps, *options):
     s = None if steps is None else _merge_vmap_dim(steps, in_dims[1], n)
     outputs = torch.ops.beamgrad.decode(x, s, *options)
     return tuple(o.reshape(n, o.shape[0] // n, *o.shape[1:]) for o in outputs), (0,) * len(outputs)
+
+
+def _decode_ex_vmap(info, in_dims, inputs, from_logits, steps, *options):
+    if any(dim is not None for dim in in_dims[3:]):
+        raise NotImplementedError("beamgrad: vmap over banned_tokens is not supported")
+    n = info.batch_size
+    x = _merge_vmap_dim(inputs, in_dims[0], n)
+    s = None if steps is None else _merge_vmap_dim(steps, in_dims[2], n)
+    outputs = torch.ops.beamgrad.decode_ex(x, from_logits, s, *options)
+    return tuple(o.reshape(n, o.shape[0] // n, *o.shape[1:]) for o in outputs), (0,) * len(outputs)
+
+
+def _decode_backward_vmap(info, in_dims, *args):
+    n = info.batch_size
+    # Every tensor argument, batched or not, is folded into the batch dimension.
+    merged = [
+        a if not isinstance(a, torch.Tensor) else _merge_vmap_dim(a, d, n) for a, d in zip(args, in_dims, strict=True)
+    ]
+    grad = torch.ops.beamgrad.decode_backward(*merged)
+    return grad.reshape(n, grad.shape[0] // n, *grad.shape[1:]), 0
 
 
 def _final_scores_backward_vmap(
@@ -248,6 +342,8 @@ if hasattr(torch.library, "register_vmap"):  # PyTorch 2.5+
     torch.library.register_vmap("beamgrad::decode", _decode_vmap)
     torch.library.register_vmap("beamgrad::final_scores_backward", _final_scores_backward_vmap)
     torch.library.register_vmap("beamgrad::length_penalty", _length_penalty_vmap)
+    torch.library.register_vmap("beamgrad::decode_ex", _decode_ex_vmap)
+    torch.library.register_vmap("beamgrad::decode_backward", _decode_backward_vmap)
 
 
 # ---------------------------------------------------------------------------
@@ -255,10 +351,16 @@ if hasattr(torch.library, "register_vmap"):  # PyTorch 2.5+
 # ---------------------------------------------------------------------------
 
 
+_NATIVE_DTYPES = (torch.float32, torch.float16, torch.bfloat16)
+
+
 def _prepare(
     log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike
 ) -> tuple[torch.Tensor, torch.Tensor | None, torch.Tensor | None, bool]:
-    """Check shapes and return (x [B,T,K,V] float32, steps [B] | None, banned [V] | None, unbatched).
+    """Check shapes and return (x [B,T,K,V], steps [B] | None, banned [V] | None, unbatched).
+
+    ``x`` keeps a float16 or bfloat16 dtype (the operators read those rows as
+    they are, without a float32 copy); other floating dtypes become float32.
 
     Only static properties are checked here; values (NaN/+inf, the range of
     steps) are checked inside the operators, which keeps this traceable.
@@ -300,7 +402,9 @@ def _prepare(
     elif device != "cpu":
         raise RuntimeError(f"beamgrad supports CPU and CUDA tensors, got device {x.device}")
 
-    x = x.to(torch.float32).contiguous()
+    if x.dtype not in _NATIVE_DTYPES:
+        x = x.to(torch.float32)
+    x = x.contiguous()
 
     steps_t: torch.Tensor | None = None
     if steps is not None:
@@ -321,9 +425,12 @@ def _prepare(
     return x, steps_t, banned, unbatched
 
 
-def _decode_op(x: torch.Tensor, steps_t: torch.Tensor | None, banned: torch.Tensor | None, options: BeamOptions):
-    return torch.ops.beamgrad.decode(
+def _decode_op(
+    x: torch.Tensor, from_logits: bool, steps_t: torch.Tensor | None, banned: torch.Tensor | None, options: BeamOptions
+):
+    return torch.ops.beamgrad.decode_ex(
         x,
+        bool(from_logits),
         steps_t,
         options.eos_token,
         options.min_length,
@@ -335,10 +442,10 @@ def _decode_op(x: torch.Tensor, steps_t: torch.Tensor | None, banned: torch.Tens
     )
 
 
-class _FinalScores(torch.autograd.Function):
-    """The final scores (differentiable) and the whole decode trace, from one decode.
+class _Decode(torch.autograd.Function):
+    """The decode operator's outputs, with the surrogate gradients of its scores.
 
-    ``torch.ops.beamgrad.decode`` carries its own autograd formula, but
+    ``torch.ops.beamgrad.decode_ex`` carries its own autograd formula, but
     ``torch.library`` implements it as an ``autograd.Function`` whose forward
     takes ``ctx``, which ``torch.func`` transforms reject. This function has
     the same backward and a separate ``setup_context``; its vmap rule is
@@ -348,35 +455,18 @@ class _FinalScores(torch.autograd.Function):
     generate_vmap_rule = True
 
     @staticmethod
-    def forward(x, steps, banned, options):
-        # final_scores, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob
-        return _decode_op(x, steps, banned, options)
+    def forward(x, from_logits, steps, banned, options):
+        # final_scores, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob, row_lse
+        return _decode_op(x, from_logits, steps, banned, options)
 
     @staticmethod
     def setup_context(ctx, inputs, output):
-        x, steps, _, options = inputs
-        _, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob = output
-        ctx.mark_non_differentiable(
-            final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob
-        )
-        ctx.save_for_backward(parents, tokens, lengths, from_logprob, steps)
-        ctx.vocab_size = x.shape[-1]
-        ctx.length_penalty_alpha = float(options.length_penalty_alpha)
+        x, from_logits, steps, _, options = inputs
+        _save_decode(ctx, x, from_logits, steps, options.length_penalty_alpha, output)
 
     @staticmethod
-    def backward(ctx, grad_final_scores, *unused_grads):
-        parents, tokens, lengths, from_logprob, steps = ctx.saved_tensors
-        grad = torch.ops.beamgrad.final_scores_backward(
-            grad_final_scores.to(torch.float32).contiguous(),
-            parents,
-            tokens,
-            lengths,
-            from_logprob,
-            steps,
-            ctx.vocab_size,
-            ctx.length_penalty_alpha,
-        )
-        return grad, None, None, None
+    def backward(ctx, *grads):
+        return _decode_grad(ctx, *grads), None, None, None, None
 
 
 def length_penalty(lengths: torch.Tensor, alpha: float) -> torch.Tensor:
@@ -392,27 +482,41 @@ def length_penalty(lengths: torch.Tensor, alpha: float) -> torch.Tensor:
     return torch.ops.beamgrad.length_penalty(lengths, alpha)
 
 
-def _decode_outputs(x: torch.Tensor, steps: torch.Tensor | None, banned: torch.Tensor | None, options: BeamOptions):
-    """The decode operator's outputs, with the final scores' surrogate gradient when ``x`` needs one."""
+def _decode_outputs(
+    x: torch.Tensor,
+    from_logits: bool,
+    steps: torch.Tensor | None,
+    banned: torch.Tensor | None,
+    options: BeamOptions,
+):
+    """The decode operator's outputs, with the scores' surrogate gradients when ``x`` needs them."""
     if torch.is_grad_enabled() and x.requires_grad:  # also true inside torch.func.grad, vjp and jacrev
-        return _FinalScores.apply(x, steps, banned, options)
-    # Nothing to differentiate: the operator alone, as decode() calls it. Same values; and PyTorch 2.4's
-    # Dynamo mis-traces an autograd.Function with a separate setup_context when no input requires grad.
-    return _decode_op(x, steps, banned, options)
+        return _Decode.apply(x, from_logits, steps, banned, options)
+    # Nothing to differentiate: the operator alone. Same values; and PyTorch 2.4's Dynamo
+    # mis-traces an autograd.Function with a separate setup_context when no input requires grad.
+    return _decode_op(x, from_logits, steps, banned, options)
 
 
-def final_scores(log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike = None) -> torch.Tensor:
+def final_scores(
+    log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike = None, *, from_logits: bool = False
+) -> torch.Tensor:
     """Run beam search and return the final beam scores, with surrogate gradients.
 
     Args:
         log_probs: Per-step log-probabilities, ``[T, K, V]`` or ``[B, T, K, V]``,
-            on CPU or CUDA, in any floating dtype (computation is float32).
+            on CPU or CUDA, in any floating dtype. float16 and bfloat16 are read
+            as they are; the computation is float32.
             ``log_probs[b, t, k]`` scores the next token for beam ``k`` at step
             ``t``, i.e. row ``k`` is the distribution conditioned on beam ``k``'s
             prefix. At ``t = 0`` only beam 0 is live.
         options: :class:`BeamOptions`; ``beam_size`` must equal ``K``.
         steps: Optional ``[B]`` number of steps to decode per example (batched
             input only), each in ``[1, T]``. Defaults to ``T`` for every example.
+        from_logits: The rows are logits rather than log-probabilities. Each row
+            the search reads is normalised on the fly (``x - logsumexp(row)``,
+            with the library's deterministic logsumexp), so the search is the
+            one over ``log_softmax(logits)`` without materialising it, and the
+            gradient flows through the log-softmax to the logits.
 
     Returns:
         ``[K]`` or ``[B, K]`` final scores (float32), best beam first.
@@ -422,22 +526,29 @@ def final_scores(log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike
     holding the beam selection fixed.
     """
     x, steps_t, banned, unbatched = _prepare(log_probs, options, steps)
-    scores = _decode_outputs(x, steps_t, banned, options)[0]
+    scores = _decode_outputs(x, from_logits, steps_t, banned, options)[0]
     return scores.squeeze(0) if unbatched else scores
 
 
-@torch.no_grad()
-def decode(log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike = None) -> BeamSearchOutput:
-    """Run beam search and return the full trace (no gradients).
+def decode(
+    log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike = None, *, from_logits: bool = False
+) -> BeamSearchOutput:
+    """Run beam search and return the full trace.
 
     Takes the same arguments as :func:`final_scores`. See
     :class:`BeamSearchOutput` for the returned fields and
     :func:`backtrack` to recover each final beam's token sequence.
+
+    When ``log_probs`` requires grad, the scores (``final_scores``,
+    ``final_raw_scores``, ``scores``, ``raw_scores``) are differentiable: each
+    score's gradient flows along the path of tokens that produced it, holding
+    the beam selection fixed, as for :func:`final_scores` (through the
+    log-softmax with ``from_logits``).
     """
     x, steps_t, banned, unbatched = _prepare(log_probs, options, steps)
     B, T = x.shape[:2]
-    out = _decode_op(x, steps_t, banned, options)
-    final_scores_, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob = out
+    out = _decode_outputs(x, from_logits, steps_t, banned, options)
+    final_scores_, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob, _ = out
     decoded_steps = torch.full((B,), T, dtype=torch.long, device=x.device) if steps_t is None else steps_t.long()
     result = BeamSearchOutput(
         final_scores=final_scores_,

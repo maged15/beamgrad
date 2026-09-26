@@ -238,3 +238,63 @@ def test_decode_step_rejects_live_beams_of_different_lengths():
         for a, b in zip(cpu, gpu, strict=True):
             assert torch.equal(a, b.cpu())
     run("cuda", [1, 5], 3.0, validate=False)  # unchecked without validation, as documented
+
+
+def score_loss(trace, seed=0):
+    """A loss on every score output with random weights (-inf slots left out)."""
+    g = torch.Generator().manual_seed(seed)
+    total = 0.0
+    for name in ("final_scores", "final_raw_scores", "scores", "raw_scores"):
+        value = getattr(trace, name)
+        weights = torch.randn(value.shape, generator=g).to(value.device)
+        total = total + torch.where(torch.isfinite(value), value, 0.0).mul(weights).sum()
+    return total
+
+
+@pytest.mark.parametrize("shape,options", CASES)
+@pytest.mark.parametrize("dtype", [torch.float32, torch.float16, torch.bfloat16])
+@pytest.mark.parametrize("from_logits", [False, True])
+def test_logits_and_half_inputs_match_cpu(shape, options, dtype, from_logits):
+    # Every decode output and the gradient of all the score outputs, bit for bit.
+    g = torch.Generator().manual_seed(sum(shape) + 1)
+    x = torch.randn(*shape, generator=g) * 3.0
+    if not from_logits:
+        x = torch.log_softmax(x, -1)
+    x = x.to(dtype)
+    cpu = x.clone().requires_grad_(True)
+    gpu = x.cuda().requires_grad_(True)
+    a = decode(cpu, options, from_logits=from_logits)
+    b = decode(gpu, options, from_logits=from_logits)
+    for name in a._fields:
+        assert torch.equal(getattr(b, name).detach().cpu(), getattr(a, name).detach()), name
+    score_loss(a).backward()
+    score_loss(b).backward()
+    assert gpu.grad.dtype == dtype
+    assert torch.equal(gpu.grad.cpu(), cpu.grad)
+
+
+def test_row_logsumexp_matches_cpu():
+    x = torch.randn(2, 5, 4, 3000, generator=torch.Generator().manual_seed(3)) * 4.0
+    args = (None, 2, 1, 0.6, None, 0, 1.0, True)
+    cpu = torch.ops.beamgrad.decode_ex(x, True, *args)
+    gpu = torch.ops.beamgrad.decode_ex(x.cuda(), True, *args)
+    for a, b in zip(cpu, gpu, strict=True):
+        assert torch.equal(b.cpu(), a)
+
+
+@pytest.mark.parametrize("from_logits", [False, True])
+def test_differentiable_decode_with_steps_matches_cpu(from_logits):
+    options = BeamOptions(beam_size=3, eos_token=2, length_penalty_alpha=0.6)
+    x = torch.randn(4, 6, 3, 40, generator=torch.Generator().manual_seed(1)) * 3.0
+    if not from_logits:
+        x = torch.log_softmax(x, -1)
+    steps = [6, 2, 4, 1]
+    cpu = x.clone().requires_grad_(True)
+    gpu = x.cuda().requires_grad_(True)
+    a = decode(cpu, options, steps=steps, from_logits=from_logits)
+    b = decode(gpu, options, steps=steps, from_logits=from_logits)
+    for name in a._fields:
+        assert torch.equal(getattr(b, name).detach().cpu(), getattr(a, name).detach()), name
+    score_loss(a).backward()
+    score_loss(b).backward()
+    assert torch.equal(gpu.grad.cpu(), cpu.grad)

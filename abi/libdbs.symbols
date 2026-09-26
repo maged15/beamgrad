@@ -4,6 +4,7 @@ dbs_allocator_call_count
 dbs_allocator_counters_reset
 dbs_backward
 dbs_backward_batch_into
+dbs_backward_batch_into_ex
 dbs_backward_default
 dbs_backward_dense
 dbs_backward_grad_initial_scores
@@ -22,6 +23,7 @@ dbs_create_ex
 dbs_decode
 dbs_decode_batch
 dbs_decode_batch_into
+dbs_decode_batch_into_ex
 dbs_decode_batch_typed
 dbs_decode_batch_variable
 dbs_decode_constrained

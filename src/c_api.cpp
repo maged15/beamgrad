@@ -202,54 +202,11 @@ dbs::DecodeConstraints from_c_constraints(const DBSAdvancedConstraintsC& c) {
     return out;
 }
 
-float fp16_to_float(uint16_t h) noexcept {
-    const uint32_t sign = (static_cast<uint32_t>(h & 0x8000u)) << 16;
-    const uint32_t exp = (h >> 10) & 0x1fu;
-    const uint32_t mant = h & 0x03ffu;
-    uint32_t out = 0;
-    if (exp == 0) {
-        if (mant == 0) {
-            out = sign;
-        } else {
-            uint32_t m = mant;
-            uint32_t e = 113u;
-            while ((m & 0x0400u) == 0) {
-                m <<= 1;
-                --e;
-            }
-            m &= 0x03ffu;
-            out = sign | (e << 23) | (m << 13);
-        }
-    } else if (exp == 31) {
-        out = sign | 0x7f800000u | (mant << 13);
-    } else {
-        out = sign | ((exp + 112u) << 23) | (mant << 13);
-    }
-    float f;
-    std::memcpy(&f, &out, sizeof(f));
-    return f;
-}
-
-float bf16_to_float(uint16_t h) noexcept {
-    const uint32_t bits = static_cast<uint32_t>(h) << 16;
-    float f;
-    std::memcpy(&f, &bits, sizeof(f));
-    return f;
-}
-
-std::vector<float> convert_to_f32(const void* data, int data_type, size_t count) {
-    require(data != nullptr, "log_probs cannot be null");
-    std::vector<float> out(count);
-    if (data_type == DBS_DTYPE_F16) {
-        const uint16_t* p = static_cast<const uint16_t*>(data);
-        for (size_t i = 0; i < count; ++i) out[i] = fp16_to_float(p[i]);
-    } else if (data_type == DBS_DTYPE_BF16) {
-        const uint16_t* p = static_cast<const uint16_t*>(data);
-        for (size_t i = 0; i < count; ++i) out[i] = bf16_to_float(p[i]);
-    } else {
-        throw std::invalid_argument("unsupported DBS data type");
-    }
-    return out;
+// A C data type as the decoder's element type.
+dbs::DType dtype_of(int data_type) {
+    require(data_type == DBS_DTYPE_F32 || data_type == DBS_DTYPE_F16 || data_type == DBS_DTYPE_BF16,
+            "unsupported DBS data type");
+    return static_cast<dbs::DType>(data_type);
 }
 
 // Below this much work, starting threads costs more than it saves. Work is the
@@ -448,20 +405,17 @@ extern "C" DBS_EXPORT int dbs_decode_typed(
     DBSResultHandle** out_result
 ) {
     if (out_result) *out_result = nullptr;
-    if (data_type == DBS_DTYPE_F32) {
-        return dbs_decode(handle, static_cast<const float*>(log_probs), steps, vocab_size, out_result);
-    }
-    std::vector<float> f32;
-    const int rc = guarded(handle, [&] {
+    return guarded(handle, [&] {
+        require(out_result != nullptr, "out_result cannot be null");
         const dbs::BeamSearchDecoder& decoder = decoder_of(handle);
-        require(steps > 0 && vocab_size > 0, "steps and vocab_size must be positive");
-        const size_t count = dbs::checked_mul_size(
-            dbs::checked_mul_size(static_cast<size_t>(steps), static_cast<size_t>(decoder.options().beam_size), "typed decode size overflow"),
-            static_cast<size_t>(vocab_size), "typed decode size overflow");
-        f32 = convert_to_f32(log_probs, data_type, count);
+        const dbs::DType type = dtype_of(data_type);
+        const auto start = std::chrono::steady_clock::now();
+        auto r = std::make_unique<DBSResultHandle>();
+        // 16-bit rows are converted one at a time, for the beams that are expanded.
+        r->result = decoder.decode_typed(log_probs, type, steps, vocab_size, nullptr);
+        record_decode_stats(handle, r->result, now_ns_since(start), 1, false);
+        *out_result = r.release();
     });
-    if (rc != DBS_OK) return rc;
-    return dbs_decode(handle, f32.data(), steps, vocab_size, out_result);
 }
 
 extern "C" DBS_EXPORT int dbs_decode_batch_typed(
@@ -475,20 +429,34 @@ extern "C" DBS_EXPORT int dbs_decode_batch_typed(
     DBSBatchResultHandle** out_result
 ) {
     if (out_result) *out_result = nullptr;
-    if (data_type == DBS_DTYPE_F32) {
-        return dbs_decode_batch(handle, static_cast<const float*>(log_probs), batch_size, steps, vocab_size, num_threads, out_result);
-    }
-    std::vector<float> f32;
-    const int rc = guarded(handle, [&] {
+    return guarded(handle, [&] {
+        require(out_result != nullptr, "out_result cannot be null");
         const dbs::BeamSearchDecoder& decoder = decoder_of(handle);
+        const dbs::DType type = dtype_of(data_type);
+        require(log_probs != nullptr, "log_probs cannot be null");
         require(batch_size > 0 && steps > 0 && vocab_size > 0, "batch_size, steps and vocab_size must be positive");
-        size_t n = dbs::checked_mul_size(static_cast<size_t>(batch_size), static_cast<size_t>(steps), "typed batch decode size overflow");
-        n = dbs::checked_mul_size(n, static_cast<size_t>(decoder.options().beam_size), "typed batch decode size overflow");
-        n = dbs::checked_mul_size(n, static_cast<size_t>(vocab_size), "typed batch decode size overflow");
-        f32 = convert_to_f32(log_probs, data_type, n);
+        const auto start = std::chrono::steady_clock::now();
+        const size_t stride = dbs::checked_mul_size(
+            dbs::checked_mul_size(static_cast<size_t>(steps), static_cast<size_t>(decoder.options().beam_size), "batch stride overflow"),
+            static_cast<size_t>(vocab_size), "batch stride overflow");
+        const size_t work = dbs::checked_mul_size(stride, static_cast<size_t>(batch_size), "batch size overflow");
+        const char* base = static_cast<const char*>(log_probs);
+        const size_t stride_bytes = dbs::checked_mul_size(stride, dbs::dtype_size(type), "batch stride overflow");
+
+        auto br = std::make_unique<DBSBatchResultHandle>();
+        br->results.resize(static_cast<size_t>(batch_size));
+        const int threads = thread_count(num_threads, batch_size, work);
+        parallel_for(batch_size, threads, [&](int b) {
+            try {
+                br->results[static_cast<size_t>(b)].result =
+                    decoder.decode_typed(base + static_cast<size_t>(b) * stride_bytes, type, steps, vocab_size, nullptr);
+            } catch (const std::invalid_argument& e) {
+                rethrow_for_example(b, e);
+            }
+        });
+        record_decode_stats(handle, br->results.front().result, now_ns_since(start), threads, false);
+        *out_result = br.release();
     });
-    if (rc != DBS_OK) return rc;
-    return dbs_decode_batch(handle, f32.data(), batch_size, steps, vocab_size, num_threads, out_result);
 }
 
 extern "C" DBS_EXPORT int dbs_decode_constrained(
@@ -716,6 +684,110 @@ extern "C" DBS_EXPORT int dbs_decode_batch_variable(
     });
 }
 
+namespace {
+
+// dbs_decode_batch_into and dbs_decode_batch_into_ex (ex may be null).
+void decode_batch_into(
+    DBSDecoderHandle* handle,
+    const void* inputs,
+    int data_type,
+    bool from_logits,
+    int batch_size,
+    int steps,
+    int vocab_size,
+    const int32_t* steps_per_example,
+    const DBSAdvancedConstraintsC* constraints_c,
+    int num_threads,
+    const DBSDecodeOutputsC* outputs,
+    const DBSDecodeOutputsExC* ex) {
+    const dbs::BeamSearchDecoder& decoder = decoder_of(handle);
+    const dbs::DType type = dtype_of(data_type);
+    require(inputs != nullptr, "log_probs cannot be null");
+    require(outputs != nullptr && outputs->final_scores != nullptr, "outputs and outputs->final_scores cannot be null");
+    require(batch_size > 0 && steps > 0 && vocab_size > 0, "batch_size, steps and vocab_size must be positive");
+    const bool pool = ex && (ex->pool_parents || ex->pool_tokens || ex->pool_lengths || ex->pool_scores ||
+                             ex->pool_raw_scores || ex->pool_from_logprob);
+    if (ex) {
+        require(!ex->reserved[0] && !ex->reserved[1] && !ex->reserved[2] && !ex->reserved[3], "reserved fields must be NULL");
+        require(!pool || decoder.options().relaxed_pool_multiplier > 0,
+                "pool outputs need a relaxed pool: set relaxed_pool_multiplier >= 1");
+    }
+    const auto start = std::chrono::steady_clock::now();
+    const int K = decoder.options().beam_size;
+    const size_t P = pool ? static_cast<size_t>(K) * static_cast<size_t>(decoder.options().relaxed_pool_multiplier) : 0;
+    const size_t trace_stride = dbs::checked_mul_size(static_cast<size_t>(steps), static_cast<size_t>(K), "batch stride overflow");
+    const size_t pool_stride = dbs::checked_mul_size(static_cast<size_t>(steps), P, "batch stride overflow");
+    const size_t input_stride = dbs::checked_mul_size(trace_stride, static_cast<size_t>(vocab_size), "batch stride overflow");
+    const size_t work = dbs::checked_mul_size(input_stride, static_cast<size_t>(batch_size), "batch size overflow");
+    const size_t input_bytes = dbs::checked_mul_size(input_stride, dbs::dtype_size(type), "batch stride overflow");
+    const std::vector<int32_t> steps_b = steps_for(steps_per_example, batch_size, steps);
+    const dbs::DecodeConstraints shared = constraints_c ? from_c_constraints(*constraints_c) : dbs::DecodeConstraints{};
+    const char* base = static_cast<const char*>(inputs);
+
+    const int threads = thread_count(num_threads, batch_size, work);
+    parallel_for(batch_size, threads, [&](int b) {
+        const size_t bs = static_cast<size_t>(b);
+        const size_t off = bs * trace_stride;
+        const size_t poff = bs * pool_stride;
+        dbs::TraceOutputs trace;
+        trace.parents = outputs->parents ? outputs->parents + off : nullptr;
+        trace.tokens = outputs->tokens ? outputs->tokens + off : nullptr;
+        trace.lengths = outputs->lengths ? outputs->lengths + off : nullptr;
+        trace.scores = outputs->scores ? outputs->scores + off : nullptr;
+        trace.raw_scores = outputs->raw_scores ? outputs->raw_scores + off : nullptr;
+        trace.from_logprob = outputs->from_logprob ? outputs->from_logprob + off : nullptr;
+        if (ex) {
+            trace.pool_parents = ex->pool_parents ? ex->pool_parents + poff : nullptr;
+            trace.pool_tokens = ex->pool_tokens ? ex->pool_tokens + poff : nullptr;
+            trace.pool_lengths = ex->pool_lengths ? ex->pool_lengths + poff : nullptr;
+            trace.pool_scores = ex->pool_scores ? ex->pool_scores + poff : nullptr;
+            trace.pool_raw_scores = ex->pool_raw_scores ? ex->pool_raw_scores + poff : nullptr;
+            trace.pool_from_logprob = ex->pool_from_logprob ? ex->pool_from_logprob + poff : nullptr;
+            trace.row_lse = from_logits && ex->row_lse ? ex->row_lse + off : nullptr;
+            // Rows the search does not read get 0.
+            if (ex->row_lse) std::fill(ex->row_lse + off, ex->row_lse + off + trace_stride, 0.0f);
+        }
+
+        // Padding for the steps this example does not decode.
+        const size_t used = static_cast<size_t>(steps_b[bs]) * static_cast<size_t>(K);
+        const size_t pool_used = static_cast<size_t>(steps_b[bs]) * P;
+        const float neg_inf = -std::numeric_limits<float>::infinity();
+        if (trace.parents) std::fill(trace.parents + used, trace.parents + trace_stride, -1);
+        if (trace.tokens) std::fill(trace.tokens + used, trace.tokens + trace_stride, -1);
+        if (trace.lengths) std::fill(trace.lengths + used, trace.lengths + trace_stride, 0);
+        if (trace.scores) std::fill(trace.scores + used, trace.scores + trace_stride, neg_inf);
+        if (trace.raw_scores) std::fill(trace.raw_scores + used, trace.raw_scores + trace_stride, neg_inf);
+        if (trace.from_logprob) std::fill(trace.from_logprob + used, trace.from_logprob + trace_stride, uint8_t{0});
+        if (trace.pool_parents) std::fill(trace.pool_parents + pool_used, trace.pool_parents + pool_stride, -1);
+        if (trace.pool_tokens) std::fill(trace.pool_tokens + pool_used, trace.pool_tokens + pool_stride, -1);
+        if (trace.pool_lengths) std::fill(trace.pool_lengths + pool_used, trace.pool_lengths + pool_stride, 0);
+        if (trace.pool_scores) std::fill(trace.pool_scores + pool_used, trace.pool_scores + pool_stride, neg_inf);
+        if (trace.pool_raw_scores) std::fill(trace.pool_raw_scores + pool_used, trace.pool_raw_scores + pool_stride, neg_inf);
+        if (trace.pool_from_logprob) {
+            std::fill(trace.pool_from_logprob + pool_used, trace.pool_from_logprob + pool_stride, uint8_t{0});
+        }
+
+        dbs::DecodeConstraints constraints = shared;
+        constraints.batch_index = b;
+        const size_t final_off = bs * static_cast<size_t>(K);
+        try {
+            decoder.decode_into(
+                base + bs * input_bytes, type, from_logits, steps_b[bs], vocab_size,
+                constraints_c ? &constraints : nullptr, trace,
+                outputs->final_scores + final_off,
+                outputs->final_raw_scores ? outputs->final_raw_scores + final_off : nullptr,
+                outputs->final_lengths ? outputs->final_lengths + final_off : nullptr);
+        } catch (const std::invalid_argument& e) {
+            rethrow_for_example(b, e);
+        }
+    });
+    record_batch_stats(handle, static_cast<int64_t>(batch_size) * static_cast<int64_t>(trace_stride),
+                       static_cast<int64_t>(batch_size) * static_cast<int64_t>(input_stride),
+                       now_ns_since(start), threads);
+}
+
+} // namespace
+
 extern "C" DBS_EXPORT int dbs_decode_batch_into(
     DBSDecoderHandle* handle,
     const float* log_probs,
@@ -728,56 +800,28 @@ extern "C" DBS_EXPORT int dbs_decode_batch_into(
     const DBSDecodeOutputsC* outputs
 ) {
     return guarded(handle, [&] {
-        const dbs::BeamSearchDecoder& decoder = decoder_of(handle);
-        require(log_probs != nullptr, "log_probs cannot be null");
-        require(outputs != nullptr && outputs->final_scores != nullptr, "outputs and outputs->final_scores cannot be null");
-        require(batch_size > 0 && steps > 0 && vocab_size > 0, "batch_size, steps and vocab_size must be positive");
-        const auto start = std::chrono::steady_clock::now();
-        const int K = decoder.options().beam_size;
-        const size_t trace_stride = dbs::checked_mul_size(static_cast<size_t>(steps), static_cast<size_t>(K), "batch stride overflow");
-        const size_t input_stride = dbs::checked_mul_size(trace_stride, static_cast<size_t>(vocab_size), "batch stride overflow");
-        const size_t work = dbs::checked_mul_size(input_stride, static_cast<size_t>(batch_size), "batch size overflow");
-        const std::vector<int32_t> steps_b = steps_for(steps_per_example, batch_size, steps);
-        const dbs::DecodeConstraints shared = constraints_c ? from_c_constraints(*constraints_c) : dbs::DecodeConstraints{};
+        decode_batch_into(handle, log_probs, DBS_DTYPE_F32, false, batch_size, steps, vocab_size, steps_per_example,
+                          constraints_c, num_threads, outputs, nullptr);
+    });
+}
 
-        const int threads = thread_count(num_threads, batch_size, work);
-        parallel_for(batch_size, threads, [&](int b) {
-            const size_t bs = static_cast<size_t>(b);
-            const size_t off = bs * trace_stride;
-            dbs::TraceOutputs trace;
-            trace.parents = outputs->parents ? outputs->parents + off : nullptr;
-            trace.tokens = outputs->tokens ? outputs->tokens + off : nullptr;
-            trace.lengths = outputs->lengths ? outputs->lengths + off : nullptr;
-            trace.scores = outputs->scores ? outputs->scores + off : nullptr;
-            trace.raw_scores = outputs->raw_scores ? outputs->raw_scores + off : nullptr;
-            trace.from_logprob = outputs->from_logprob ? outputs->from_logprob + off : nullptr;
-
-            // Padding for the steps this example does not decode.
-            const size_t used = static_cast<size_t>(steps_b[bs]) * static_cast<size_t>(K);
-            const float neg_inf = -std::numeric_limits<float>::infinity();
-            if (trace.parents) std::fill(trace.parents + used, trace.parents + trace_stride, -1);
-            if (trace.tokens) std::fill(trace.tokens + used, trace.tokens + trace_stride, -1);
-            if (trace.lengths) std::fill(trace.lengths + used, trace.lengths + trace_stride, 0);
-            if (trace.scores) std::fill(trace.scores + used, trace.scores + trace_stride, neg_inf);
-            if (trace.raw_scores) std::fill(trace.raw_scores + used, trace.raw_scores + trace_stride, neg_inf);
-            if (trace.from_logprob) std::fill(trace.from_logprob + used, trace.from_logprob + trace_stride, uint8_t{0});
-
-            dbs::DecodeConstraints constraints = shared;
-            constraints.batch_index = b;
-            const size_t final_off = bs * static_cast<size_t>(K);
-            try {
-                decoder.decode_into(
-                    log_probs + bs * input_stride, steps_b[bs], vocab_size, constraints_c ? &constraints : nullptr, trace,
-                    outputs->final_scores + final_off,
-                    outputs->final_raw_scores ? outputs->final_raw_scores + final_off : nullptr,
-                    outputs->final_lengths ? outputs->final_lengths + final_off : nullptr);
-            } catch (const std::invalid_argument& e) {
-                rethrow_for_example(b, e);
-            }
-        });
-        record_batch_stats(handle, static_cast<int64_t>(batch_size) * static_cast<int64_t>(trace_stride),
-                           static_cast<int64_t>(batch_size) * static_cast<int64_t>(input_stride),
-                           now_ns_since(start), threads);
+extern "C" DBS_EXPORT int dbs_decode_batch_into_ex(
+    DBSDecoderHandle* handle,
+    const void* inputs,
+    int data_type,
+    int from_logits,
+    int batch_size,
+    int steps,
+    int vocab_size,
+    const int32_t* steps_per_example,
+    const DBSAdvancedConstraintsC* constraints_c,
+    int num_threads,
+    const DBSDecodeOutputsExC* outputs
+) {
+    return guarded(handle, [&] {
+        require(outputs != nullptr, "outputs cannot be null");
+        decode_batch_into(handle, inputs, data_type, from_logits != 0, batch_size, steps, vocab_size, steps_per_example,
+                          constraints_c, num_threads, &outputs->base, outputs);
     });
 }
 
@@ -821,6 +865,97 @@ extern "C" DBS_EXPORT int dbs_backward_batch_into(
             trace.from_logprob = from_logprob + bs * trace_stride;
             try {
                 dbs::final_scores_backward_into(trace, grad_final_scores + bs * static_cast<size_t>(K), grad_log_probs + bs * grad_stride);
+            } catch (const std::invalid_argument& e) {
+                rethrow_for_example(b, e);
+            }
+        });
+        std::lock_guard<std::mutex> lock(handle->stats_mutex);
+        handle->stats.used_sparse_backward = 0;
+        handle->stats.used_dense_backward = 1;
+        handle->stats.last_backward_ns = now_ns_since(start);
+        handle->stats.last_sparse_grad_count = 0;
+        handle->stats.last_error_category = 0;
+    });
+}
+
+extern "C" DBS_EXPORT int dbs_backward_batch_into_ex(
+    DBSDecoderHandle* handle,
+    const DBSBackwardInputsC* in,
+    int num_threads,
+    float* grad_inputs
+) {
+    return guarded(handle, [&] {
+        const dbs::BeamSearchDecoder& decoder = decoder_of(handle);
+        require(in != nullptr && grad_inputs != nullptr, "inputs and grad_inputs cannot be null");
+        require(!in->reserved[0] && !in->reserved[1] && !in->reserved[2] && !in->reserved[3], "reserved fields must be NULL");
+        require(in->parents && in->tokens && in->lengths && in->from_logprob, "parents, tokens, lengths and from_logprob cannot be null");
+        require(in->batch_size > 0 && in->steps > 0 && in->vocab_size > 0 && in->pool_size >= 0,
+                "batch_size, steps and vocab_size must be positive and pool_size non-negative");
+        const bool pool_grads = in->grad_pool_scores || in->grad_pool_raw_scores;
+        require(!pool_grads || (in->pool_size > 0 && in->pool_parents && in->pool_tokens && in->pool_lengths && in->pool_from_logprob),
+                "pool gradients need pool_size > 0 and the pool trace");
+        dbs::DType logits_type = dbs::DType::F32;
+        if (in->logits) {
+            logits_type = dtype_of(in->logits_type);
+            require(in->row_lse != nullptr, "row_lse cannot be null with logits");
+        }
+        const auto start = std::chrono::steady_clock::now();
+        const int B = in->batch_size, T = in->steps, V = in->vocab_size;
+        const int K = decoder.options().beam_size;
+        const int P = pool_grads ? in->pool_size : 0;
+        const size_t trace_stride = dbs::checked_mul_size(static_cast<size_t>(T), static_cast<size_t>(K), "batch stride overflow");
+        const size_t pool_stride = dbs::checked_mul_size(static_cast<size_t>(T), static_cast<size_t>(in->pool_size), "batch stride overflow");
+        const size_t grad_stride = dbs::checked_mul_size(trace_stride, static_cast<size_t>(V), "batch stride overflow");
+        (void)dbs::checked_mul_size(grad_stride, static_cast<size_t>(B), "batch size overflow");
+        const std::vector<int32_t> steps_b = steps_for(in->steps_per_example, B, T);
+        // With logits every row with a path gradient is written in full.
+        const size_t work = trace_stride * static_cast<size_t>(B) * (in->logits ? static_cast<size_t>(V) : 1);
+        const size_t logits_row_bytes = static_cast<size_t>(V) * dbs::dtype_size(logits_type);
+        const char* logits = static_cast<const char*>(in->logits);
+
+        parallel_for(B, thread_count(num_threads, B, work), [&](int b) {
+            const size_t bs = static_cast<size_t>(b);
+            const size_t off = bs * trace_stride;
+            const size_t poff = bs * pool_stride;
+            dbs::TraceView trace;
+            trace.steps = steps_b[bs];
+            trace.beam_size = K;
+            trace.vocab_size = V;
+            trace.pool_size = P;
+            trace.length_penalty_alpha = decoder.options().length_penalty_alpha;
+            trace.parents = in->parents + off;
+            trace.tokens = in->tokens + off;
+            trace.lengths = in->lengths + off;
+            trace.from_logprob = in->from_logprob + off;
+            if (P > 0) {
+                trace.pool_parents = in->pool_parents + poff;
+                trace.pool_tokens = in->pool_tokens + poff;
+                trace.pool_lengths = in->pool_lengths + poff;
+                trace.pool_from_logprob = in->pool_from_logprob + poff;
+            }
+            dbs::OutputGradients g;
+            g.final_scores = in->grad_final_scores ? in->grad_final_scores + bs * static_cast<size_t>(K) : nullptr;
+            g.final_raw_scores = in->grad_final_raw_scores ? in->grad_final_raw_scores + bs * static_cast<size_t>(K) : nullptr;
+            g.scores = in->grad_scores ? in->grad_scores + off : nullptr;
+            g.raw_scores = in->grad_raw_scores ? in->grad_raw_scores + off : nullptr;
+            g.pool_scores = in->grad_pool_scores ? in->grad_pool_scores + poff : nullptr;
+            g.pool_raw_scores = in->grad_pool_raw_scores ? in->grad_pool_raw_scores + poff : nullptr;
+            float* out = grad_inputs + bs * grad_stride;
+            try {
+                const std::vector<dbs::SparseGradEntry> entries = dbs::path_gradient(trace, g);
+                const auto add = [out](int64_t index, float value) { out[index] += value; };
+                if (!logits) {
+                    dbs::apply_path_gradient(entries, V, nullptr, [](int64_t, float*) -> const float* { return nullptr; }, add);
+                } else {
+                    const char* rows = logits + bs * trace_stride * logits_row_bytes;
+                    const auto read_row = [&](int64_t r, float* buffer) -> const float* {
+                        const char* row = rows + static_cast<size_t>(r) * logits_row_bytes;
+                        if (logits_type == dbs::DType::F32) return reinterpret_cast<const float*>(row);
+                        dbs::convert_to_float(row, logits_type, static_cast<size_t>(V), buffer);
+                        return buffer;
+                    };
+                    dbs::apply_path_gradient(entries, V, in->row_lse + off, read_row, add);
+                }
             } catch (const std::invalid_argument& e) {
                 rethrow_for_example(b, e);
             }

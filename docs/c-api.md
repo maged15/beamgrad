@@ -86,7 +86,7 @@ per step costs time, so it is off by default.
 | function | input |
 |---|---|
 | `dbs_decode` | float32 `[T, K, V]` |
-| `dbs_decode_typed` | float32, IEEE fp16 or bf16 `[T, K, V]` (`DBSDataTypeC`) |
+| `dbs_decode_typed` | float32, IEEE fp16 or bf16 `[T, K, V]` (`DBSDataTypeC`); 16-bit rows are converted one at a time, only for the beams that are expanded |
 | `dbs_decode_constrained` | banned tokens `[V]`, forced tokens `[T]` (`-1` = free), per-call min length |
 | `dbs_decode_constrained_ex` | `DBSAdvancedConstraintsC`: the above plus repetition penalty, no-repeat n-gram size, and a token-filter callback |
 | `dbs_decode_batch` / `dbs_decode_batch_typed` | `[B, T, K, V]`, decoded on `num_threads` threads (0 = all cores, or only the calling thread for a batch under 2^19 candidates) |
@@ -94,6 +94,7 @@ per step costs time, so it is off by default.
 | `dbs_decode_model_steps_ex` | a callback produces each step's `[K, V]` rows from the current beams (see below); optional constraints |
 | `dbs_decode_model_steps` / `..._with_workspace` | the original callback, which sees only each beam's previous token and score |
 | `dbs_decode_batch_into` | `[B, T, K, V]` with optional per-example steps and constraints, straight into caller-owned arrays (`DBSDecodeOutputsC`), no result handles |
+| `dbs_decode_batch_into_ex` | the same for any `DBSDataTypeC`, and for **logits** (`from_logits`); `DBSDecodeOutputsExC` adds the relaxed pool's trace and each row's logsumexp |
 
 Constraints (`DBSAdvancedConstraintsC`) are applied per beam: `banned_tokens`
 removes tokens everywhere, `no_repeat_ngram_size = n` blocks every token that
@@ -157,6 +158,29 @@ any decoder handle.
 it takes that call's `parents`, `tokens`, `lengths` and `from_logprob` outputs
 and `grad_final_scores [B, K]`, checks that the trace is in range, and
 accumulates the final-score gradient into `grad_log_probs [B, T, K, V]`.
+
+`dbs_backward_batch_into_ex` generalises it. It takes a `DBSBackwardInputsC`
+with the trace (and the pool's, for pool gradients) and the gradient of a loss
+with respect to any of the decode outputs: final scores, final raw scores,
+per-step scores and raw scores, and pool scores and raw scores. Each output
+is differentiated along the path of tokens that produced it, holding the
+selection fixed, and contributions to one entry are summed in a fixed order
+(selected beams by slot, then pool candidates by rank). If the batch was
+decoded from logits, pass the logits and the decode's `row_lse`. Every row
+with a path gradient `g` then receives the log-softmax gradient
+`g - softmax(row) * sum(g)` in full.
+
+### Decoding from logits
+
+With `from_logits`, the rows are logits, and each row the search reads is
+normalised on the fly: `log_prob = x - logsumexp(row)`. No log-softmax is
+materialised, and `row_lse` reports each row's logsumexp (0 for rows not
+read). The logsumexp uses a deterministic `exp` built from basic IEEE
+operations, with a fixed summation order: lane `v mod 256`, then a pairwise
+tree. Every CPU kernel path (scalar, SSE4.2, AVX2, AVX-512, NEON) therefore
+computes the same bits, and decoding from logits is exactly decoding the rows
+`x - row_lse` given as log-probabilities. The selected-beam softmax and the
+relaxed pool's sigmoid use the same `exp`.
 
 ## Introspection
 

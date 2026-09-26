@@ -4,12 +4,15 @@
 // Nothing in this header is part of the public interface (see include/dbs.h).
 #pragma once
 
+#include "half.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -139,6 +142,24 @@ bool operator!=(const AlignedAllocator<T, A>&, const AlignedAllocator<U, A>&) {
 using AlignedFloatVector = std::vector<float, AlignedAllocator<float, 64>>;
 using AlignedIntVector = std::vector<int32_t, AlignedAllocator<int32_t, 64>>;
 using AlignedInt64Vector = std::vector<int64_t, AlignedAllocator<int64_t, 64>>;
+
+inline size_t dtype_size(DType t) noexcept { return t == DType::F32 ? 4 : 2; }
+
+inline float f16_to_float(uint16_t h) noexcept { return f16_bits_to_float(h); }
+inline float bf16_to_float(uint16_t h) noexcept { return bf16_bits_to_float(h); }
+
+// Converts n elements of a typed buffer to float (exact for every type).
+inline void convert_to_float(const void* src, DType type, size_t n, float* dst) noexcept {
+    if (type == DType::F32) {
+        std::memcpy(dst, src, n * sizeof(float));
+    } else if (type == DType::F16) {
+        const uint16_t* p = static_cast<const uint16_t*>(src);
+        for (size_t i = 0; i < n; ++i) dst[i] = f16_to_float(p[i]);
+    } else {
+        const uint16_t* p = static_cast<const uint16_t*>(src);
+        for (size_t i = 0; i < n; ++i) dst[i] = bf16_to_float(p[i]);
+    }
+}
 
 struct BeamOptions {
     int beam_size = 8;

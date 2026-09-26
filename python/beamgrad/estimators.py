@@ -41,8 +41,9 @@ def _batched(result: BeamSearchResult):
     rows = result.step_log_probs
     if not rows:
         raise ValueError(
-            "the estimators need the rows the search read: use beamgrad.search(), or beam_search() through the "
-            "steps (not rescore_fn), with return_log_probs left on"
+            "the estimators need the log-probabilities of the rows the search read: use beamgrad.search() "
+            "(on log_softmax(logits) rather than with from_logits=True), or beam_search() through the steps "
+            "(not rescore_fn), with return_log_probs left on"
         )
     if trace.tokens.dim() == 2:  # unbatched search()
         trace = type(trace)(*(t[None] for t in trace))

@@ -92,6 +92,66 @@ class DBSDecodeOutputsC(ctypes.Structure):
     ]
 
 
+class DBSDecodeOutputsExC(ctypes.Structure):
+    """Mirror of ``DBSDecodeOutputsExC``: ``base`` plus the pool trace and the rows' logsumexp."""
+
+    _fields_ = [
+        ("base", DBSDecodeOutputsC),
+        *(
+            (name, ctypes.c_void_p)
+            for name in (
+                "pool_parents",
+                "pool_tokens",
+                "pool_lengths",
+                "pool_scores",
+                "pool_raw_scores",
+                "pool_from_logprob",
+                "row_lse",
+            )
+        ),
+        ("reserved", ctypes.c_void_p * 4),
+    ]
+
+
+class DBSBackwardInputsC(ctypes.Structure):
+    """Mirror of ``DBSBackwardInputsC`` (the pointers as ``c_void_p``)."""
+
+    _fields_ = [
+        ("batch_size", ctypes.c_int),
+        ("steps", ctypes.c_int),
+        ("vocab_size", ctypes.c_int),
+        ("pool_size", ctypes.c_int),
+        *(
+            (name, ctypes.c_void_p)
+            for name in (
+                "steps_per_example",
+                "parents",
+                "tokens",
+                "lengths",
+                "from_logprob",
+                "pool_parents",
+                "pool_tokens",
+                "pool_lengths",
+                "pool_from_logprob",
+                "grad_final_scores",
+                "grad_final_raw_scores",
+                "grad_scores",
+                "grad_raw_scores",
+                "grad_pool_scores",
+                "grad_pool_raw_scores",
+                "logits",
+            )
+        ),
+        ("logits_type", ctypes.c_int),
+        ("row_lse", ctypes.c_void_p),
+        ("reserved", ctypes.c_void_p * 4),
+    ]
+
+
+# DBSDataTypeC
+DTYPE_F32, DTYPE_F16, DTYPE_BF16 = 0, 1, 2
+
+
 def options_to_c(options: BeamOptions) -> DBSOptionsC:
     """Convert :class:`BeamOptions`; unused C fields take their documented defaults."""
     c = DBSOptionsC()
@@ -159,6 +219,23 @@ def _bind(lib: ctypes.CDLL) -> None:
             i32,
         ),
         "dbs_backward_batch_into": ([p, i32, i32, i32, p, p, p, p, p, p, i32, p], i32),
+        "dbs_decode_batch_into_ex": (
+            [
+                p,
+                p,
+                i32,
+                i32,
+                i32,
+                i32,
+                i32,
+                p,
+                ctypes.POINTER(DBSAdvancedConstraintsC),
+                i32,
+                ctypes.POINTER(DBSDecodeOutputsExC),
+            ],
+            i32,
+        ),
+        "dbs_backward_batch_into_ex": ([p, ctypes.POINTER(DBSBackwardInputsC), i32, p], i32),
     }
     for name, (argtypes, restype) in signatures.items():
         fn = getattr(lib, name)
