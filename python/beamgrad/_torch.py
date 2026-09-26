@@ -392,6 +392,15 @@ def length_penalty(lengths: torch.Tensor, alpha: float) -> torch.Tensor:
     return torch.ops.beamgrad.length_penalty(lengths, alpha)
 
 
+def _decode_outputs(x: torch.Tensor, steps: torch.Tensor | None, banned: torch.Tensor | None, options: BeamOptions):
+    """The decode operator's outputs, with the final scores' surrogate gradient when ``x`` needs one."""
+    if torch.is_grad_enabled() and x.requires_grad:  # also true inside torch.func.grad, vjp and jacrev
+        return _FinalScores.apply(x, steps, banned, options)
+    # Nothing to differentiate: the operator alone, as decode() calls it. Same values; and PyTorch 2.4's
+    # Dynamo mis-traces an autograd.Function with a separate setup_context when no input requires grad.
+    return _decode_op(x, steps, banned, options)
+
+
 def final_scores(log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike = None) -> torch.Tensor:
     """Run beam search and return the final beam scores, with surrogate gradients.
 
@@ -413,7 +422,7 @@ def final_scores(log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike
     holding the beam selection fixed.
     """
     x, steps_t, banned, unbatched = _prepare(log_probs, options, steps)
-    scores = _FinalScores.apply(x, steps_t, banned, options)[0]
+    scores = _decode_outputs(x, steps_t, banned, options)[0]
     return scores.squeeze(0) if unbatched else scores
 
 

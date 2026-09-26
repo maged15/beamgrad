@@ -41,6 +41,12 @@ The C ABI is unchanged (version 10).
 
 ### Fixed
 
+- `final_scores` and `search` on tensors that do not require grad could not
+  be compiled with `torch.compile(fullgraph=True)` on PyTorch 2.4. Its
+  Dynamo mis-traces an `autograd.Function` with a separate `setup_context`
+  when no input requires grad. They now call the decode operator directly
+  when there is nothing to differentiate, as `decode` does; the values are
+  the same.
 - On CUDA, `torch.ops.beamgrad.decode_step` (and so `beam_search`) silently
   mis-ranked a hand-built state whose live, unfinished beams had different
   lengths when there was a length penalty (the documented precondition of
