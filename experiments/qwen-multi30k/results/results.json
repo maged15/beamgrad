@@ -1,0 +1,153 @@
+{
+ "setup": {
+  "model": "Qwen/Qwen2.5-0.5B-Instruct (all 494M parameters trained)",
+  "beamgrad": "2.2.0 (PyPI wheel, pt214cu130)",
+  "torch": "2.14.0+cu130",
+  "transformers": "5.17.0",
+  "gpu": "NVIDIA GeForce RTX 4080 SUPER (16 GB)",
+  "test": "Multi30k test2016, 1000 sentences, beam 4, alpha 0.6"
+ },
+ "zero_shot": 16.406912026291096,
+ "sft_checkpoints": {
+  "seeds 0-2": 38.56412357166855,
+  "seeds 3-13": 38.943116435223374
+ },
+ "mrt_vs_continued_sft": [
+  {
+   "seed": 0,
+   "continued_sft": 40.43396325973882,
+   "beamgrad_mrt": 41.090925651429075
+  },
+  {
+   "seed": 1,
+   "continued_sft": 40.002237438274406,
+   "beamgrad_mrt": 39.681474737361484
+  },
+  {
+   "seed": 2,
+   "continued_sft": 40.177689959634705,
+   "beamgrad_mrt": 40.472349535633455
+  },
+  {
+   "seed": 3,
+   "continued_sft": 39.659100937061076,
+   "beamgrad_mrt": 41.3357923574193
+  },
+  {
+   "seed": 4,
+   "continued_sft": 40.96136509297576,
+   "beamgrad_mrt": 41.428506641009356
+  },
+  {
+   "seed": 5,
+   "continued_sft": 39.52521318740405,
+   "beamgrad_mrt": 41.10408956900493
+  },
+  {
+   "seed": 6,
+   "continued_sft": 38.53663981959667,
+   "beamgrad_mrt": 39.7441215561437
+  },
+  {
+   "seed": 7,
+   "continued_sft": 39.34563052839514,
+   "beamgrad_mrt": 39.57825411446221
+  }
+ ],
+ "beamgrad_vs_diy_mrt": {
+  "decoder_beamgrad": [
+   {
+    "seed": 3,
+    "diy_mrt": 41.11316352007617,
+    "beamgrad_mrt": 41.3357923574193
+   },
+   {
+    "seed": 4,
+    "diy_mrt": 40.20566359251398,
+    "beamgrad_mrt": 41.428506641009356
+   },
+   {
+    "seed": 5,
+    "diy_mrt": 39.892245293869465,
+    "beamgrad_mrt": 41.10408956900493
+   },
+   {
+    "seed": 6,
+    "diy_mrt": 39.79457894519855,
+    "beamgrad_mrt": 39.7441215561437
+   },
+   {
+    "seed": 7,
+    "diy_mrt": 39.02943748992139,
+    "beamgrad_mrt": 39.57825411446221
+   },
+   {
+    "seed": 8,
+    "diy_mrt": 40.11352584838172,
+    "beamgrad_mrt": 39.81691209378306
+   },
+   {
+    "seed": 9,
+    "diy_mrt": 40.17597513810249,
+    "beamgrad_mrt": 39.95631059651175
+   },
+   {
+    "seed": 10,
+    "diy_mrt": 41.39016330063711,
+    "beamgrad_mrt": 41.248523030083184
+   },
+   {
+    "seed": 11,
+    "diy_mrt": 39.2235820263825,
+    "beamgrad_mrt": 40.04761867777005
+   },
+   {
+    "seed": 12,
+    "diy_mrt": 40.10902927432891,
+    "beamgrad_mrt": 40.204612441663905
+   },
+   {
+    "seed": 13,
+    "diy_mrt": 39.911136772609275,
+    "beamgrad_mrt": 40.18906586617378
+   }
+  ],
+  "decoder_generate": [
+   {
+    "seed": 8,
+    "diy_mrt": 39.84685228451717,
+    "beamgrad_mrt": 39.70863364703014
+   },
+   {
+    "seed": 9,
+    "diy_mrt": 40.184574036414475,
+    "beamgrad_mrt": 39.959270818578695
+   },
+   {
+    "seed": 10,
+    "diy_mrt": 41.53174321430699,
+    "beamgrad_mrt": 41.27961709358837
+   },
+   {
+    "seed": 11,
+    "diy_mrt": 39.12481378248423,
+    "beamgrad_mrt": 39.985939028605074
+   },
+   {
+    "seed": 12,
+    "diy_mrt": 40.02087951074302,
+    "beamgrad_mrt": 40.21058820655831
+   },
+   {
+    "seed": 13,
+    "diy_mrt": 40.0101841683203,
+    "beamgrad_mrt": 39.96044098034259
+   }
+  ]
+ },
+ "peak_memory_gib": {
+  "beamgrad_mrt": "9.2 on all 14 runs (the same peak as continued SFT)",
+  "diy_mrt": "11.4 to 12.4 over its 11 runs",
+  "beamgrad_mrt_without_gradient_checkpointing": "out of memory on the 15.6 GiB card"
+ }
+}

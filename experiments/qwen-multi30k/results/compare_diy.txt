@@ -1,0 +1,24 @@
+test BLEU per seed (same SFT checkpoint, same batches)
+  seed  cont.SFT  beamgrad-MRT  DIY-MRT
+     3     39.66         41.34    41.11
+     4     40.96         41.43    40.21
+     5     39.53         41.10    39.89
+     6     38.54         39.74    39.79
+     7     39.35         39.58    39.03
+  mean     39.61         40.64    40.01
+
+DIY MRT vs continued SFT
+  seed 3: 39.66 -> 41.11  delta +1.45  95% CI [+0.57, +2.35]
+  seed 4: 40.96 -> 40.21  delta -0.76  95% CI [-1.68, +0.14]
+  seed 5: 39.53 -> 39.89  delta +0.37  95% CI [-0.58, +1.37]
+  seed 6: 38.54 -> 39.79  delta +1.26  95% CI [+0.30, +2.31]
+  seed 7: 39.35 -> 39.03  delta -0.32  95% CI [-1.38, +0.66]
+  across 5 seeds: mean +0.40 +/- 0.96  wins 3/5  t-test p = 0.403  sign-flip p = 0.375
+
+beamgrad MRT vs DIY MRT
+  seed 3: 41.11 -> 41.34  delta +0.22  95% CI [-0.53, +1.03]
+  seed 4: 40.21 -> 41.43  delta +1.22  95% CI [+0.51, +1.93]
+  seed 5: 39.89 -> 41.10  delta +1.21  95% CI [+0.33, +2.05]
+  seed 6: 39.79 -> 39.74  delta -0.05  95% CI [-0.87, +0.74]
+  seed 7: 39.03 -> 39.58  delta +0.55  95% CI [-0.28, +1.33]
+  across 5 seeds: mean +0.63 +/- 0.58  wins 4/5  t-test p = 0.070  sign-flip p = 0.125

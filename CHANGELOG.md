@@ -24,6 +24,13 @@
   with scores that can differ in the last bits (the prompt runs at another
   batch size); `share_prompt=False` keeps the previous behaviour and its
   bit-identical parity with `generate()`.
+- `experiments/qwen-multi30k`: minimum-risk training through `beam_search`
+  on a fully fine-tuned Qwen2.5-0.5B-Instruct. It beat continued supervised
+  fine-tuning by +0.72 BLEU on 7 of 8 seeds (p = 0.023). Against
+  `generate()` plus hand-written re-scoring, the gradient and the BLEU are the
+  same and the peak memory is lower (9.2 against 11.4–12.4 GiB). The
+  training guide notes that full fine-tuning of that model on 16 GB needs
+  `CausalLMRescorer(gradient_checkpointing=True)`.
 - `benchmarks/hf_beam_search.py` counts every EOS token of the model, turns
   off the repetition penalty of instruct models' generation configs (which
   made `generate()` a different search), checks both prompt modes, and times
