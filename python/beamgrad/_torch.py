@@ -86,7 +86,7 @@ StepsLike = torch.Tensor | Sequence[int] | None
 def _no_cuda_operators_message() -> str:
     try:
         from ._build_info import CUDA_SKIPPED as reason
-    except ImportError:  # source checkouts without a build, and builds before 2.2.1
+    except ImportError:  # source checkouts without a build, and builds before 2.3.0
         reason = None
     why = f" The build left them out: {reason}" if reason else ""
     return (

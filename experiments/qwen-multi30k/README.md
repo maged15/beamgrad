@@ -20,7 +20,7 @@ for evaluation.
 
 **Search.** Beam 4, length penalty α = 0.6, `min_length=2`. The EOS token is
 `<|im_end|>`, and `<|endoftext|>` is banned: beamgrad 2.2.0, which ran this,
-took one EOS token (2.2.1 takes both). Evaluation decodes up to 96 tokens and
+took one EOS token (2.3.0 takes both). Evaluation decodes up to 96 tokens and
 scores the best beam with sacreBLEU (default `13a` tokenization).
 
 **Supervised fine-tuning (SFT).** 1,800 steps of batch 16 (about one epoch),
@@ -135,7 +135,7 @@ python final_compare.py
 python gradcheck.py
 ```
 
-With beamgrad 2.2.1 or later, `CausalLMStep` runs each prompt once per
+With beamgrad 2.3.0 or later, `CausalLMStep` runs each prompt once per
 example by default. Its scores can then differ in the last bits from the
 2.2.0 runs recorded here; the beams do not. `share_prompt=False` restores
 the 2.2.0 behaviour. [`results/results.json`](results/results.json) has
