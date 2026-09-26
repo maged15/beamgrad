@@ -24,7 +24,7 @@ GPUs:
 | `cu130` | 7.5, 8.0, 8.6, 8.9, 9.0, 10.0, 12.0 |
 
 A wheel's local version label names the PyTorch it needs. For example,
-`2.0.0+pt214cu126` requires `torch==2.14.*` built for CUDA 12.x. Install
+`2.1.0+pt214cu126` requires `torch==2.14.*` built for CUDA 12.x. Install
 PyTorch first, then the wheel that matches it. This prints the label for the
 installed PyTorch:
 
@@ -36,7 +36,7 @@ Then install that wheel from the release, for example:
 
 ```bash
 pip install torch==2.14.* --index-url https://download.pytorch.org/whl/cu126
-pip install "https://github.com/maged15/beamgrad/releases/download/v2.0.0/beamgrad-2.0.0+pt214cu126-cp310-abi3-linux_x86_64.whl"
+pip install "https://github.com/maged15/beamgrad/releases/download/v2.1.0/beamgrad-2.1.0+pt214cu126-cp310-abi3-linux_x86_64.whl"
 ```
 
 If there is no wheel for your combination, for example another PyTorch
