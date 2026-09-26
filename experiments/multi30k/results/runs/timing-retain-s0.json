@@ -5,8 +5,8 @@
   "valid_bleu": NaN,
   "final_valid_bleu": NaN,
   "test_bleu": NaN,
-  "seconds_per_step": 0.24758110496914015,
-  "peak_gib": 3.300278663635254,
+  "seconds_per_step": 0.15107422374887391,
+  "peak_gib": 3.299271583557129,
   "history": [],
   "config": {
     "seed": 0,

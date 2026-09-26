@@ -200,3 +200,41 @@ def test_step_counts_beyond_int32_are_rejected():
     x = random_log_probs(2, 4, 3, 10).cuda()
     with pytest.raises(ValueError, match="steps"):
         decode(x, BeamOptions(beam_size=3), steps=torch.tensor([4, 2**32 + 1], device="cuda"))
+
+
+def test_decode_step_rejects_live_beams_of_different_lengths():
+    # The CUDA scan ranks by raw score, which is the CPU's ranking only when
+    # every live, unfinished beam of an example has the same length (with a
+    # length penalty). States the search produces always do; with validation
+    # a state that does not is rejected instead of silently mis-ranked.
+    op = torch.ops.beamgrad.decode_step
+
+    def run(device, lengths, alpha, finished=(0, 0), validate=True, eos=-1):
+        lp = torch.full((1, 2, 3), -9.0, device=device)
+        lp[0, 0, 0], lp[0, 1, 0] = -1.0, -0.5
+        raw = torch.tensor([[-2.0, -6.0]], device=device)
+        state = (
+            raw,
+            torch.tensor([lengths], dtype=torch.int32, device=device),
+            torch.tensor([finished], dtype=torch.uint8, device=device),
+            torch.zeros(1, 2, 0, dtype=torch.int32, device=device),
+        )
+        return op(lp, *state, eos, 0, alpha, None, 0, 1.0, validate)
+
+    with pytest.raises(ValueError, match="example 0: .* same length .* from 1 to 5"):
+        run("cuda", [1, 5], 3.0)
+    # Without EOS handling the finished flag is ignored, so that beam is live too.
+    with pytest.raises(ValueError, match="same length"):
+        run("cuda", [1, 5], 3.0, finished=(0, 1), eos=-1)
+    # Equal lengths, no length penalty, or a finished beam (carried forward
+    # with EOS) of another length: CUDA selects exactly what the CPU selects.
+    for lengths, alpha, finished, eos in (
+        ([3, 3], 3.0, (0, 0), -1),
+        ([1, 5], 0.0, (0, 0), -1),
+        ([1, 5], 3.0, (0, 1), 2),
+    ):
+        cpu = run("cpu", lengths, alpha, finished, eos=eos)
+        gpu = run("cuda", lengths, alpha, finished, eos=eos)
+        for a, b in zip(cpu, gpu, strict=True):
+            assert torch.equal(a, b.cpu())
+    run("cuda", [1, 5], 3.0, validate=False)  # unchecked without validation, as documented

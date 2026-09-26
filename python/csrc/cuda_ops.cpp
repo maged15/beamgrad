@@ -210,6 +210,21 @@ StepOutputs decode_step_cuda(
     Tensor final_scores = torch::empty({B, K}, x.options());
     Tensor from_logprob = torch::empty({B, K}, x.options().dtype(torch::kUInt8));
     Tensor invalid = validate ? torch::empty({B}, x.options().dtype(torch::kUInt8)) : Tensor();
+    // The CUDA scan ranks candidates by raw score, which equals the CPU's ranking
+    // by length-penalised score only when every live, unfinished beam of an
+    // example has the same length (see DBSCudaBeamState). States the search
+    // produces always do. With validation, check it on the device and read the
+    // result back together with the NaN flags, so it costs no extra sync.
+    Tensor length_range;
+    if (validate && length_penalty_alpha != 0.0) {
+        // Without EOS handling the finished flags are ignored: every beam with a
+        // finite score is extended.
+        Tensor live = torch::isfinite(raw_scores);
+        if (eos_token >= 0) live = live & (finished == 0);
+        const Tensor shortest = torch::where(live, lengths, torch::full_like(lengths, kIntMax)).amin(1);
+        const Tensor longest = torch::where(live, lengths, torch::full_like(lengths, -1)).amax(1);
+        length_range = torch::stack({shortest, longest});
+    }
 
     DBSCudaDecodeOutputs out{};
     out.tokens = tokens.data_ptr<int32_t>();
@@ -226,8 +241,21 @@ StepOutputs decode_step_cuda(
                                       at::cuda::getCurrentCUDAStream().stream()),
                  "decode_step");
     if (validate) {
-        const Tensor flags = invalid.cpu();  // one byte per example; synchronizes the stream
-        const uint8_t* f = flags.data_ptr<uint8_t>();
+        // One transfer for the NaN flags and the length check; synchronizes the stream.
+        Tensor host = invalid.to(torch::kInt32).unsqueeze(0);
+        if (length_range.defined()) host = torch::cat({host, length_range});
+        host = host.cpu();
+        const int32_t* f = host.data_ptr<int32_t>();
+        if (length_range.defined()) {
+            const int32_t* shortest = f + B;
+            const int32_t* longest = f + 2 * B;
+            for (int64_t b = 0; b < B; ++b) {
+                TORCH_CHECK_VALUE(longest[b] <= shortest[b], "example ", b,
+                                  ": with length_penalty_alpha != 0, decode_step on CUDA needs every live, unfinished "
+                                  "beam to have the same length (as in any state the search produced), got lengths "
+                                  "from ", shortest[b], " to ", longest[b]);
+            }
+        }
         for (int64_t b = 0; b < B; ++b) {
             TORCH_CHECK_VALUE(f[b] == 0, "example ", b, ": log_probs contains NaN or +inf in a row the search reads");
         }

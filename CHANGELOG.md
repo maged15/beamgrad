@@ -1,5 +1,76 @@
 # Changelog
 
+## 2.1.1 (2026-09-26)
+
+Closes the gaps left by 2.1.0 and its review:
+- the CUDA step's precondition is now checked in the PyTorch operator;
+- `length_penalty` has a vmap rule;
+- `relaxed_topk` is 14× faster on the GPU;
+- the `torch.compile` documentation is accurate;
+- wheels install with one command;
+- a report of the device tests on a real GPU is published;
+- the translation experiment has 8 seeds.
+
+The C ABI is unchanged (version 10).
+
+### Added
+
+- Wheel index pages on GitHub Pages, one per PyTorch minor version and CUDA
+  variant: `pip install beamgrad -f
+  https://maged15.github.io/beamgrad/whl/pt214cu126.html` installs the
+  matching wheel. `docs/installation.md` has a one-line command that picks
+  the page for the installed PyTorch. The pages are rebuilt after every
+  release (`.github/workflows/wheel-index.yml`, `scripts/wheel_index.py`);
+  the wheels stay on the GitHub releases.
+- `scripts/gpu_report.py` runs the device tests (C/C++ with the native CUDA
+  backend, and the Python suite) on a local GPU and writes a report.
+  `docs/gpu-report.md` is the report for 2.1.0. GitHub-hosted CI has no
+  GPU; `docs/cuda.md` now separates what CI checks (compilation, emulation)
+  from what needs a device.
+
+### Changed
+
+- `estimators.relaxed_topk` runs one bisection for all steps instead of one
+  per step. Each iteration reads a convergence flag back from the device, so
+  on CUDA this removed about T times as many synchronizations. With B = 32,
+  T = 40, K = 4, V = 8000, forward + backward went from 382 ms to 27 ms on an
+  RTX 4080 SUPER, and from 136 ms to 106 ms on the CPU. The weights,
+  candidates and gradients are bit for bit the same.
+- `length_penalty` has a vmap batching rule, so `torch.vmap` of
+  `sequence_scores` no longer falls back to a slower loop with a warning.
+
+### Fixed
+
+- `final_scores` and `search` on tensors that do not require grad could not
+  be compiled with `torch.compile(fullgraph=True)` on PyTorch 2.4. Its
+  Dynamo mis-traces an `autograd.Function` with a separate `setup_context`
+  when no input requires grad. They now call the decode operator directly
+  when there is nothing to differentiate, as `decode` does; the values are
+  the same.
+- On CUDA, `torch.ops.beamgrad.decode_step` (and so `beam_search`) silently
+  mis-ranked a hand-built state whose live, unfinished beams had different
+  lengths when there was a length penalty (the documented precondition of
+  `dbs_cuda_decode_step`). With `validate_inputs` on, the default, it now
+  raises `ValueError`. The check shares the transfer that already reads the
+  NaN flags, so it adds no synchronization. States the search produces were
+  never affected.
+
+### Documentation
+
+- `torch.compile`: the operators, `final_scores`, `decode`, `search` and
+  `sequence_scores` compile with `fullgraph=True`. `beam_search` is a Python
+  loop with a data-dependent stop, so it is not captured as one graph:
+  compile the model it calls. Both are now tested.
+- The README leads with minimum-risk training, the loss that helped in the
+  translation experiment, and links to the guide on which loss and gradient
+  mode to use.
+- Multi30k experiment: MLE, MRT and MRT through re-scoring now have 8 seeds,
+  and the summary reports wins, a sign test and a paired t-test. MRT beat
+  continued MLE on 7 of 8 seeds (+0.39 BLEU, t-test p = 0.009; the first 3
+  seeds had suggested +0.55 at p ≈ 0.1). Through re-scoring, with dropout
+  on, it gained only +0.11 (p = 0.33). The likely cause is that re-scoring
+  draws new dropout masks, and `docs/training.md` now says so.
+
 ## 2.1.0 (2026-09-26)
 
 Fixes and hardening on top of 2.0.0: an accurate relaxed top-k at any score

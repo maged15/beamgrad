@@ -32,7 +32,8 @@
 //        scores were the search to end here. Used by beamgrad.beam_search.
 //        On CUDA, every live, unfinished beam of an example must have the
 //        same length, as in any state the search produced (see
-//        DBSCudaBeamState in include/dbs_cuda.h).
+//        DBSCudaBeamState in include/dbs_cuda.h); with validate and a length
+//        penalty, a state that does not raises ValueError.
 //
 // With validate, a NaN or +inf in any row the search reads raises ValueError.
 //

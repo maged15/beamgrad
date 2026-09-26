@@ -29,23 +29,26 @@ result = beamgrad.beam_search(step, options, max_steps=T, batch_size=B)
 # result.scores: [B, K], best first, differentiable w.r.t. the model
 # result.sequences: [B, K, T] tokens of each beam, -1 after it ends
 
-# Structured margin: the reference must beat the best beam that is not the reference.
-gold_lp = model.token_log_probs(src, gold)                      # [B, T] teacher-forced; gold is [B, T], -1-padded
-gold_score = beamgrad.sequence_scores(gold_lp, gold_lengths, options)  # on the beams' scale
-loss = beamgrad.losses.structured_margin(result, gold, gold_score, margin=1.0)
+# Minimum-risk training: move probability toward the beams with the lowest cost.
+costs = 1 - sentence_bleu(result.sequences, references)       # [B, K], any per-beam cost, no gradient needed
+loss = beamgrad.losses.minimum_risk(result, costs)
 loss.backward()                                                 # through the search, into the model
 ```
 
-The loss is defined on what beam search actually returns. When the reference
-already wins by the margin it is zero; otherwise it raises the reference and
-lowers the beam that beat it. [`examples/train_lm.py`](examples/train_lm.py)
-is a runnable version, with a GRU whose hidden states follow the beams
-(`beams.parents` reorders them, as it would a key/value cache).
-`beamgrad.losses.minimum_risk` (expected cost over the beams) and the
-estimators in `beamgrad.estimators` are the alternatives. In a controlled
-translation experiment, minimum-risk training improved test BLEU over
-continued MLE on every seed, and this margin against the reference did not
-([training guide](docs/training.md#experiment-multi30k-ende)).
+The loss is defined on what beam search actually returns. It is the expected
+cost of the beams under a softmax over their scores, so its gradient raises
+the scores of good beams and lowers those of bad ones.
+[`experiments/multi30k`](experiments/multi30k) is a runnable version for
+translation, with sentence BLEU as the cost and a transformer whose
+key/value cache follows the beams (`beams.parents` reorders it). It also
+compares the alternatives on the same task: a structured margin against
+the reference (`losses.structured_margin`, runnable in
+[`examples/train_lm.py`](examples/train_lm.py)) and the relaxed top-k
+estimator. There, minimum-risk training beat continued MLE on 7 of 8 seeds
+(+0.39 BLEU, paired t-test p = 0.009) and the margin against the reference
+did not help. [docs/training.md](docs/training.md) explains which loss and
+which gradient mode (through the steps, or re-scoring for large models) to
+use.
 
 If the next-token distributions of every beam are already in a
 `[B, T, K, V]` tensor, score and decode it directly:
@@ -93,9 +96,13 @@ best = beamgrad.backtrack(beamgrad.decode(log_probs, options))[:, 0]   # [B, T] 
   allocator. Every backend selects the same beams with the same scores, bit
   for bit.
 - **A good PyTorch citizen.** The operators are registered with
-  `torch.library`, with fake-tensor, autograd and vmap rules: `torch.compile`
-  (even `fullgraph=True`), `torch.export`, `torch.vmap` and `torch.func`
-  (`grad`, `vjp`, `jacrev`, per-example gradients) work.
+  `torch.library`, with fake-tensor, autograd and vmap rules. So
+  `final_scores`, `decode` and `search` work under `torch.compile` (even
+  `fullgraph=True`), `torch.export`, `torch.vmap` and `torch.func` (`grad`,
+  `vjp`, `jacrev`, per-example gradients). `beam_search` is a Python loop
+  that stops once every beam has finished, so it is not captured as one
+  graph: compile the model it calls instead
+  ([details](docs/python.md#torchcompile-and-beam_search)).
 - **A stable C ABI.** `libdbs` works from C, C++ or any FFI. It adds forced
   tokens and token-filter callbacks, fp16/bf16 input, incremental
   model-callback decoding (with each beam's parent, for KV-cache reordering),
@@ -107,15 +114,22 @@ best = beamgrad.backtrack(beamgrad.decode(log_probs, options))[:, 0]   # [B, T] 
 ## Installation
 
 Releases include prebuilt wheels for PyTorch 2.13 and 2.14: Linux (CPU,
-CUDA 12.6, CUDA 13.0), macOS arm64 and Windows. Each wheel works on every
-Python from 3.10. [docs/installation.md](docs/installation.md) has the
-matrix and the command for your PyTorch. Otherwise beamgrad compiles against
-your installed PyTorch:
+CUDA 12.6, CUDA 13.0), macOS and Windows, each for every Python from 3.10.
+With PyTorch installed, this picks the wheel that matches it:
 
 ```bash
-pip install torch
-pip install --no-build-isolation "git+https://github.com/maged15/beamgrad"
+pip install beamgrad -f "https://maged15.github.io/beamgrad/whl/$(python -c "import torch; v = torch.__version__.split('+')[0].split('.'); c = torch.version.cuda; print(f'pt{v[0]}{v[1]}' + ('cu' + c.replace('.', '') if c else 'cpu'))").html"
 ```
+
+For other PyTorch versions, beamgrad compiles against your installed PyTorch:
+
+```bash
+pip install torch "setuptools>=77" wheel "packaging>=24.2"
+pip install --no-build-isolation beamgrad
+```
+
+[docs/installation.md](docs/installation.md) has the compatibility matrix and
+the details.
 
 `--no-build-isolation` matters: the compiled operators only work with the
 PyTorch they were built against, and if the two differ, `import beamgrad`

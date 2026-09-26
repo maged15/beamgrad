@@ -12,11 +12,31 @@ engine, forward and backward.
 The work is done by operators registered with `torch.library`
 (`torch.ops.beamgrad.decode`, `decode_step`, `final_scores_backward`,
 `final_scores_path_gradient` and `length_penalty`)
-with fake-tensor implementations, an autograd formula and a vmap rule, so
-beamgrad works inside `torch.compile` (including `fullgraph=True`), with
-`torch.export` and fake-tensor tracing, and under `torch.vmap` (PyTorch 2.5+).
-`final_scores` also works under the `torch.func` transforms (`grad`, `vjp`,
-`jacrev`, and `vmap` of them, for example per-example gradients).
+with fake-tensor implementations, an autograd formula and a vmap rule. So
+`final_scores`, `decode`, `search` and `sequence_scores` work inside
+`torch.compile` (including `fullgraph=True`), with `torch.export` and
+fake-tensor tracing, and under `torch.vmap` (PyTorch 2.5+). `final_scores`
+also works under the `torch.func` transforms (`grad`, `vjp`, `jacrev`, and
+`vmap` of them, for example per-example gradients).
+
+### torch.compile and `beam_search`
+
+`beam_search` is different: it is a Python loop that calls your step function
+once per step and stops as soon as every beam has finished. That stop is a
+data-dependent condition, so `torch.compile(..., fullgraph=True)` cannot
+capture the whole search as one graph (Dynamo reports that it "could not guard
+on data-dependent expression"). Without `fullgraph` it falls back to graph
+breaks. Compile the model inside the step function instead; that is where
+nearly all of the time goes, and the search is unchanged:
+
+```python
+compiled = torch.compile(model)
+
+def step(beams):
+    return compiled(...).log_softmax(-1)      # compiled once, reused every step
+
+result = beamgrad.beam_search(step, options, max_steps=T, batch_size=B)
+```
 
 ## `BeamOptions`
 

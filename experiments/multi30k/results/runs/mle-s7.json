@@ -1,0 +1,63 @@
+{
+  "arm": "mle",
+  "name": "mle",
+  "seed": 7,
+  "valid_bleu": 38.35781087974223,
+  "final_valid_bleu": 38.35781087974223,
+  "test_bleu": 37.96380212767816,
+  "seconds_per_step": 0.00671149422720338,
+  "peak_gib": 0.7175049781799316,
+  "history": [
+    {
+      "step": 0,
+      "valid_bleu": 37.41754398512437
+    },
+    {
+      "step": 200,
+      "valid_bleu": 37.5833092614178,
+      "train_loss": 2.2719924330711363
+    },
+    {
+      "step": 400,
+      "valid_bleu": 37.62754579709619,
+      "train_loss": 2.2541197293996813
+    },
+    {
+      "step": 600,
+      "valid_bleu": 37.89180582761682,
+      "train_loss": 2.256716084480286
+    },
+    {
+      "step": 800,
+      "valid_bleu": 37.7968688594472,
+      "train_loss": 2.2540052795410155
+    },
+    {
+      "step": 1000,
+      "valid_bleu": 38.35781087974223,
+      "train_loss": 2.2303518164157867
+    }
+  ],
+  "config": {
+    "seed": 7,
+    "vocab": 8000,
+    "smoothing": 0.1,
+    "eval_beam": 4,
+    "eval_alpha": 0.6,
+    "arm": "mle",
+    "name": "mle",
+    "steps": 1000,
+    "batch_size": 32,
+    "lr": 0.0001,
+    "dropout": 0.1,
+    "beam": 4,
+    "alpha": 0.6,
+    "nll_weight": 0.3,
+    "temperature": 1.0,
+    "margin": 1.0,
+    "pool_multiplier": 4,
+    "gradient": "steps",
+    "eval_every": 200,
+    "time_only": false
+  }
+}

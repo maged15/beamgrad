@@ -20,7 +20,7 @@ from typing import NamedTuple
 import torch
 
 from ._options import INT32_MAX, BeamOptions, _is_int
-from ._torch import BeamSearchOutput, StepsLike, _FinalScores, _prepare, backtrack, length_penalty
+from ._torch import BeamSearchOutput, StepsLike, _decode_outputs, _prepare, backtrack, length_penalty
 
 
 class BeamState(NamedTuple):
@@ -266,7 +266,7 @@ def search(log_probs: torch.Tensor, options: BeamOptions, steps: StepsLike = Non
     """
     x, steps_t, banned, unbatched = _prepare(log_probs, options, steps)
     B, T = x.shape[:2]
-    final, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob = _FinalScores.apply(
+    final, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob = _decode_outputs(
         x, steps_t, banned, options
     )
     trace = BeamSearchOutput(
