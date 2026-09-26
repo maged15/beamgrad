@@ -31,26 +31,50 @@ def _positions(mask: torch.Tensor) -> torch.Tensor:
 class CausalLMStep:
     """A step function for a causal LM: next-token log-probabilities of every beam.
 
-    Step 0 runs the (left-padded) prompts once per beam slot; each later step
-    feeds every beam's last token, after reordering the key/value cache by
-    ``beams.parents`` so that each slot continues its own hypothesis. Rows are
-    the float32 log-softmax of the logits, as ``generate()`` computes them, and
-    the model inputs match ``generate()``'s, so a float32 model gives the same
-    beams as ``model.generate(num_beams=K)`` (see ``benchmarks/hf_beam_search.py``).
-    Every search starts over from the prompts at step 0, so one instance can
-    drive several searches.
+    Step 0 runs the (left-padded) prompts; each later step feeds every beam's
+    last token, after reordering the key/value cache by ``beams.parents`` so
+    that each slot continues its own hypothesis. Rows are the float32
+    log-softmax of the logits, as ``generate()`` computes them. Every search
+    starts over from the prompts at step 0, so one instance can drive several
+    searches.
+
+    With ``share_prompt=True`` (the default) each prompt runs once, and its
+    key/value cache is then copied to the example's ``K`` beam slots (only
+    slot 0 is read at step 0), so the prompt costs a ``K``-th of the compute
+    and activation memory. ``generate(num_beams=K)`` instead runs every prompt
+    ``K`` times, and the model inputs are otherwise the same. With
+    ``share_prompt=False`` this class does the same, and a float32 model then
+    gives the same beams as ``generate()`` with bit-identical scores (see
+    ``benchmarks/hf_beam_search.py``). Sharing computes the prompt at a
+    different batch size, and matrix kernels may round differently at another
+    batch size, so the scores can then differ from ``generate()``'s in the last
+    bits.
 
     Args:
-        model: The causal LM.
+        model: The causal LM. With ``share_prompt``, its key/value cache must
+            support ``reorder_cache`` with a longer index (as ``DynamicCache``,
+            the default, does).
         input_ids: ``[B, P]`` prompt tokens, left-padded.
         attention_mask: ``[B, P]``, 0 on padding.
         beam_size: ``K``.
+        share_prompt: Run each prompt once rather than once per beam slot.
     """
 
-    def __init__(self, model, input_ids: torch.Tensor, attention_mask: torch.Tensor, beam_size: int):
+    def __init__(
+        self,
+        model,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        beam_size: int,
+        *,
+        share_prompt: bool = True,
+    ):
         self.model = model
         self.batch_size, self.beam_size = input_ids.shape[0], beam_size
-        self.input_ids = input_ids.repeat_interleave(beam_size, 0)
+        self.share_prompt = share_prompt
+        # The prompts as step 0 runs them: once per example, or once per beam slot.
+        self.input_ids = input_ids if share_prompt else input_ids.repeat_interleave(beam_size, 0)
+        self.input_mask = attention_mask if share_prompt else attention_mask.repeat_interleave(beam_size, 0)
         self.prompt_mask = attention_mask.repeat_interleave(beam_size, 0)
         self.mask = self.prompt_mask  # grows by one column per step
         self.cache = None
@@ -61,12 +85,17 @@ class CausalLMStep:
             self.mask, self.cache = self.prompt_mask, None  # the previous search's cache is freed first
             out = self.model(
                 input_ids=self.input_ids,
-                attention_mask=self.mask,
-                position_ids=_positions(self.mask),
-                cache_position=torch.arange(self.mask.shape[1], device=self.mask.device),
+                attention_mask=self.input_mask,
+                position_ids=_positions(self.input_mask),
+                cache_position=torch.arange(self.input_mask.shape[1], device=self.input_mask.device),
                 use_cache=True,
                 logits_to_keep=1,
             )
+            if self.share_prompt:
+                # Each example's cache, copied to its K beam slots; its row, shared by them (only slot 0 is read).
+                self.cache = out.past_key_values
+                self.cache.reorder_cache(torch.arange(B, device=self.mask.device).repeat_interleave(K))
+                return out.logits[:, -1].float().log_softmax(-1)[:, None].expand(B, K, -1)
         else:
             slots = torch.arange(B, device=beams.parents.device)[:, None] * K
             self.cache.reorder_cache((slots + beams.parents.clamp(min=0)).flatten())

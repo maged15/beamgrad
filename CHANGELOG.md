@@ -16,6 +16,19 @@
   (`DBSCudaSearchOptions`, up to 16 extra tokens). The operators
   `beamgrad::decode_ex` and `decode_step` take `extra_eos=[]`.
 
+- `beamgrad.hf.CausalLMStep(share_prompt=True)`, the new default, runs each
+  prompt once per example rather than once per beam, and copies its
+  key/value cache to the beams. With 2,048-token prompts (Qwen2.5-0.5B,
+  batch 8, 4 beams) a search takes 916 ms and 3.4 GiB instead of
+  `generate()`'s 2,759 ms and 7.8 GiB. It returns the same beams as before,
+  with scores that can differ in the last bits (the prompt runs at another
+  batch size); `share_prompt=False` keeps the previous behaviour and its
+  bit-identical parity with `generate()`.
+- `benchmarks/hf_beam_search.py` counts every EOS token of the model, turns
+  off the repetition penalty of instruct models' generation configs (which
+  made `generate()` a different search), checks both prompt modes, and times
+  long prompts (`--long-prompt`).
+
 ### Fixed
 
 - `pip install beamgrad` (the source distribution) no longer fails when the

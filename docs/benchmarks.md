@@ -38,15 +38,25 @@ times are an upper bound for training with `beam_search`.
 `Qwen/Qwen2.5-0.5B`) through `beamgrad.beam_search` with
 `beamgrad.hf.CausalLMStep`, and through `generate(num_beams=K)`. It reports:
 
-- whether the two return the same beams when EOS is suppressed. They do,
-  with bit-identical scores, in float32. In bfloat16, logits often tie
-  exactly and the two break ties differently; the script counts those
-  prompts.
+- whether the two return the same beams when EOS is suppressed. They do. In
+  float32 the scores are bit-identical when beamgrad runs the prompt once per
+  beam as `generate()` does (`share_prompt=False`), and within 1e-4 when it
+  runs each prompt once (the default). In bfloat16, logits often tie exactly
+  and the two break ties differently; the script counts those prompts.
 - how the two compare with natural EOS handling. beamgrad keeps finished
   hypotheses competing in their slots; `transformers` moves them to a
   separate pool.
 - median wall time for both. The model's forward passes dominate, so the two
-  are close.
+  are close on short prompts.
+- with `--long-prompt N`, time and peak memory on prompts of `N` tokens. On
+  an RTX 4080 SUPER with Qwen2.5-0.5B-Instruct in float32 (batch 8, 4 beams,
+  8 new tokens, 2,048-token prompts): `generate()` 2,759 ms and 7.82 GiB,
+  beamgrad with `share_prompt=False` 2,754 ms and 7.82 GiB, beamgrad by
+  default 916 ms and 3.41 GiB.
+
+Every EOS token of the model's generation config counts on both sides, and
+the script turns off the repetition penalty that instruct models'
+generation configs set, which `generate()` would otherwise apply.
 
 ## End to end: training
 

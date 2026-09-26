@@ -4,21 +4,31 @@
 Runs the same open-weights model two ways and compares them:
 
 1. Parity. Both searches rank by total log-probability and EOS is suppressed
-   (`min_new_tokens` in transformers, a banned token in beamgrad), so both are
+   (`min_new_tokens` in transformers, banned tokens in beamgrad), so both are
    plain beam search over the same rows and must return the same beams.
+   `CausalLMStep(share_prompt=False)` runs each prompt once per beam, as
+   `generate` does, and must give bit-identical float32 scores; the default
+   (the prompt once per example) must give the same beams.
 2. Natural decoding with EOS. transformers keeps `num_beams` unfinished beams
    and moves finished hypotheses to a separate pool; beamgrad keeps finished
    hypotheses in their beam slots (see docs/algorithm.md). Both rank by total
    log-probability here; the script reports how often the best hypotheses
    agree and which search found the more probable one when they differ.
-3. Training through the search (`--train`). Fine-tunes the model's last layers
+3. Long prompts (`--long-prompt N`): time and peak memory of both searches on
+   prompts of N tokens, where running each prompt once per example matters.
+4. Training through the search (`--train`). Fine-tunes the model's last layers
    with a structured margin so that a chosen continuation wins beam search,
    the use case beamgrad exists for; `generate` has no gradient to offer.
+
+Every EOS token of the model's generation config counts (Qwen's instruct
+models have two), and `generate`'s own defaults that would change the search
+(the repetition penalty of instruct models) are turned off.
 
 Timings are medians of `--repeats` runs after a warm-up, on the same device.
 
     pip install transformers accelerate
-    python benchmarks/hf_beam_search.py --model Qwen/Qwen2.5-0.5B --beams 4 --max-new-tokens 32 --train
+    python benchmarks/hf_beam_search.py --model Qwen/Qwen2.5-0.5B --beams 4 --max-new-tokens 32 \
+        --long-prompt 2048 --train
 """
 
 from __future__ import annotations
@@ -56,6 +66,12 @@ def timed(fn, repeats: int):
     return result, statistics.median(times) * 1e3
 
 
+def eos_tokens(model) -> tuple[int, ...]:
+    """Every EOS token of the model's generation config."""
+    eos = model.generation_config.eos_token_id
+    return tuple(eos) if isinstance(eos, (list, tuple)) else (eos,)
+
+
 def hf_beam_search(model, batch, beams: int, new_tokens: int, suppress_eos: bool):
     out = model.generate(
         **batch,
@@ -66,6 +82,7 @@ def hf_beam_search(model, batch, beams: int, new_tokens: int, suppress_eos: bool
         do_sample=False,
         length_penalty=0.0,  # rank by total log-probability, like beamgrad with length_penalty_alpha=0
         early_stopping=False,
+        repetition_penalty=1.0,  # instruct models' generation configs set one
         output_scores=True,
         return_dict_in_generate=True,
     )
@@ -74,29 +91,30 @@ def hf_beam_search(model, batch, beams: int, new_tokens: int, suppress_eos: bool
     return generated.view(B, beams, -1), out.sequences_scores.view(B, beams)
 
 
-def beamgrad_search(model, batch, beams: int, new_tokens: int, eos: int, suppress_eos: bool):
+def beamgrad_search(model, batch, beams: int, new_tokens: int, suppress_eos: bool, share_prompt: bool = True):
+    eos = eos_tokens(model)
     options = beamgrad.BeamOptions(
         beam_size=beams,
         eos_token=-1 if suppress_eos else eos,
-        banned_tokens=(eos,) if suppress_eos else None,
+        banned_tokens=eos if suppress_eos else None,
         validate_inputs=False,
     )
-    step = CausalLMStep(model, batch["input_ids"], batch["attention_mask"], beams)
+    step = CausalLMStep(model, batch["input_ids"], batch["attention_mask"], beams, share_prompt=share_prompt)
     return beamgrad.beam_search(step, options, max_steps=new_tokens, batch_size=batch["input_ids"].shape[0])
 
 
-def tokens_until_eos(tokens, eos: int, pad: int) -> list[int]:
+def tokens_until_eos(tokens, eos: tuple[int, ...], pad: int) -> list[int]:
     out = []
     for token in tokens.tolist():
-        if token < 0 or token == pad and token != eos:
+        if token < 0 or token == pad and token not in eos:
             break
         out.append(token)
-        if token == eos:
+        if token in eos:
             break
     return out
 
 
-def exact_ties(result, beams: int, banned: int) -> torch.Tensor:
+def exact_ties(result, beams: int, banned: tuple[int, ...]) -> torch.Tensor:
     """[B] bool: some step had two of its K + 1 best candidates with exactly equal scores.
 
     Low-precision logits make such ties common. beamgrad breaks them by a fixed
@@ -113,7 +131,7 @@ def exact_ties(result, beams: int, banned: int) -> torch.Tensor:
         else:
             parent = result.trace.raw_scores[:, t - 1]
         candidates = parent[..., None] + log_probs.detach().float().index_fill(
-            -1, torch.tensor([banned], device=tied.device), float("-inf")
+            -1, torch.tensor(banned, device=tied.device), float("-inf")
         )
         best = candidates.view(B, -1).topk(beams + 1).values
         tied |= ((best[:, :-1] == best[:, 1:]) & torch.isfinite(best[:, 1:])).any(-1)
@@ -121,40 +139,45 @@ def exact_ties(result, beams: int, banned: int) -> torch.Tensor:
 
 
 def compare_parity(model, tokenizer, batch, args) -> None:
-    eos = tokenizer.eos_token_id
+    eos = eos_tokens(model)
     (hf_seqs, hf_scores), hf_ms = timed(
         lambda: hf_beam_search(model, batch, args.beams, args.max_new_tokens, True), args.repeats
     )
-    with torch.no_grad():
-        result, bg_ms = timed(
-            lambda: beamgrad_search(model, batch, args.beams, args.max_new_tokens, eos, True), args.repeats
-        )
-    same_beams = (hf_seqs == result.sequences).all(-1)  # [B, K]
-    same_scores = hf_scores == result.scores  # bitwise
-    tied = exact_ties(result, args.beams, eos)
-    clean = ~tied
-    B, K = same_beams.shape
     print("1. Parity: EOS suppressed, both rank by total log-probability")
-    print(f"   prompts whose search met an exact score tie: {int(tied.sum())}/{B}")
-    print(
-        f"   prompts without ties: identical beams {int(same_beams[clean].sum())}/{int(clean.sum()) * K}, "
-        f"bitwise-identical scores {int(same_scores[clean].sum())}/{int(clean.sum()) * K}"
-    )
-    tied_same = int(same_beams[tied].sum())
-    print(f"   prompts with ties:    identical beams {tied_same}/{int(tied.sum()) * K} (tie order may differ)")
-    print(f"   time: transformers generate {hf_ms:8.1f} ms   beamgrad.beam_search {bg_ms:8.1f} ms")
+    for share in (False, True):
+        with torch.no_grad():
+            result, bg_ms = timed(
+                lambda share=share: beamgrad_search(model, batch, args.beams, args.max_new_tokens, True, share),
+                args.repeats,
+            )
+        same_beams = (hf_seqs == result.sequences).all(-1)  # [B, K]
+        same_scores = hf_scores == result.scores  # bitwise
+        tied = exact_ties(result, args.beams, eos)
+        clean = ~tied
+        B, K = same_beams.shape
+        print(f"   share_prompt={share} (the prompt once per {'example' if share else 'beam, as generate does'}):")
+        print(f"     prompts whose search met an exact score tie: {int(tied.sum())}/{B}")
+        largest = (hf_scores - result.scores)[clean].abs().max().item() if clean.any() else 0.0
+        print(
+            f"     prompts without ties: identical beams {int(same_beams[clean].sum())}/{int(clean.sum()) * K}, "
+            f"bitwise-identical scores {int(same_scores[clean].sum())}/{int(clean.sum()) * K}, "
+            f"largest score difference {largest:.1e}"
+        )
+        tied_same = int(same_beams[tied].sum())
+        print(f"     prompts with ties:    identical beams {tied_same}/{int(tied.sum()) * K} (tie order may differ)")
+        print(f"     time: transformers generate {hf_ms:8.1f} ms   beamgrad.beam_search {bg_ms:8.1f} ms")
     for b in range(min(B, 3)):
         print(f"   [{PROMPTS[b]!r}] -> {tokenizer.decode(result.sequences[b, 0])!r}")
 
 
 def compare_natural(model, tokenizer, batch, args) -> None:
-    eos = tokenizer.eos_token_id
+    eos = eos_tokens(model)
     (hf_seqs, hf_scores), hf_ms = timed(
         lambda: hf_beam_search(model, batch, args.beams, args.max_new_tokens, False), args.repeats
     )
     with torch.no_grad():
         result, bg_ms = timed(
-            lambda: beamgrad_search(model, batch, args.beams, args.max_new_tokens, eos, False), args.repeats
+            lambda: beamgrad_search(model, batch, args.beams, args.max_new_tokens, False), args.repeats
         )
     B = hf_seqs.shape[0]
     agree, hf_better, bg_better = 0, 0, 0
@@ -173,6 +196,30 @@ def compare_natural(model, tokenizer, batch, args) -> None:
     print(f"   time: transformers generate {hf_ms:8.1f} ms   beamgrad.beam_search {bg_ms:8.1f} ms")
 
 
+def compare_long_prompts(model, tokenizer, args) -> None:
+    """Time and peak memory of both searches on prompts of args.long_prompt tokens."""
+    text = " ".join(PROMPTS) + " "
+    ids = tokenizer(text * (args.long_prompt // 8 + 1), return_tensors="pt").input_ids[:, : args.long_prompt]
+    batch = {
+        "input_ids": ids.repeat(args.batch, 1).cuda(),
+        "attention_mask": torch.ones(args.batch, ids.shape[1], dtype=torch.long).cuda(),
+    }
+    new = 8
+    print(
+        f"3. Long prompts: batch {args.batch}, prompts of {ids.shape[1]} tokens, {args.beams} beams, {new} new tokens"
+    )
+    for name, run in (
+        ("transformers generate", lambda: hf_beam_search(model, batch, args.beams, new, True)),
+        ("beamgrad, share_prompt=False", lambda: beamgrad_search(model, batch, args.beams, new, True, False)),
+        ("beamgrad, share_prompt=True", lambda: beamgrad_search(model, batch, args.beams, new, True, True)),
+    ):
+        with torch.no_grad():
+            run()  # warm-up
+            torch.cuda.reset_peak_memory_stats()
+            _, ms = timed(run, args.repeats)
+        print(f"   {name:30s} {ms:8.1f} ms   peak memory {torch.cuda.max_memory_allocated() / 2**30:5.2f} GiB")
+
+
 def train(model, tokenizer, args) -> None:
     """Fine-tune the last layers so that a chosen continuation wins beam search by a margin."""
     prompt, target = "My favorite color is", " teal, like the sea at dawn."
@@ -188,8 +235,7 @@ def train(model, tokenizer, args) -> None:
     for p in trainable:
         p.requires_grad_(True)
     optimizer = torch.optim.Adam(trainable, lr=args.lr)
-    eos = tokenizer.eos_token_id
-    options = beamgrad.BeamOptions(beam_size=args.beams, eos_token=-1, banned_tokens=(eos,))
+    options = beamgrad.BeamOptions(beam_size=args.beams, eos_token=-1, banned_tokens=eos_tokens(model))
 
     def gold_log_prob():
         ids = torch.cat([batch.input_ids, gold], dim=1)
@@ -227,6 +273,7 @@ def main() -> None:
     parser.add_argument("--max-new-tokens", type=int, default=32)
     parser.add_argument("--batch", type=int, default=len(PROMPTS))
     parser.add_argument("--repeats", type=int, default=5)
+    parser.add_argument("--long-prompt", type=int, default=0, help="also time prompts of this many tokens")
     parser.add_argument("--train", action="store_true")
     parser.add_argument("--train-steps", type=int, default=30)
     parser.add_argument("--lr", type=float, default=1e-4)
@@ -247,6 +294,8 @@ def main() -> None:
     )
     compare_parity(model, tokenizer, batch, args)
     compare_natural(model, tokenizer, batch, args)
+    if args.long_prompt:
+        compare_long_prompts(model, tokenizer, args)
     if args.train:
         train(model, tokenizer, args)
 

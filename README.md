@@ -88,8 +88,11 @@ rows are read as they are.
   the search, one step at a time, reordering its cache by each beam's parent.
   On Qwen2.5-0.5B and Qwen3-0.6B, with EOS suppressed and
   `length_penalty=0`, it returns all `K` beams of `transformers`'
-  `generate(num_beams=K)` with bit-identical scores in float32, at the same
-  speed. With EOS enabled the two differ by design: beamgrad keeps finished
+  `generate(num_beams=K)`, with bit-identical scores in float32 when it runs
+  the prompt once per beam as `generate()` does (`share_prompt=False`). By
+  default it runs each prompt once per example instead: with 2,048-token
+  prompts that makes a search 3× faster than `generate()` with less than half
+  its peak memory. With EOS enabled the two differ by design: beamgrad keeps finished
   hypotheses in their beam slots, and `transformers` keeps them in a separate
   pool. So there only the best beam is compared
   ([benchmarks/hf_beam_search.py](benchmarks/hf_beam_search.py),

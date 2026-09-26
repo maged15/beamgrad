@@ -300,19 +300,34 @@ support `no_repeat_ngram_size` or `repetition_penalty`. The formulas are in
 Adapters for Hugging Face `transformers` causal LMs (the module does not
 import `transformers`):
 
-- `CausalLMStep(model, input_ids, attention_mask, beam_size)`: a step
-  function. It runs the left-padded prompts once, then one token per beam per
-  step, reordering the key/value cache by `beams.parents`. Its inputs match
-  `generate()`'s, so a float32 model returns the same beams as
-  `generate(num_beams=K)`. Each search restarts from the prompts, so one
-  instance can drive several searches.
+- `CausalLMStep(model, input_ids, attention_mask, beam_size, *,
+  share_prompt=True)`: a step function. It runs the left-padded prompts, then
+  one token per beam per step, reordering the key/value cache by
+  `beams.parents`. By default each prompt runs once and its cache is copied
+  to the example's beam slots. `generate(num_beams=K)` runs every prompt `K`
+  times, so on long prompts this is much cheaper: with 2,048-token prompts
+  (Qwen2.5-0.5B, batch 8, 4 beams, 8 new tokens) a search takes 916 ms and
+  3.4 GiB instead of `generate()`'s 2,759 ms and 7.8 GiB. It returns the same
+  beams as `generate()`, with float32 scores within about 1e-4 (the prompt
+  runs at another batch size, which rounds differently). `share_prompt=False`
+  runs the prompts once per beam as `generate()` does, and then the scores are
+  bit-identical too. Each search restarts from the prompts, so one instance
+  can drive several searches.
 - `CausalLMRescorer(model, input_ids, attention_mask, chunk_size=256,
   gradient_checkpointing=False)`: a `rescore_fn`. It runs one teacher-forced
   pass over prompt + beam and projects to the vocabulary in checkpointed
   chunks. With `gradient_checkpointing=True` it enables the model's
   checkpointing and training mode for its own pass only. Run the search in
   eval mode, because `transformers` disables the cache for checkpointing
-  models in training mode.
+  models in training mode. Full fine-tuning of a 0.5B model through the
+  search fits in 16 GB only with it: see
+  [training.md](training.md#memory-three-ways-to-take-the-gradient).
+
+Pass `eos_token=model.generation_config.eos_token_id` to `BeamOptions`: it is
+a list for models with several EOS tokens (Qwen, Llama 3). When comparing with
+`generate()`, note that instruct models' generation configs also set sampling
+options and a repetition penalty, which `generate()` applies even to beam
+search; pass `repetition_penalty=1.0` to it for the plain search.
 
 ## `cuda_available() -> bool`
 
