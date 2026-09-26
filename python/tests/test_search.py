@@ -236,6 +236,28 @@ def test_argument_errors():
         beam_search(good, BeamOptions(beam_size=2, eos_token=4), max_steps=2)
 
 
+@pytest.mark.skipif(not hasattr(torch.library, "register_vmap"), reason="torch.library.register_vmap needs PyTorch 2.5")
+def test_length_penalty_has_a_batching_rule():
+    # Without one, vmap (e.g. of sequence_scores) fell back to a slow per-example loop, with a warning.
+    assert torch._C._dispatch_has_kernel_for_dispatch_key("beamgrad::length_penalty", "FuncTorchBatched")
+    lengths = torch.tensor([[1, 5, 0], [7, 2, 3]])
+    for dim in (0, 1):
+        batched = torch.vmap(lambda n: beamgrad.length_penalty(n, 0.6), in_dims=dim, out_dims=dim)(lengths)
+        assert torch.equal(batched, beamgrad.length_penalty(lengths, 0.6))
+
+
+def test_compiled_model_in_the_step_function():
+    # The documented pattern for torch.compile: compile the model, not beam_search.
+    model = TinyLM(seed=8)
+    options = BeamOptions(beam_size=3, eos_token=1)
+    reference = beam_search(model.step_fn(2), options, max_steps=6, batch_size=2)
+    compiled = TinyLM(seed=8)
+    compiled.gru = torch.compile(compiled.gru, backend="aot_eager")
+    result = beam_search(compiled.step_fn(2), options, max_steps=6, batch_size=2)
+    assert torch.equal(result.sequences, reference.sequences)
+    torch.testing.assert_close(result.scores, reference.scores)
+
+
 def test_integer_arguments_accept_numpy_integers():
     # Like BeamOptions: any integer type but bool.
     np = pytest.importorskip("numpy")

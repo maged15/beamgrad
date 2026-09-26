@@ -469,6 +469,18 @@ def test_torch_compile_fullgraph_forward_and_backward():
     assert torch.equal(a.grad, b.grad)
 
 
+def test_torch_compile_fullgraph_decode_and_search():
+    options = BeamOptions(beam_size=3, eos_token=2, length_penalty_alpha=0.6)
+    x = random_log_probs(2, 6, 3, 11, seed=14)
+    trace = torch.compile(lambda y: decode(y, options), fullgraph=True, backend="aot_eager")(x)
+    expected = decode(x, options)
+    for name in expected._fields:
+        assert torch.equal(getattr(trace, name), getattr(expected, name)), name
+    result = torch.compile(lambda y: beamgrad.search(y, options), fullgraph=True, backend="aot_eager")(x)
+    reference = beamgrad.search(x, options)
+    assert torch.equal(result.scores, reference.scores) and torch.equal(result.sequences, reference.sequences)
+
+
 @pytest.mark.skipif(not hasattr(torch.library, "register_vmap"), reason="torch.library.register_vmap needs PyTorch 2.5")
 def test_vmap_matches_a_batched_call():
     options = BeamOptions(beam_size=2, eos_token=1)

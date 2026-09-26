@@ -204,7 +204,7 @@ def relaxed_topk(
     alpha, eos = options.length_penalty_alpha, options.eos_token
     device = trace.tokens.device
     banned = None
-    pool_scores, pool_weights, pool_index = [], [], []
+    pool_scores, pool_index = [], []
     for t, row in enumerate(rows):
         V = row.shape[-1]
         if banned is None and options.banned_tokens:
@@ -241,8 +241,12 @@ def relaxed_topk(
             index = torch.nn.functional.pad(index, (0, P - index.shape[1]), value=-1)
         index = torch.where(best > _NEG_GUARD, index, -1)
         pool_scores.append(best)
-        pool_weights.append(_SoftTopK.apply(best, K, temperature, tolerance, max_iters))
         pool_index.append((index, K * V))
+    scores = torch.stack(pool_scores, 1)  # [B, T, P]
+    # One bisection for every step at once. Each row's is independent, so the
+    # weights are the same; but each iteration reads a convergence flag back from
+    # the device, so this syncs once per iteration instead of T times.
+    weights = _SoftTopK.apply(scores, K, temperature, tolerance, max_iters)
     parents, tokens, from_logprob = [], [], []
     for index, expansions in pool_index:
         expanded = (index >= 0) & (index < expansions)
@@ -251,8 +255,8 @@ def relaxed_topk(
         tokens.append(torch.where(expanded, index % V, torch.where(index >= 0, eos, -1)))
         from_logprob.append(expanded)
     out = RelaxedTopK(
-        torch.stack(pool_scores, 1),
-        torch.stack(pool_weights, 1),
+        scores,
+        weights,
         torch.stack(parents, 1),
         torch.stack(tokens, 1),
         torch.stack(from_logprob, 1),

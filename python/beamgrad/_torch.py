@@ -239,9 +239,15 @@ def _final_scores_backward_vmap(
     return grad.reshape(n, grad.shape[0] // n, *grad.shape[1:]), 0
 
 
+def _length_penalty_vmap(info, in_dims, lengths, length_penalty_alpha):
+    # Elementwise: the batched lengths go through as they are.
+    return torch.ops.beamgrad.length_penalty(lengths, length_penalty_alpha), in_dims[0]
+
+
 if hasattr(torch.library, "register_vmap"):  # PyTorch 2.5+
     torch.library.register_vmap("beamgrad::decode", _decode_vmap)
     torch.library.register_vmap("beamgrad::final_scores_backward", _final_scores_backward_vmap)
+    torch.library.register_vmap("beamgrad::length_penalty", _length_penalty_vmap)
 
 
 # ---------------------------------------------------------------------------
