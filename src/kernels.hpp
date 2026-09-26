@@ -16,6 +16,7 @@
 #pragma once
 
 #include "common.hpp"
+#include "logits.hpp"
 
 namespace dbs {
 
@@ -47,10 +48,11 @@ KernelPath selected_kernel_path() noexcept;
 const char* kernel_path_name(KernelPath path) noexcept;
 
 // One parent beam's expansion: every token v of `row` is a candidate
-// (parent, v) with raw score parent_raw + row[v] and ranking score
-// raw * inv_penalty, unless it is excluded.
+// (parent, v) with log-probability lp = row[v] (minus `offset` when
+// has_offset: the row's logsumexp when decoding from logits), raw score
+// parent_raw + lp and ranking score raw * inv_penalty, unless it is excluded.
 struct RowScan {
-    const float* row;          // [V] log-probabilities conditioned on the parent's prefix
+    const float* row;          // [V] log-probabilities (or logits) conditioned on the parent's prefix
     const uint8_t* banned;     // [V], non-zero excludes the token; may be null
     float parent_raw;          // the parent's cumulative log-probability (finite)
     float inv_penalty;         // 1 / gnmt_length_penalty(new_length, alpha)
@@ -59,7 +61,13 @@ struct RowScan {
     int vocab_size;
     int forced_token;          // >= 0: only this token is a candidate
     int masked_token;          // >= 0: this token is excluded (EOS below min_length)
+    bool has_offset = false;
+    float offset = 0.0f;       // subtracted from every entry when has_offset (finite)
 };
+
+inline float row_log_prob(const RowScan& s, int v) noexcept {
+    return s.has_offset ? det::sub(s.row[v], s.offset) : s.row[v];
+}
 
 // Inserts every finite, allowed candidate of the row into `top` (a descending
 // buffer of top_count candidates, see insert_topk). Returns true if the row
@@ -94,7 +102,7 @@ bool scan_row(const RowScan& scan, Candidate* top, int top_count);
 // true if row[v] is NaN or +inf.
 inline bool scan_token(const RowScan& s, int v, Candidate* top, int top_count) noexcept {
     constexpr float kInf = std::numeric_limits<float>::infinity();
-    const float lp = s.row[v];
+    const float lp = row_log_prob(s, v);
     if (!(lp < kInf)) return true;
     if (lp == -kInf) return false;
     if (s.banned && s.banned[v]) return false;
@@ -109,7 +117,7 @@ template <class ScanRange>
 inline bool scan_around_masked(const RowScan& s, ScanRange&& scan_range) {
     const int m = s.masked_token;
     if (m < 0) return scan_range(0, s.vocab_size);
-    bool invalid = !(s.row[m] < std::numeric_limits<float>::infinity());
+    bool invalid = !(row_log_prob(s, m) < std::numeric_limits<float>::infinity());
     invalid |= scan_range(0, m);
     invalid |= scan_range(m + 1, s.vocab_size);
     return invalid;
@@ -123,6 +131,58 @@ inline int count_trailing_zeros(uint32_t x) noexcept {
 #else
     return __builtin_ctz(x);
 #endif
+}
+
+// Statistics of a row of logits: the maximum over finite entries, the
+// logsumexp (-inf when no entry is finite), and whether any entry is NaN or
+// +inf (those entries are ignored). Every kernel path computes the same bits
+// (see logits.hpp for the fixed reduction order).
+struct LogitStats {
+    float max;
+    float lse;
+    bool invalid;
+};
+
+LogitStats logit_stats(const float* row, int vocab_size);
+LogitStats logit_stats_scalar(const float* row, int vocab_size);
+
+// out[v] = 0 - softmax(row)[v] * scale, given the row's logsumexp: the part of
+// a log-softmax gradient spread over the whole row (the caller adds the path
+// gradient at the tokens that have one). Same bits on every kernel path.
+void softmax_gradient_row(const float* row, int vocab_size, float lse, float scale, float* out);
+void softmax_gradient_row_scalar(const float* row, int vocab_size, float lse, float scale, float* out);
+
+#if DBS_CAN_COMPILE_AVX512
+namespace avx512 {
+LogitStats logit_stats(const float* row, int vocab_size);
+void softmax_gradient_row(const float* row, int vocab_size, float lse, float scale, float* out);
+}
+#endif
+#if DBS_CAN_COMPILE_AVX2
+namespace avx2 {
+LogitStats logit_stats(const float* row, int vocab_size);
+void softmax_gradient_row(const float* row, int vocab_size, float lse, float scale, float* out);
+}
+#endif
+#if DBS_CAN_COMPILE_SSE42
+namespace sse42 {
+LogitStats logit_stats(const float* row, int vocab_size);
+void softmax_gradient_row(const float* row, int vocab_size, float lse, float scale, float* out);
+}
+#endif
+#if DBS_ARM_NEON && defined(__aarch64__)
+namespace neon {
+LogitStats logit_stats(const float* row, int vocab_size);
+void softmax_gradient_row(const float* row, int vocab_size, float lse, float scale, float* out);
+}
+#endif
+
+// Combines the kLogitLanes partial sums with the fixed pairwise tree.
+inline float combine_lanes(float* lanes) noexcept {
+    for (int stride = kLogitLanes / 2; stride > 0; stride >>= 1) {
+        for (int j = 0; j < stride; ++j) lanes[j] = det::add(lanes[j], lanes[j + stride]);
+    }
+    return lanes[0];
 }
 
 // Deterministic scalar reductions over the K selected beams.

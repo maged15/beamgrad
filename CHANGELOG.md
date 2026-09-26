@@ -1,5 +1,28 @@
 # Changelog
 
+## Unreleased
+
+### Added
+
+- Decoding from logits in the C library. `dbs_decode_batch_into_ex` takes
+  logits (`from_logits`) and normalises each row the search reads on the
+  fly, with a deterministic logsumexp that every CPU kernel path computes
+  bit for bit. It also takes fp16/bf16 input and returns the relaxed pool's
+  trace and each row's logsumexp (`DBSDecodeOutputsExC`).
+- `dbs_backward_batch_into_ex` (`DBSBackwardInputsC`): the gradient of any
+  decode output (final, per-step and pool scores and raw scores), through
+  the logits' log-softmax when the batch was decoded from logits. Both new
+  functions are additions; ABI 10 is unchanged.
+
+### Changed
+
+- `dbs_decode_typed` and `dbs_decode_batch_typed` convert 16-bit rows one at
+  a time, only for the beams that are expanded, instead of converting the
+  whole input first.
+- The selected-beam softmax weights and the relaxed pool's sigmoid use the
+  library's deterministic `exp`. Their values can differ from 2.1.1's in the
+  last bits.
+
 ## 2.1.1 (2026-09-26)
 
 Closes the gaps left by 2.1.0 and its review:

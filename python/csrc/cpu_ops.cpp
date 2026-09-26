@@ -184,7 +184,8 @@ DecodeOutputs decode_cpu(
             dbs::DecodeConstraints c = constraints;
             c.batch_index = static_cast<int>(b);
             try {
-                decoder.decode_into(xp + b * T * K * V, steps_b[static_cast<size_t>(b)], static_cast<int>(V),
+                decoder.decode_into(xp + b * T * K * V, dbs::DType::F32, /*from_logits=*/false,
+                                    steps_b[static_cast<size_t>(b)], static_cast<int>(V),
                                     constrained ? &c : nullptr, out, final_scores.data_ptr<float>() + b * K,
                                     final_raw.data_ptr<float>() + b * K, final_lengths.data_ptr<int32_t>() + b * K);
             } catch (const std::invalid_argument& e) {

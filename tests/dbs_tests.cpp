@@ -966,6 +966,235 @@ static void test_validation_checks_every_element() {
     dbs_destroy(h);
 }
 
+// ---------------------------------------------------------------------------
+// dbs_decode_batch_into_ex and dbs_backward_batch_into_ex
+// ---------------------------------------------------------------------------
+
+namespace {
+
+struct BatchTrace {
+    int B, T, K, P;
+    std::vector<float> final_scores, final_raw, scores, raw, pool_scores, pool_raw, row_lse;
+    std::vector<int32_t> final_lengths, tokens, parents, lengths, pool_parents, pool_tokens, pool_lengths;
+    std::vector<uint8_t> from_logprob, pool_from_logprob;
+    DBSDecodeOutputsExC out{};
+
+    BatchTrace(int B_, int T_, int K_, int P_) : B(B_), T(T_), K(K_), P(P_) {
+        const size_t bk = static_cast<size_t>(B) * K, btk = bk * T, btp = static_cast<size_t>(B) * T * P;
+        final_scores.assign(bk, 7.0f); final_raw.assign(bk, 7.0f); final_lengths.assign(bk, 7);
+        scores.assign(btk, 7.0f); raw.assign(btk, 7.0f); tokens.assign(btk, 7); parents.assign(btk, 7);
+        lengths.assign(btk, 7); from_logprob.assign(btk, 7); row_lse.assign(btk, 7.0f);
+        out.base = DBSDecodeOutputsC{final_scores.data(), final_raw.data(), final_lengths.data(), tokens.data(),
+                                     parents.data(), lengths.data(), scores.data(), raw.data(), from_logprob.data()};
+        out.row_lse = row_lse.data();
+        if (P > 0) {
+            pool_scores.assign(btp, 7.0f); pool_raw.assign(btp, 7.0f); pool_parents.assign(btp, 7);
+            pool_tokens.assign(btp, 7); pool_lengths.assign(btp, 7); pool_from_logprob.assign(btp, 7);
+            out.pool_parents = pool_parents.data(); out.pool_tokens = pool_tokens.data();
+            out.pool_lengths = pool_lengths.data(); out.pool_scores = pool_scores.data();
+            out.pool_raw_scores = pool_raw.data(); out.pool_from_logprob = pool_from_logprob.data();
+        }
+    }
+};
+
+template <class A>
+bool same_bits(const A& a, const A& b) {
+    return a.size() == b.size() && (a.empty() || std::memcmp(a.data(), b.data(), a.size() * sizeof(a[0])) == 0);
+}
+
+bool same_selection(const BatchTrace& a, const BatchTrace& b) {
+    return same_bits(a.tokens, b.tokens) && same_bits(a.parents, b.parents) && same_bits(a.lengths, b.lengths) &&
+           same_bits(a.from_logprob, b.from_logprob) && same_bits(a.pool_tokens, b.pool_tokens) &&
+           same_bits(a.pool_parents, b.pool_parents);
+}
+
+bool same_trace(const BatchTrace& a, const BatchTrace& b) {
+    return same_selection(a, b) && same_bits(a.scores, b.scores) && same_bits(a.raw, b.raw) &&
+           same_bits(a.final_scores, b.final_scores) && same_bits(a.final_raw, b.final_raw) &&
+           same_bits(a.final_lengths, b.final_lengths) && same_bits(a.pool_scores, b.pool_scores) &&
+           same_bits(a.pool_raw, b.pool_raw) && same_bits(a.pool_lengths, b.pool_lengths) &&
+           same_bits(a.pool_from_logprob, b.pool_from_logprob);
+}
+
+uint16_t to_bf16(float x) {
+    uint32_t u;
+    std::memcpy(&u, &x, sizeof(u));
+    return static_cast<uint16_t>(u >> 16);
+}
+
+float from_bf16(uint16_t h) {
+    const uint32_t u = static_cast<uint32_t>(h) << 16;
+    float x;
+    std::memcpy(&x, &u, sizeof(x));
+    return x;
+}
+
+} // namespace
+
+static void test_decode_batch_into_ex() {
+    DBSOptionsC opt = test_options();
+    opt.beam_size = 3;
+    opt.eos_token = 2;
+    opt.length_penalty_alpha = 0.6f;
+    opt.relaxed_pool_multiplier = 2;
+    DBSDecoderHandle* h = nullptr;
+    CHECK(dbs_create_ex(opt, &h) == 0);
+    const int B = 3, T = 5, K = 3, V = 11, P = K * 2;
+    const int32_t steps[B] = {5, 3, 4};
+    std::vector<float> x(static_cast<size_t>(B) * T * K * V);
+    for (size_t i = 0; i < x.size(); ++i) x[i] = static_cast<float>((i * 7919 + 13) % 997) / 83.0f - 6.0f;
+    // Round to bf16 values, so the float and bf16 inputs are the same numbers.
+    std::vector<uint16_t> xb(x.size());
+    for (size_t i = 0; i < x.size(); ++i) {
+        xb[i] = to_bf16(x[i]);
+        x[i] = from_bf16(xb[i]);
+    }
+
+    // Float log-probs through _ex equal dbs_decode_batch_into, bit for bit.
+    BatchTrace a(B, T, K, 0), b(B, T, K, 0);
+    CHECK(dbs_decode_batch_into(h, x.data(), B, T, V, steps, nullptr, 1, &a.out.base) == 0);
+    CHECK(dbs_decode_batch_into_ex(h, x.data(), DBS_DTYPE_F32, 0, B, T, V, steps, nullptr, 2, &b.out) == 0);
+    CHECK(same_trace(a, b));
+    for (float v : b.row_lse) CHECK(v == 0.0f);  // not from logits: every row_lse entry is 0
+
+    // From logits: the same search as over x - row_lse, row by row; bf16 input too.
+    BatchTrace lf(B, T, K, P), lb(B, T, K, P);
+    CHECK(dbs_decode_batch_into_ex(h, x.data(), DBS_DTYPE_F32, 1, B, T, V, steps, nullptr, 1, &lf.out) == 0);
+    CHECK(dbs_decode_batch_into_ex(h, xb.data(), DBS_DTYPE_BF16, 1, B, T, V, steps, nullptr, 2, &lb.out) == 0);
+    CHECK(same_trace(lf, lb) && same_bits(lf.row_lse, lb.row_lse));
+    std::vector<float> normalised(x.size());
+    for (size_t r = 0; r < lf.row_lse.size(); ++r) {
+        for (int v = 0; v < V; ++v) normalised[r * V + static_cast<size_t>(v)] = x[r * V + static_cast<size_t>(v)] - lf.row_lse[r];
+    }
+    BatchTrace n(B, T, K, P);
+    CHECK(dbs_decode_batch_into_ex(h, normalised.data(), DBS_DTYPE_F32, 0, B, T, V, steps, nullptr, 1, &n.out) == 0);
+    CHECK(same_trace(lf, n));
+    CHECK(lf.row_lse[0] != 0.0f && std::isfinite(lf.row_lse[0]));  // step 0, beam 0 is always read
+
+    // Pool outputs equal the result-handle API's (example 0 decodes all T steps).
+    DBSResultHandle* r = nullptr;
+    CHECK(dbs_decode(h, normalised.data(), T, V, &r) == 0);
+    CHECK(dbs_result_pool_size(r) == P);
+    const size_t tp = static_cast<size_t>(T) * P;
+    CHECK(std::memcmp(dbs_result_pool_tokens(r), n.pool_tokens.data(), tp * sizeof(int32_t)) == 0);
+    CHECK(std::memcmp(dbs_result_pool_parents(r), n.pool_parents.data(), tp * sizeof(int32_t)) == 0);
+    CHECK(std::memcmp(dbs_result_pool_scores(r), n.pool_scores.data(), tp * sizeof(float)) == 0);
+    dbs_free_result(r);
+    // Padding past an example's steps.
+    for (int t = steps[1]; t < T; ++t) {
+        for (int p2 = 0; p2 < P; ++p2) CHECK(n.pool_parents[(static_cast<size_t>(T) + t) * P + p2] == -1);
+    }
+
+    // Errors.
+    BatchTrace bad(B, T, K, P);
+    bad.out.reserved[0] = &bad;
+    CHECK(dbs_decode_batch_into_ex(h, x.data(), DBS_DTYPE_F32, 1, B, T, V, steps, nullptr, 1, &bad.out) == DBS_ERROR_INVALID_ARGUMENT);
+    CHECK(dbs_decode_batch_into_ex(h, x.data(), 7, 1, B, T, V, steps, nullptr, 1, &lf.out) == DBS_ERROR_INVALID_ARGUMENT);
+    std::vector<float> nan_row = x;
+    nan_row[0] = std::numeric_limits<float>::quiet_NaN();
+    const int rc = dbs_decode_batch_into_ex(h, nan_row.data(), DBS_DTYPE_F32, 1, B, T, V, steps, nullptr, 1, &lf.out);
+    CHECK(rc == DBS_ERROR_INVALID_ARGUMENT && std::strstr(dbs_last_error(h), "logits contain NaN") != nullptr);
+    dbs_destroy(h);
+
+    DBSOptionsC no_pool = opt;
+    no_pool.relaxed_pool_multiplier = 0;
+    CHECK(dbs_create_ex(no_pool, &h) == 0);
+    BatchTrace with_pool(B, T, K, P);
+    CHECK(dbs_decode_batch_into_ex(h, x.data(), DBS_DTYPE_F32, 0, B, T, V, steps, nullptr, 1, &with_pool.out) ==
+          DBS_ERROR_INVALID_ARGUMENT);
+    dbs_destroy(h);
+}
+
+static void test_backward_batch_into_ex() {
+    DBSOptionsC opt = test_options();
+    opt.beam_size = 2;
+    opt.eos_token = -1;
+    opt.length_penalty_alpha = 0.6f;
+    opt.relaxed_pool_multiplier = 2;
+    DBSDecoderHandle* h = nullptr;
+    CHECK(dbs_create_ex(opt, &h) == 0);
+    const int B = 2, T = 3, K = 2, V = 5, P = K * 2;
+    std::vector<float> x(static_cast<size_t>(B) * T * K * V);
+    for (size_t i = 0; i < x.size(); ++i) x[i] = static_cast<float>((i * 104729 + 7) % 613) / 61.0f - 5.0f;
+    BatchTrace tr(B, T, K, P);
+    CHECK(dbs_decode_batch_into_ex(h, x.data(), DBS_DTYPE_F32, 1, B, T, V, nullptr, nullptr, 1, &tr.out) == 0);
+
+    const size_t bk = static_cast<size_t>(B) * K, btk = bk * T, btp = static_cast<size_t>(B) * T * P;
+    auto grads = [](size_t n, float scale) {
+        std::vector<float> g(n);
+        for (size_t i = 0; i < n; ++i) g[i] = scale * static_cast<float>(static_cast<int>(i % 7) - 3);
+        return g;
+    };
+    const std::vector<float> gf = grads(bk, 0.5f), gfr = grads(bk, -0.25f), gs = grads(btk, 0.3f), gr = grads(btk, 0.2f),
+                             gps = grads(btp, 0.1f), gpr = grads(btp, -0.15f);
+    DBSBackwardInputsC in{};
+    in.batch_size = B; in.steps = T; in.vocab_size = V; in.pool_size = P;
+    in.parents = tr.parents.data(); in.tokens = tr.tokens.data(); in.lengths = tr.lengths.data();
+    in.from_logprob = tr.from_logprob.data();
+    in.pool_parents = tr.pool_parents.data(); in.pool_tokens = tr.pool_tokens.data();
+    in.pool_lengths = tr.pool_lengths.data(); in.pool_from_logprob = tr.pool_from_logprob.data();
+
+    // Final-score gradients of log-probs: exactly dbs_backward_batch_into.
+    in.grad_final_scores = gf.data();
+    std::vector<float> g1(x.size(), 0.0f), g2(x.size(), 0.0f);
+    CHECK(dbs_backward_batch_into_ex(h, &in, 1, g1.data()) == 0);
+    CHECK(dbs_backward_batch_into(h, B, T, V, nullptr, tr.parents.data(), tr.tokens.data(), tr.lengths.data(),
+                                  tr.from_logprob.data(), gf.data(), 2, g2.data()) == 0);
+    CHECK(same_bits(g1, g2));
+
+    // Every output's gradient, through the logits: central differences.
+    in.grad_final_raw_scores = gfr.data(); in.grad_scores = gs.data(); in.grad_raw_scores = gr.data();
+    in.grad_pool_scores = gps.data(); in.grad_pool_raw_scores = gpr.data();
+    in.logits = x.data(); in.logits_type = DBS_DTYPE_F32; in.row_lse = tr.row_lse.data();
+    std::vector<float> grad(x.size(), 0.0f);
+    CHECK(dbs_backward_batch_into_ex(h, &in, 2, grad.data()) == 0);
+    auto loss = [&](const std::vector<float>& logits, BatchTrace& t) {
+        CHECK(dbs_decode_batch_into_ex(h, logits.data(), DBS_DTYPE_F32, 1, B, T, V, nullptr, nullptr, 1, &t.out) == 0);
+        double l = 0.0;
+        for (size_t i = 0; i < bk; ++i) l += static_cast<double>(gf[i]) * t.final_scores[i] + static_cast<double>(gfr[i]) * t.final_raw[i];
+        for (size_t i = 0; i < btk; ++i) {
+            if (t.parents[i] >= 0) l += static_cast<double>(gs[i]) * t.scores[i] + static_cast<double>(gr[i]) * t.raw[i];
+        }
+        for (size_t i = 0; i < btp; ++i) {
+            if (t.pool_parents[i] >= 0) l += static_cast<double>(gps[i]) * t.pool_scores[i] + static_cast<double>(gpr[i]) * t.pool_raw[i];
+        }
+        return l;
+    };
+    int checked = 0;
+    const float eps = 1e-2f;
+    for (size_t i = 0; i < x.size(); i += 3) {
+        std::vector<float> xp = x, xm = x;
+        xp[i] += eps;
+        xm[i] -= eps;
+        BatchTrace tp(B, T, K, P), tm(B, T, K, P);
+        const double fd = (loss(xp, tp) - loss(xm, tm)) / (2.0 * eps);
+        if (!same_selection(tp, tr) || !same_selection(tm, tr)) continue;  // the selection moved: not differentiable here
+        CHECK(std::fabs(fd - grad[i]) <= 2e-3 * std::max(1.0, std::fabs(fd)));
+        ++checked;
+    }
+    CHECK(checked > 10);
+
+    // Errors.
+    DBSBackwardInputsC bad = in;
+    bad.row_lse = nullptr;
+    CHECK(dbs_backward_batch_into_ex(h, &bad, 1, grad.data()) == DBS_ERROR_INVALID_ARGUMENT);
+    bad = in;
+    bad.pool_parents = nullptr;
+    CHECK(dbs_backward_batch_into_ex(h, &bad, 1, grad.data()) == DBS_ERROR_INVALID_ARGUMENT);
+    bad = in;
+    bad.reserved[1] = &bad;
+    CHECK(dbs_backward_batch_into_ex(h, &bad, 1, grad.data()) == DBS_ERROR_INVALID_ARGUMENT);
+    bad = in;
+    bad.logits_type = 9;
+    CHECK(dbs_backward_batch_into_ex(h, &bad, 1, grad.data()) == DBS_ERROR_INVALID_ARGUMENT);
+    std::vector<int32_t> corrupt = tr.pool_tokens;
+    corrupt[1] = V;
+    bad = in;
+    bad.pool_tokens = corrupt.data();
+    CHECK(dbs_backward_batch_into_ex(h, &bad, 1, grad.data()) == DBS_ERROR_INVALID_ARGUMENT);
+    dbs_destroy(h);
+}
+
 int main() {
     CHECK(dbs_abi_version() == DBS_ABI_VERSION);
     char expected_version[32];
@@ -1005,6 +1234,8 @@ int main() {
     test_variable_beam_batch_backward();
     test_model_steps_ex_tracks_beam_prefixes();
     test_batch_into_matches_result_handles();
+    test_decode_batch_into_ex();
+    test_backward_batch_into_ex();
     test_validation_checks_every_element();
     std::cout << "dbs_tests passed\n";
     return 0;

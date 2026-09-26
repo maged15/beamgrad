@@ -25,8 +25,8 @@
 namespace dbs {
 
 // Where a search writes its per-step trace. Selected-beam arrays are [T * K],
-// pool arrays [T * P]; any pointer may be null when the output is not needed
-// (pool pointers must be null when the relaxed pool is disabled).
+// pool arrays [T * P] (P = K * relaxed_pool_multiplier); any pointer may be
+// null when the output is not needed.
 struct TraceOutputs {
     int32_t* parents = nullptr;
     int32_t* tokens = nullptr;
@@ -43,6 +43,10 @@ struct TraceOutputs {
     float* pool_raw_scores = nullptr;
     float* relaxed_weights = nullptr;
     uint8_t* pool_from_logprob = nullptr;
+
+    // Decoding from logits: the logsumexp of every row the search read
+    // [T * K] (other entries are left untouched).
+    float* row_lse = nullptr;
 };
 
 // The beams entering a model step, as passed to a model-step callback.
@@ -63,16 +67,33 @@ struct ModelStepInfo {
 // Throws to abort the decode.
 using ModelStepFunction = std::function<void(const ModelStepInfo& info, float* rows)>;
 
-// A decode trace as flat arrays, for the final-score backward.
+// One example's decode trace as flat arrays, for the backward of the decode
+// outputs (see path_gradient).
 struct TraceView {
     int steps = 0;
     int beam_size = 0;
     int vocab_size = 0;
+    int pool_size = 0;                           // P, or 0 without a pool
     float length_penalty_alpha = 0.0f;
-    const int32_t* parents = nullptr;       // [T * K]
-    const int32_t* tokens = nullptr;        // [T * K]
-    const int32_t* lengths = nullptr;       // [T * K]
-    const uint8_t* from_logprob = nullptr;  // [T * K]
+    const int32_t* parents = nullptr;            // [T * K]
+    const int32_t* tokens = nullptr;             // [T * K]
+    const int32_t* lengths = nullptr;            // [T * K]
+    const uint8_t* from_logprob = nullptr;       // [T * K]
+    const int32_t* pool_parents = nullptr;       // [T * P]
+    const int32_t* pool_tokens = nullptr;        // [T * P]
+    const int32_t* pool_lengths = nullptr;       // [T * P]
+    const uint8_t* pool_from_logprob = nullptr;  // [T * P]
+};
+
+// Gradients of a loss with respect to the decode outputs of one example; any
+// pointer may be null (a zero gradient).
+struct OutputGradients {
+    const float* final_scores = nullptr;      // [K]
+    const float* final_raw_scores = nullptr;  // [K]
+    const float* scores = nullptr;            // [T * K]
+    const float* raw_scores = nullptr;        // [T * K]
+    const float* pool_scores = nullptr;       // [T * P]
+    const float* pool_raw_scores = nullptr;   // [T * P]
 };
 
 class BeamSearchDecoder {
@@ -81,9 +102,10 @@ public:
 
     const BeamOptions& options() const noexcept { return opt_; }
 
-    // log_probs: [steps, beam_size, vocab_size] float32, where step t starts at
-    // log_probs + t * step_stride (step_stride = beam_size * vocab_size when
-    // contiguous; rows of one step are always contiguous).
+    // log_probs: [steps, beam_size, vocab_size] of `type`, where step t starts
+    // at element t * step_stride (step_stride = beam_size * vocab_size when
+    // contiguous; rows of one step are always contiguous). 16-bit rows are
+    // converted one at a time, and only for the beams that are expanded.
     DecodeResult decode(const float* log_probs, int steps, int vocab_size) const;
     DecodeResult decode_constrained(
         const float* log_probs,
@@ -91,11 +113,23 @@ public:
         int vocab_size,
         const DecodeConstraints* constraints,
         int64_t step_stride = 0) const;
+    DecodeResult decode_typed(
+        const void* log_probs,
+        DType type,
+        int steps,
+        int vocab_size,
+        const DecodeConstraints* constraints,
+        int64_t step_stride = 0) const;
 
-    // Decodes straight into caller buffers: the trace (weights and pool outputs
-    // must be null) and optional final arrays [K].
+    // Decodes straight into caller buffers: the trace (weights and relaxed
+    // weights must be null; pool outputs are written when the options enable
+    // the relaxed pool) and optional final arrays [K]. With from_logits the
+    // input rows are logits: each row the search reads is log-softmax
+    // normalised on the fly, and trace.row_lse receives its logsumexp.
     void decode_into(
-        const float* log_probs,
+        const void* log_probs,
+        DType type,
+        bool from_logits,
         int steps,
         int vocab_size,
         const DecodeConstraints* constraints,
@@ -156,9 +190,56 @@ private:
     BeamOptions opt_;
 };
 
-// Final-score surrogate gradient of one example, accumulated (+=) into
-// grad_log_probs [T, K, V]. Checks that the trace indexes stay in range.
+// The surrogate gradient of one example's decode outputs with respect to its
+// log-probs [T, K, V], as sorted entries with unique indices. Every output is
+// differentiated along the path of tokens that produced it, holding the
+// selection fixed; contributions to one entry are summed in the CPU backward's
+// order (selected beams by slot, then pool candidates by rank). Checks that
+// the trace indexes stay in range.
+std::vector<SparseGradEntry> path_gradient(const TraceView& trace, const OutputGradients& grads);
+
+// The final-score gradient of one example (grad_final_scores [K]),
+// accumulated (+=) into a dense grad_log_probs [T, K, V]: the same values as
+// path_gradient with only final-score gradients, without sorting. Checks that
+// the trace indexes stay in range.
 void final_scores_backward_into(const TraceView& trace, const float* grad_final_scores, float* grad_log_probs);
+
+// Adds a path gradient (from path_gradient) to a [T, K, V] gradient through
+// add(index, value). When the inputs were logits, row_lse is the decode's
+// [T * K] logsumexp output and read_row(r, buffer) returns row r of the
+// logits as floats: every row with a path gradient g then receives the
+// log-softmax gradient g - softmax(row) * sum(g) (sum in token order) in full.
+template <class ReadRow, class Add>
+void apply_path_gradient(
+    const std::vector<SparseGradEntry>& entries,
+    int vocab_size,
+    const float* row_lse,
+    ReadRow&& read_row,
+    Add&& add) {
+    if (!row_lse) {
+        for (const SparseGradEntry& e : entries) add(e.index, e.value);
+        return;
+    }
+    const int64_t V = vocab_size;
+    std::vector<float> row_buffer(static_cast<size_t>(V));
+    std::vector<float> grad(static_cast<size_t>(V));
+    size_t i = 0;
+    while (i < entries.size()) {
+        const int64_t r = entries[i].index / V;
+        size_t j = i;
+        float sum = 0.0f;
+        for (; j < entries.size() && entries[j].index / V == r; ++j) sum = det::add(sum, entries[j].value);
+        const float* x = read_row(r, row_buffer.data());
+        const float lse = row_lse[r];
+        softmax_gradient_row(x, vocab_size, lse, sum, grad.data());
+        for (size_t k = i; k < j; ++k) {
+            const int64_t v = entries[k].index - r * V;
+            grad[static_cast<size_t>(v)] = det::sub(entries[k].value, det::mul(softmax_probability(x[v], lse), sum));
+        }
+        for (int64_t v = 0; v < V; ++v) add(r * V + v, grad[static_cast<size_t>(v)]);
+        i = j;
+    }
+}
 
 // The same gradient restricted to the entries the selected beams used: draws
 // [T, K] gets, for slot k of step t, the gradient of its log-prob entry (0 for
