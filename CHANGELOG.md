@@ -1,6 +1,19 @@
 # Changelog
 
-## Unreleased
+## 2.2.0 (2026-09-26)
+
+Decoding from logits and from float16/bfloat16 rows, on every backend, and
+gradients of every decode output:
+- `final_scores`, `decode` and `search` (and `beamgrad.jax.final_scores`)
+  take `from_logits=True`. The search is the one over `log_softmax(logits)`,
+  computed on the fly, and the gradient flows through the log-softmax;
+- float16 and bfloat16 rows are read as they are, without a float32 copy;
+- `decode` is differentiable: its final, per-step and raw scores carry the
+  path gradient;
+- the C library and the CUDA engine have the same features as additions
+  (`_ex` functions), and CPU and GPU agree bit for bit.
+
+The C ABI is unchanged (version 10): every new function is an addition.
 
 ### Added
 
