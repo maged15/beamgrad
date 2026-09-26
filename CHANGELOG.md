@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+### Fixed
+
+- `pip install beamgrad` (the source distribution) no longer fails when the
+  CUDA operators cannot be built. With the default `BEAMGRAD_CUDA=auto`, a
+  CUDA toolkit whose major version differs from PyTorch's CUDA (a system
+  `nvcc` 12.4 with a PyTorch built for CUDA 13.0), a host compiler that
+  PyTorch rejects for that toolkit, or an `nvcc` failure now gives a warning
+  and an installation without the CUDA operators. Passing a CUDA tensor to it
+  raises an error that gives the reason. `BEAMGRAD_CUDA=1` still makes any of
+  these an error.
+
 ## 2.2.0 (2026-09-26)
 
 Decoding from logits and from float16/bfloat16 rows, on every backend, and

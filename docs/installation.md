@@ -61,7 +61,8 @@ On a mismatch, `import beamgrad` says what is wrong:
 ## From source
 
 Building needs a C++17 compiler. For the CUDA operators it also needs a CUDA
-toolkit whose major version matches your PyTorch's CUDA.
+toolkit whose major version matches your PyTorch's CUDA, and a host compiler
+that toolkit supports (for example GCC 13 or older with CUDA 12.4).
 
 ```bash
 pip install torch "setuptools>=77" wheel "packaging>=24.2"
@@ -75,11 +76,28 @@ builds in a temporary environment with the newest PyTorch, and
 the installed build tools, so install them first. `setuptools>=77` needs
 `packaging>=24.2`.
 
+If the CUDA operators cannot be built, the default `BEAMGRAD_CUDA=auto` still
+installs beamgrad, without them. That happens when the toolkit's major version
+differs from PyTorch's CUDA (say, a system `nvcc` 12.4 with a PyTorch built for
+CUDA 13.0), when PyTorch rejects the host compiler for that CUDA version, or
+when `nvcc` fails. The build prints a warning (pip shows it with `-v`). Passing
+a CUDA tensor to such an installation then raises an error that says why. To
+build them, point `CUDA_HOME` at a matching toolkit and, if needed, the host
+compiler at a supported one:
+
+```bash
+CUDA_HOME=/usr/local/cuda-13.0 BEAMGRAD_CUDA=1 pip install --no-build-isolation beamgrad
+CC=gcc-13 CXX=g++-13 BEAMGRAD_CUDA=1 pip install --no-build-isolation beamgrad   # nvcc 12.4 with GCC 14+
+```
+
+or install a prebuilt wheel ([above](#prebuilt-wheels)).
+
 Environment variables:
 
 | variable | effect |
 |---|---|
-| `BEAMGRAD_CUDA` | `auto` (default): build the CUDA operators if `nvcc` and a CUDA-enabled PyTorch are found; `1`: require them; `0`: skip them |
+| `BEAMGRAD_CUDA` | `auto` (default): build the CUDA operators when a CUDA-enabled PyTorch and an `nvcc` of the same CUDA major version are found, else warn and build without them; `1`: require them (any failure is an error); `0`: skip them |
+| `CUDA_HOME` | the CUDA toolkit to build with (default: the one PyTorch finds, e.g. the `nvcc` on `PATH`) |
 | `TORCH_CUDA_ARCH_LIST` | GPU architectures to compile for (default: the GPUs present) |
 | `MAX_JOBS` | parallel compile jobs |
 | `BEAMGRAD_PIN_TORCH=1` | make the built wheel require the PyTorch minor version it was built against (release wheels) |
@@ -95,8 +113,9 @@ Tested in CI:
 | Compilers | GCC, Clang, MSVC, Apple Clang; `nvcc` with GCC up to 15 |
 
 The GitHub-hosted runners have no GPU. There, the CUDA kernels run under a
-CPU emulation layer (see [cuda.md](cuda.md)). A self-hosted GPU runner runs
-the device tests (`.github/workflows/gpu.yml`).
+CPU emulation layer (see [cuda.md](cuda.md)). The device tests run on a local
+GPU with `scripts/gpu_report.py`; [gpu-report.md](gpu-report.md) is the latest
+report.
 
 ## The C library
 

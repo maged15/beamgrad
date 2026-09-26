@@ -83,6 +83,19 @@ if importlib.util.find_spec(f"{__package__}._C_cuda") is not None:  # built with
 StepsLike = torch.Tensor | Sequence[int] | None
 
 
+def _no_cuda_operators_message() -> str:
+    try:
+        from ._build_info import CUDA_SKIPPED as reason
+    except ImportError:  # source checkouts without a build, and builds before 2.2.1
+        reason = None
+    why = f" The build left them out: {reason}" if reason else ""
+    return (
+        f"beamgrad was installed without its CUDA operators, so CUDA tensors are not supported.{why} "
+        "Install a prebuilt wheel for your PyTorch and CUDA version (see docs/installation.md), or rebuild with a "
+        "CUDA toolkit of PyTorch's CUDA major version: `BEAMGRAD_CUDA=1 pip install --no-build-isolation beamgrad`."
+    )
+
+
 class BeamSearchOutput(NamedTuple):
     """Result of :func:`decode`. Leading ``[B]`` is absent for unbatched input.
 
@@ -392,11 +405,7 @@ def _prepare(
     device = x.device.type
     if device == "cuda":
         if _C_cuda is None:
-            raise RuntimeError(
-                "beamgrad was installed without its CUDA operators, so CUDA tensors are not supported. "
-                "Reinstall on a machine with the CUDA toolkit (nvcc) available, e.g. "
-                "`BEAMGRAD_CUDA=1 pip install --no-build-isolation beamgrad`."
-            )
+            raise RuntimeError(_no_cuda_operators_message())
         if K > CUDA_MAX_BEAM:
             raise ValueError(f"beam_size {K} exceeds the CUDA backend maximum of {CUDA_MAX_BEAM}")
     elif device != "cpu":
