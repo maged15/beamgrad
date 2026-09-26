@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import statistics
 import subprocess
 import sys
@@ -32,6 +33,7 @@ ABLATIONS = {
     "mrt-beam8": ["--arm", "mrt", "--beam", "8"],
     "mrt-alpha0": ["--arm", "mrt", "--alpha", "0"],
     "margin-rescore": ["--arm", "margin", "--gradient", "rescore"],
+    "mrt-rescore": ["--arm", "mrt", "--gradient", "rescore"],
 }
 # Cost: measured separately (seed 0, no evaluation, nothing else running), so
 # that time per step is not affected by evaluation or by other jobs.
@@ -70,17 +72,73 @@ def mean_std(values: list[float]) -> str:
     return f"{statistics.mean(values):.2f} ± {statistics.stdev(values):.2f}"
 
 
+def _betacf(a: float, b: float, x: float) -> float:
+    """Continued fraction of the regularized incomplete beta function (modified Lentz)."""
+    tiny = 1e-300
+    c, d = 1.0, 1.0 - (a + b) * x / (a + 1.0)
+    d = 1.0 / (d if abs(d) > tiny else tiny)
+    h = d
+    for m in range(1, 300):
+        for numerator in (
+            m * (b - m) * x / ((a + 2 * m - 1) * (a + 2 * m)),
+            -(a + m) * (a + b + m) * x / ((a + 2 * m) * (a + 2 * m + 1)),
+        ):
+            d = 1.0 + numerator * d
+            d = 1.0 / (d if abs(d) > tiny else tiny)
+            c = 1.0 + numerator / c
+            c = c if abs(c) > tiny else tiny
+            h *= d * c
+        if abs(d * c - 1.0) < 1e-14:
+            break
+    return h
+
+
+def _betainc(a: float, b: float, x: float) -> float:
+    """Regularized incomplete beta function I_x(a, b)."""
+    if x <= 0.0 or x >= 1.0:
+        return 0.0 if x <= 0.0 else 1.0
+    front = math.exp(math.lgamma(a + b) - math.lgamma(a) - math.lgamma(b) + a * math.log(x) + b * math.log1p(-x))
+    if x < (a + 1.0) / (a + b + 2.0):
+        return front * _betacf(a, b, x) / a
+    return 1.0 - front * _betacf(b, a, 1.0 - x) / b
+
+
+def paired_t_p(deltas: list[float]) -> float:
+    """Two-sided p-value of a paired t-test (a one-sample t-test on the differences)."""
+    n = len(deltas)
+    if n < 2:
+        return math.nan
+    mean, sd = statistics.mean(deltas), statistics.stdev(deltas)
+    if sd == 0.0:
+        return 1.0 if mean == 0.0 else 0.0
+    t = mean / (sd / math.sqrt(n))
+    df = n - 1
+    return _betainc(df / 2.0, 0.5, df / (df + t * t))
+
+
+def sign_test_p(deltas: list[float]) -> float:
+    """Two-sided exact sign test: how often a fair coin splits the non-zero differences this unevenly."""
+    signs = [d > 0 for d in deltas if d != 0]
+    n, wins = len(signs), sum(signs)
+    if n == 0:
+        return 1.0
+    tail = sum(math.comb(n, i) for i in range(min(wins, n - wins) + 1)) / 2**n
+    return min(1.0, 2.0 * tail)
+
+
 def summarise(args) -> str:
     seeds = range(args.seeds)
     pre = load(args.out, "pretrain", seeds)
     baseline = {m["seed"]: m["test_bleu"] for m in load(args.out, "mle", seeds)}
     lines = [
-        f"Test BLEU (sacreBLEU, test2016, beam {args.eval_beam}, alpha {args.eval_alpha}), "
-        f"mean ± std over {args.seeds} seeds; Δ is the paired difference from `mle`.",
+        f"Test BLEU (sacreBLEU, test2016, beam {args.eval_beam}, alpha {args.eval_alpha}), mean ± std over the "
+        "`n` seeds of each run. Δ is the paired difference from `mle` on the same seeds; `wins` counts the "
+        "seeds where the run beat `mle`, with the two-sided exact sign test and paired t-test p-values.",
         "",
-        "| run | test BLEU | Δ vs mle | best valid BLEU | valid BLEU at the last step |",
-        "|---|---|---|---|---|",
-        f"| pretrained (MLE, start of fine-tuning) | {mean_std([m['test_bleu'] for m in pre])} | | "
+        "| run | n | test BLEU | Δ vs mle | wins | sign test p | t-test p | best valid BLEU "
+        "| valid BLEU at the last step |",
+        "|---|---|---|---|---|---|---|---|---|",
+        f"| pretrained (MLE, start of fine-tuning) | {len(pre)} | {mean_std([m['test_bleu'] for m in pre])} | | | | | "
         f"{mean_std([m['valid_bleu'] for m in pre])} | |",
     ]
     table = {}
@@ -89,13 +147,16 @@ def summarise(args) -> str:
         if not ms:
             continue
         deltas = [m["test_bleu"] - baseline[m["seed"]] for m in ms if m["seed"] in baseline]
-        delta = ""
+        delta = wins = sign_p = t_p = ""
         if name != "mle" and deltas:
             delta = ("+" if statistics.mean(deltas) >= 0 else "") + mean_std(deltas)
+            wins = f"{sum(d > 0 for d in deltas)}/{len(deltas)}"
+            sign_p = f"{sign_test_p(deltas):.3g}"
+            t_p = f"{paired_t_p(deltas):.3g}" if len(deltas) > 1 else "–"
         final = [m["history"][-1]["valid_bleu"] for m in ms]
         lines.append(
-            f"| `{name}` | {mean_std([m['test_bleu'] for m in ms])} | {delta} | "
-            f"{mean_std([m['valid_bleu'] for m in ms])} | {mean_std(final)} |"
+            f"| `{name}` | {len(ms)} | {mean_std([m['test_bleu'] for m in ms])} | {delta} | {wins} | {sign_p} "
+            f"| {t_p} | {mean_std([m['valid_bleu'] for m in ms])} | {mean_std(final)} |"
         )
         table[name] = {
             "seeds": [m["seed"] for m in ms],
@@ -104,8 +165,11 @@ def summarise(args) -> str:
             "final_valid_bleu": final,
             "delta_vs_mle": deltas,
         }
+        if name != "mle" and len(deltas) > 1:
+            table[name]["sign_test_p"] = sign_test_p(deltas)
+            table[name]["paired_t_p"] = paired_t_p(deltas)
         if name == list(MAIN)[-1]:
-            lines.append("| *ablations* | | | | |")
+            lines.append("| *ablations* | | | | | | | | |")
     timing = {name: load(args.out, f"timing-{name}", [0]) for name in TIMING}
     if any(timing.values()):
         lines += [
@@ -134,6 +198,9 @@ def main() -> None:
     parser.add_argument("--out", type=Path, default=HERE / "runs")
     parser.add_argument("--seeds", type=int, default=3)
     parser.add_argument("--no-ablations", action="store_true")
+    parser.add_argument(
+        "--arms", help="comma-separated runs to train (default: all); the summary shows every run found"
+    )
     parser.add_argument("--no-timing", action="store_true")
     parser.add_argument("--summary-only", action="store_true")
     parser.add_argument("--eval-beam", type=int, default=4)
@@ -141,6 +208,12 @@ def main() -> None:
     args = parser.parse_args()
     if not args.summary_only:
         groups = [MAIN] if args.no_ablations else [MAIN, ABLATIONS]
+        if args.arms:
+            wanted = set(args.arms.split(","))
+            unknown = wanted - set(MAIN) - set(ABLATIONS)
+            if unknown:
+                parser.error(f"unknown runs: {', '.join(sorted(unknown))}")
+            groups = [{k: v for k, v in group.items() if k in wanted} for group in (MAIN, ABLATIONS)]
         for seed in range(args.seeds):
             if not (args.out / f"pretrain-s{seed}" / "metrics.json").exists():
                 run(args, ["pretrain", "--seed", str(seed)])

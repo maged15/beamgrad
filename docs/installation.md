@@ -25,22 +25,32 @@ GPUs:
 
 A wheel's local version label names the PyTorch it needs. For example,
 `2.1.0+pt214cu126` requires `torch==2.14.*` built for CUDA 12.x. Install
-PyTorch first, then the wheel that matches it. This prints the label for the
-installed PyTorch:
+PyTorch first. Then this one command picks the wheel for it:
 
 ```bash
-python -c "import torch; v = torch.__version__.split('+')[0].split('.'); c = torch.version.cuda; print(f'pt{v[0]}{v[1]}' + (f'cu{c.replace(\".\", \"\")}' if c else 'cpu'))"
+pip install beamgrad -f "https://maged15.github.io/beamgrad/whl/$(python -c "import torch; v = torch.__version__.split('+')[0].split('.'); c = torch.version.cuda; print(f'pt{v[0]}{v[1]}' + ('cu' + c.replace('.', '') if c else 'cpu'))").html"
 ```
 
-Then install that wheel from the release, for example:
+The `python -c` part prints the label of the installed PyTorch (here
+`pt214cu126`). `-f` points pip at that variant's page, which lists its wheels
+for every platform. pip chooses the one for yours and prefers it to the
+source distribution on PyPI. The pages are rebuilt after every release
+([the list of variants](https://maged15.github.io/beamgrad/)). For example,
+from scratch:
 
 ```bash
 pip install torch==2.14.* --index-url https://download.pytorch.org/whl/cu126
-pip install "https://github.com/maged15/beamgrad/releases/download/v2.1.0/beamgrad-2.1.0+pt214cu126-cp310-abi3-linux_x86_64.whl"
+pip install beamgrad -f https://maged15.github.io/beamgrad/whl/pt214cu126.html
 ```
 
+A wheel can also be installed straight from the release assets:
+`pip install "https://github.com/maged15/beamgrad/releases/download/v2.1.0/beamgrad-2.1.0+pt214cu126-cp310-abi3-linux_x86_64.whl"`.
+
 If there is no wheel for your combination, for example another PyTorch
-version, a CUDA 12.8 build or Linux on ARM, build from source.
+version, a CUDA 12.8 build or Linux on ARM, there is no page for it. pip then
+warns that it could not fetch it and falls back to the source distribution.
+Build that without isolation, as described in
+[From source](#from-source).
 
 On a mismatch, `import beamgrad` says what is wrong:
 

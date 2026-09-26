@@ -1,0 +1,46 @@
+# pip find-links pages for the wheels on GitHub releases, one per PyTorch
+# minor version and CUDA variant, published with GitHub Pages:
+#   pip install beamgrad -f https://maged15.github.io/beamgrad/whl/pt214cu126.html
+# Rebuilt after every successful Release run (the wheels stay on the
+# releases; the pages only link to them), or by hand.
+name: Wheel index
+
+on:
+  workflow_run:
+    workflows: [Release]
+    types: [completed]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.event_name == 'workflow_dispatch' || github.event.workflow_run.conclusion == 'success'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: Generate the pages
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: python3 scripts/wheel_index.py --repo "$GITHUB_REPOSITORY" --out site
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5

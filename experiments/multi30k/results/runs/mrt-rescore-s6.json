@@ -1,0 +1,68 @@
+{
+  "arm": "mrt",
+  "name": "mrt-rescore",
+  "seed": 6,
+  "valid_bleu": 38.117294759634696,
+  "final_valid_bleu": 37.68569717082166,
+  "test_bleu": 37.976830636522415,
+  "seconds_per_step": 0.06440426883860396,
+  "peak_gib": 2.234708309173584,
+  "history": [
+    {
+      "step": 0,
+      "valid_bleu": 37.1813343505633
+    },
+    {
+      "step": 200,
+      "valid_bleu": 37.68771555084536,
+      "train_loss": 1.241754103899002,
+      "beam_bleu": 0.45545350104570387
+    },
+    {
+      "step": 400,
+      "valid_bleu": 37.70696475931292,
+      "train_loss": 1.2379292047023773,
+      "beam_bleu": 0.45995344549417494
+    },
+    {
+      "step": 600,
+      "valid_bleu": 38.117294759634696,
+      "train_loss": 1.238162294626236,
+      "beam_bleu": 0.46076595932245257
+    },
+    {
+      "step": 800,
+      "valid_bleu": 38.00810724178083,
+      "train_loss": 1.2416502660512925,
+      "beam_bleu": 0.4585390570759773
+    },
+    {
+      "step": 1000,
+      "valid_bleu": 37.68569717082166,
+      "train_loss": 1.2127159839868547,
+      "beam_bleu": 0.47529362857341767
+    }
+  ],
+  "config": {
+    "seed": 6,
+    "vocab": 8000,
+    "smoothing": 0.1,
+    "eval_beam": 4,
+    "eval_alpha": 0.6,
+    "arm": "mrt",
+    "name": "mrt-rescore",
+    "steps": 1000,
+    "batch_size": 32,
+    "lr": 0.0001,
+    "dropout": 0.1,
+    "beam": 4,
+    "alpha": 0.6,
+    "nll_weight": 0.3,
+    "temperature": 1.0,
+    "margin": 1.0,
+    "pool_multiplier": 4,
+    "gradient": "rescore",
+    "eval_every": 200,
+    "time_only": false
+  }
+}

@@ -92,7 +92,10 @@ Which to use:
 - With **dropout** on, the two modes differ. The re-scoring pass draws new
   dropout masks, so its gradient belongs to a different random function than
   the one the search saw. Both are valid stochastic gradients, but they are
-  not identical, as they are without dropout.
+  not identical, as they are without dropout. It mattered in the experiment
+  below: minimum-risk training with dropout 0.1 gained +0.39 BLEU through the
+  steps but only +0.11 through re-scoring. When memory allows, go through
+  the steps.
 
 ## Losses
 
@@ -190,23 +193,23 @@ same beams as recomputing every prefix.
 ## Experiment: Multi30k En→De
 
 A 7.6M-parameter transformer was pretrained with MLE, then fine-tuned for
-1,000 steps with each objective, using 3 seeds and the same data order and
-settings everywhere. Test BLEU (test2016, beam 4) compared with continued
-MLE:
+1,000 steps with each objective, with the same data order and settings
+everywhere. Test BLEU (test2016, beam 4) compared with continued MLE:
 
-| objective | test BLEU | Δ vs continued MLE (per seed) |
-|---|---|---|
-| continued MLE (control) | 37.44 ± 0.37 | |
-| `minimum_risk` (MRT) | 38.00 ± 0.03 | +0.55 (+0.93, +0.47, +0.26) |
-| `structured_margin` against the reference | 36.99 ± 0.24 | −0.46; validation BLEU fell 1.8–3.7 points |
-| `relaxed_topk` keep-the-reference-in-the-beam | 37.70 ± 0.38 | +0.25 (+0.60, +0.59, −0.44) |
+| objective | seeds | test BLEU | Δ vs continued MLE | wins | t-test p |
+|---|---|---|---|---|---|
+| continued MLE (control) | 8 | 37.63 ± 0.34 | | | |
+| `minimum_risk` (MRT) | 8 | 38.02 ± 0.32 | +0.39 ± 0.31 | 7/8 | 0.009 |
+| MRT through re-scoring | 8 | 37.74 ± 0.23 | +0.11 ± 0.30 | 5/8 | 0.33 |
+| `structured_margin` against the reference | 3 | 36.99 ± 0.24 | −0.46; validation BLEU fell 1.8–3.7 points | 1/3 | 0.24 |
+| `relaxed_topk` keep-the-reference-in-the-beam | 3 | 37.70 ± 0.38 | +0.25 | 2/3 | 0.54 |
 
-Minimum-risk training on the search's beams improved every seed, with 2, 4
-and 8 training beams. It helped less when the training search omitted the
-length penalty that decoding used. The margin against the reference
-consistently hurt: most of the time the beams that beat the reference were
-good paraphrases, and the loss pushed them down. Re-scoring halved the cost
-per step and trained the same way. Three seeds make these results
-directional rather than established.
+Minimum-risk training on the search's beams beat continued MLE on 7 of 8
+seeds (paired t-test p = 0.009), and with 2, 4 and 8 training beams. It
+helped less when the training search omitted the length penalty that
+decoding used. Through re-scoring, with dropout on, it gained less (see
+above). The margin against the reference consistently hurt: most of the time
+the beams that beat the reference were good paraphrases, and the loss pushed
+them down. This is one small model on one dataset.
 [`experiments/multi30k`](../experiments/multi30k) has the full protocol,
 the ablations, cost and memory, and the code to reproduce it.

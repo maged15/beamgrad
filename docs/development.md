@@ -119,6 +119,9 @@ guides the fuzzer through the library, not just the harness.
   and Windows with the newest PyTorch (with JAX and `transformers` on Linux,
   Python 3.13), and on Linux with the oldest supported
   versions (Python 3.10, PyTorch 2.4, JAX 0.4.20); lint and version metadata.
+- **GPU reports**: `python scripts/gpu_report.py --output docs/gpu-report.md
+  --tag vX.Y.Z --benchmark` on a machine with a GPU runs the device tests and
+  records them. See [cuda.md](cuda.md#testing-on-a-gpu).
 - **GPU**: the CUDA tests and benchmark on a self-hosted GPU runner. It is
   enabled by the repository variable `BEAMGRAD_GPU_RUNNER=true` and a runner
   labelled `gpu`.

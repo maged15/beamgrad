@@ -1,0 +1,52 @@
+{
+  "seed": 4,
+  "valid_bleu": 37.010978466984504,
+  "test_bleu": 36.988881891267134,
+  "minutes": 1.7825747744830247,
+  "history": [
+    {
+      "epoch": 5,
+      "train_loss": 4.291411065845238,
+      "valid_bleu": 24.46190242220717
+    },
+    {
+      "epoch": 10,
+      "train_loss": 3.3290763310923976,
+      "valid_bleu": 32.461927198049835
+    },
+    {
+      "epoch": 15,
+      "train_loss": 3.027552765371516,
+      "valid_bleu": 34.92020087343346
+    },
+    {
+      "epoch": 20,
+      "train_loss": 2.864557354460729,
+      "valid_bleu": 36.27144174648187
+    },
+    {
+      "epoch": 25,
+      "train_loss": 2.7523473590481125,
+      "valid_bleu": 36.99874433514339
+    },
+    {
+      "epoch": 30,
+      "train_loss": 2.6682934393441626,
+      "valid_bleu": 37.010978466984504
+    }
+  ],
+  "parameters": 7644160,
+  "config": {
+    "seed": 4,
+    "vocab": 8000,
+    "smoothing": 0.1,
+    "eval_beam": 4,
+    "eval_alpha": 0.6,
+    "epochs": 30,
+    "batch_size": 128,
+    "lr": 0.001,
+    "warmup": 1000,
+    "dropout": 0.3,
+    "eval_every": 5
+  }
+}

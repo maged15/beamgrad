@@ -65,10 +65,14 @@ initial state and every state a previous step produced satisfy this, so
 state into the next are unaffected. A hand-built state that violates it, with
 `length_penalty_alpha != 0`, can select different beams than the CPU decoder,
 and not best first. For example, beams of lengths 1 and 5 with α = 3 come back
-in the opposite order to the CPU's. The step does not check this: it would
-need a device-side check and a stream synchronization on every step, and the
-existing synchronization (validating per-example arrays) only happens when
-such arrays are passed.
+in the opposite order to the CPU's. The C function does not check this: it
+would need a device-side check and a stream synchronization on every step, and
+the C step only synchronizes when per-example arrays are passed. The PyTorch
+operator (`torch.ops.beamgrad.decode_step`, which `beamgrad.beam_search`
+uses) does check it when `validate_inputs` is on (the default) and the length
+penalty is not zero. It already reads the NaN/`+inf` flags back from the
+device, and it reads the check's result in the same transfer, so the check
+costs no extra synchronization. A violating state raises `ValueError`.
 
 **Why the numbers match bit for bit.** Every floating-point operation that
 feeds a result uses an explicitly rounded intrinsic (`__fadd_rn`,
@@ -154,9 +158,24 @@ multi-level reduction, and `K = 1024`. CI runs this suite, with and without
 sanitizers, on every change.
 
 The emulation checks the kernels' logic, not their performance or warp-level
-timing. `python/tests/test_cuda.py` (exact CPU/CUDA parity, constraints,
-validation, `torch.compile`) and `.github/workflows/gpu.yml` run on real
-hardware.
+timing.
+
+## Testing on a GPU
+
+CI checks CUDA in three ways, and only the last one needs a GPU:
+
+| check | where | what it establishes |
+|---|---|---|
+| nvcc build (CUDA 12.4, 12.6, 13.0) | GitHub-hosted CI | the kernels and operators compile for each toolkit and architecture |
+| emulation (`dbs_cuda_emulation_tests`) | GitHub-hosted CI | the kernels' logic matches the CPU decoder bit for bit, under several thread schedules |
+| device (`dbs_cuda_device_tests`, `python/tests/test_cuda.py`) | a machine with a GPU | the compiled kernels on real hardware match the CPU decoder bit for bit |
+
+GitHub's hosted runners have no GPU, and `.github/workflows/gpu.yml` only runs
+on a self-hosted GPU runner, which this repository does not have. The device
+checks are run locally instead, with `scripts/gpu_report.py`. It builds the
+native CUDA backend, runs the C/C++ and Python suites on the GPU and writes a
+report of the environment and the results. [gpu-report.md](gpu-report.md) is
+the latest one.
 
 ## Performance notes
 
