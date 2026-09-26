@@ -4,6 +4,8 @@
 // Nothing in this header is part of the public interface (see include/dbs.h).
 #pragma once
 
+#include "half.hpp"
+
 #include <algorithm>
 #include <atomic>
 #include <cmath>
@@ -141,44 +143,10 @@ using AlignedFloatVector = std::vector<float, AlignedAllocator<float, 64>>;
 using AlignedIntVector = std::vector<int32_t, AlignedAllocator<int32_t, 64>>;
 using AlignedInt64Vector = std::vector<int64_t, AlignedAllocator<int64_t, 64>>;
 
-// Element types of log-prob inputs (values match DBSDataTypeC in dbs.h).
-enum class DType : int { F32 = 0, F16 = 1, BF16 = 2 };
-
 inline size_t dtype_size(DType t) noexcept { return t == DType::F32 ? 4 : 2; }
 
-inline float f16_to_float(uint16_t h) noexcept {
-    const uint32_t sign = (static_cast<uint32_t>(h & 0x8000u)) << 16;
-    const uint32_t exp = (h >> 10) & 0x1fu;
-    const uint32_t mant = h & 0x03ffu;
-    uint32_t out = 0;
-    if (exp == 0) {
-        if (mant == 0) {
-            out = sign;
-        } else {
-            uint32_t m = mant;
-            uint32_t e = 113u;
-            while ((m & 0x0400u) == 0) {
-                m <<= 1;
-                --e;
-            }
-            out = sign | (e << 23) | ((m & 0x03ffu) << 13);
-        }
-    } else if (exp == 31) {
-        out = sign | 0x7f800000u | (mant << 13);
-    } else {
-        out = sign | ((exp + 112u) << 23) | (mant << 13);
-    }
-    float f;
-    std::memcpy(&f, &out, sizeof(f));
-    return f;
-}
-
-inline float bf16_to_float(uint16_t h) noexcept {
-    const uint32_t bits = static_cast<uint32_t>(h) << 16;
-    float f;
-    std::memcpy(&f, &bits, sizeof(f));
-    return f;
-}
+inline float f16_to_float(uint16_t h) noexcept { return f16_bits_to_float(h); }
+inline float bf16_to_float(uint16_t h) noexcept { return bf16_bits_to_float(h); }
 
 // Converts n elements of a typed buffer to float (exact for every type).
 inline void convert_to_float(const void* src, DType type, size_t n, float* dst) noexcept {
