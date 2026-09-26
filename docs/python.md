@@ -54,7 +54,7 @@ result = beamgrad.beam_search(step, options, max_steps=T, batch_size=B)
 ```python
 beamgrad.BeamOptions(
     beam_size: int,                    # K; must equal the beam dimension of log_probs
-    eos_token: int = -1,               # -1 disables EOS handling
+    eos_token: int | Sequence[int] = -1,  # EOS token id(s); -1 disables EOS handling
     min_length: int = 0,               # EOS is masked until a hypothesis has this many tokens
     length_penalty_alpha: float = 0.0, # GNMT length penalty exponent
     validate_inputs: bool = True,      # reject NaN / +inf in the rows the search reads
@@ -68,6 +68,14 @@ A frozen dataclass; invalid values raise `ValueError` on construction. NumPy
 integer and float scalars are accepted, as are arrays or tensors of
 `banned_tokens`; every field is stored as a plain Python `int`, `float` or
 tuple of `int`s.
+
+`eos_token` can list several tokens, as Hugging Face's `eos_token_id` does:
+Qwen ends with `<|im_end|>` or `<|endoftext|>`, and Llama 3 has three. So
+`BeamOptions(beam_size=4, eos_token=model.generation_config.eos_token_id)`
+works as it is. Any of them finishes a hypothesis, `min_length` masks all of
+them, and a finished beam is carried forward with the token it emitted.
+`options.eos_tokens` lists them (`()` when EOS handling is off). CUDA supports
+up to 16 besides the first.
 
 `validate_inputs` raises `ValueError` if a row the search reads (the row of a
 live, unfinished beam, including banned or masked tokens) contains NaN or
@@ -292,19 +300,34 @@ support `no_repeat_ngram_size` or `repetition_penalty`. The formulas are in
 Adapters for Hugging Face `transformers` causal LMs (the module does not
 import `transformers`):
 
-- `CausalLMStep(model, input_ids, attention_mask, beam_size)`: a step
-  function. It runs the left-padded prompts once, then one token per beam per
-  step, reordering the key/value cache by `beams.parents`. Its inputs match
-  `generate()`'s, so a float32 model returns the same beams as
-  `generate(num_beams=K)`. Each search restarts from the prompts, so one
-  instance can drive several searches.
+- `CausalLMStep(model, input_ids, attention_mask, beam_size, *,
+  share_prompt=True)`: a step function. It runs the left-padded prompts, then
+  one token per beam per step, reordering the key/value cache by
+  `beams.parents`. By default each prompt runs once and its cache is copied
+  to the example's beam slots. `generate(num_beams=K)` runs every prompt `K`
+  times, so on long prompts this is much cheaper: with 2,048-token prompts
+  (Qwen2.5-0.5B, batch 8, 4 beams, 8 new tokens) a search takes 916 ms and
+  3.4 GiB instead of `generate()`'s 2,759 ms and 7.8 GiB. It returns the same
+  beams as `generate()`, with float32 scores within about 1e-4 (the prompt
+  runs at another batch size, which rounds differently). `share_prompt=False`
+  runs the prompts once per beam as `generate()` does, and then the scores are
+  bit-identical too. Each search restarts from the prompts, so one instance
+  can drive several searches.
 - `CausalLMRescorer(model, input_ids, attention_mask, chunk_size=256,
   gradient_checkpointing=False)`: a `rescore_fn`. It runs one teacher-forced
   pass over prompt + beam and projects to the vocabulary in checkpointed
   chunks. With `gradient_checkpointing=True` it enables the model's
   checkpointing and training mode for its own pass only. Run the search in
   eval mode, because `transformers` disables the cache for checkpointing
-  models in training mode.
+  models in training mode. Full fine-tuning of a 0.5B model through the
+  search fits in 16 GB only with it: see
+  [training.md](training.md#memory-three-ways-to-take-the-gradient).
+
+Pass `eos_token=model.generation_config.eos_token_id` to `BeamOptions`: it is
+a list for models with several EOS tokens (Qwen, Llama 3). When comparing with
+`generate()`, note that instruct models' generation configs also set sampling
+options and a repetition penalty, which `generate()` applies even to beam
+search; pass `repetition_penalty=1.0` to it for the plain search.
 
 ## `cuda_available() -> bool`
 

@@ -83,6 +83,19 @@ if importlib.util.find_spec(f"{__package__}._C_cuda") is not None:  # built with
 StepsLike = torch.Tensor | Sequence[int] | None
 
 
+def _no_cuda_operators_message() -> str:
+    try:
+        from ._build_info import CUDA_SKIPPED as reason
+    except ImportError:  # source checkouts without a build, and builds before 2.2.1
+        reason = None
+    why = f" The build left them out: {reason}" if reason else ""
+    return (
+        f"beamgrad was installed without its CUDA operators, so CUDA tensors are not supported.{why} "
+        "Install a prebuilt wheel for your PyTorch and CUDA version (see docs/installation.md), or rebuild with a "
+        "CUDA toolkit of PyTorch's CUDA major version: `BEAMGRAD_CUDA=1 pip install --no-build-isolation beamgrad`."
+    )
+
+
 class BeamSearchOutput(NamedTuple):
     """Result of :func:`decode`. Leading ``[B]`` is absent for unbatched input.
 
@@ -142,7 +155,8 @@ def _decode_fake(
 @torch.library.register_fake("beamgrad::decode_ex")
 def _decode_ex_fake(inputs, from_logits, steps, *options):
     B, T, K, _ = inputs.shape
-    return (*_decode_fake(inputs, steps, *options), inputs.new_empty((B, T, K), dtype=torch.float32))
+    # options: decode's (eos_token ... validate), then extra_eos
+    return (*_decode_fake(inputs, steps, *options[:7]), inputs.new_empty((B, T, K), dtype=torch.float32))
 
 
 @torch.library.register_fake("beamgrad::decode_backward")
@@ -179,6 +193,7 @@ def _decode_step_fake(
     no_repeat_ngram_size,
     repetition_penalty,
     validate,
+    extra_eos=(),
 ):
     B, K, _ = log_probs.shape
     return (
@@ -280,7 +295,7 @@ def _decode_ex_setup_context(ctx, inputs, output):
 
 
 def _decode_ex_backward(ctx, *grads):
-    return (_decode_grad(ctx, *grads),) + (None,) * 9
+    return (_decode_grad(ctx, *grads),) + (None,) * 10  # inputs, then the 10 other arguments
 
 
 torch.library.register_autograd("beamgrad::decode_ex", _decode_ex_backward, setup_context=_decode_ex_setup_context)
@@ -387,16 +402,11 @@ def _prepare(
         raise ValueError(f"log_probs dimensions must be non-empty, got {tuple(log_probs.shape)}")
     if K != options.beam_size:
         raise ValueError(f"log_probs has {K} beams but options.beam_size is {options.beam_size}")
-    if options.eos_token >= V:
-        raise ValueError(f"eos_token {options.eos_token} is outside the vocabulary (size {V})")
+    options.eos_ids(V)  # checks the EOS tokens against the vocabulary
     device = x.device.type
     if device == "cuda":
         if _C_cuda is None:
-            raise RuntimeError(
-                "beamgrad was installed without its CUDA operators, so CUDA tensors are not supported. "
-                "Reinstall on a machine with the CUDA toolkit (nvcc) available, e.g. "
-                "`BEAMGRAD_CUDA=1 pip install --no-build-isolation beamgrad`."
-            )
+            raise RuntimeError(_no_cuda_operators_message())
         if K > CUDA_MAX_BEAM:
             raise ValueError(f"beam_size {K} exceeds the CUDA backend maximum of {CUDA_MAX_BEAM}")
     elif device != "cpu":
@@ -428,17 +438,19 @@ def _prepare(
 def _decode_op(
     x: torch.Tensor, from_logits: bool, steps_t: torch.Tensor | None, banned: torch.Tensor | None, options: BeamOptions
 ):
+    eos, extra_eos = options.native_eos()
     return torch.ops.beamgrad.decode_ex(
         x,
         bool(from_logits),
         steps_t,
-        options.eos_token,
+        eos,
         options.min_length,
         float(options.length_penalty_alpha),
         banned,
         options.no_repeat_ngram_size,
         float(options.repetition_penalty),
         options.validate_inputs,
+        extra_eos,
     )
 
 

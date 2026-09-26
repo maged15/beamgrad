@@ -89,6 +89,12 @@ Which to use:
 - Use **re-scoring** for large models. Write a `rescore_fn(sequences,
   lengths) -> [B, K, T]` that returns each beam's teacher-forced token
   log-probabilities, or use `CausalLMRescorer` for Hugging Face causal LMs.
+  Full fine-tuning of Qwen2.5-0.5B-Instruct (float32 weights, AdamW, batch 8,
+  4 beams) on a 16 GB GPU fits only with
+  `CausalLMRescorer(gradient_checkpointing=True)`. It then peaks at 9.2 GiB,
+  no more than plain supervised fine-tuning of the same model; without
+  checkpointing it runs out of memory
+  ([experiments/qwen-multi30k](../experiments/qwen-multi30k)).
 - With **dropout** on, the two modes differ. The re-scoring pass draws new
   dropout masks, so its gradient belongs to a different random function than
   the one the search saw. Both are valid stochastic gradients, but they are
@@ -213,3 +219,21 @@ the beams that beat the reference were good paraphrases, and the loss pushed
 them down. This is one small model on one dataset.
 [`experiments/multi30k`](../experiments/multi30k) has the full protocol,
 the ablations, cost and memory, and the code to reproduce it.
+
+## Experiment: Qwen2.5-0.5B on Multi30k
+
+The same question at LLM scale: Qwen2.5-0.5B-Instruct, all parameters
+trained, first with supervised fine-tuning, then 500 steps of either
+continued supervised fine-tuning or minimum-risk training through
+`beam_search` with `CausalLMRescorer`. MRT beat continued SFT on 7 of 8
+seeds, by +0.72 ± 0.70 test BLEU (paired t-test p = 0.023).
+
+The same experiment compared beamgrad with the do-it-yourself route:
+`generate(num_beams=4)`, a teacher-forced pass over the beams, and the same
+loss by hand. On the same beams the two give the same gradient (float32
+cosine 1.00000000). Their BLEU did not differ reliably over 11 seeds
+(+0.34, p = 0.07). beamgrad peaked at 9.2 GiB and the do-it-yourself route
+at 11.4–12.4 GiB, at about the same speed per step. So the gain from
+beamgrad here is memory and a single call, not a better model.
+[`experiments/qwen-multi30k`](../experiments/qwen-multi30k) has the
+protocol, the per-seed results and the scripts.

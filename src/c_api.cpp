@@ -365,6 +365,19 @@ extern "C" DBS_EXPORT int dbs_create_ex(DBSOptionsC options, DBSDecoderHandle** 
     });
 }
 
+extern "C" DBS_EXPORT int dbs_set_extra_eos_tokens(DBSDecoderHandle* handle, const int32_t* tokens, int count) {
+    return guarded(handle, [&] {
+        decoder_of(handle);
+        require(count >= 0 && (count == 0 || tokens != nullptr), "tokens cannot be null when count > 0");
+        dbs::BeamOptions options = handle->options;
+        options.extra_eos_tokens.assign(tokens, tokens + count);
+        // Validated by the decoder (token ids, and eos_token >= 0 when there are any).
+        auto decoder = std::make_unique<dbs::BeamSearchDecoder>(options);
+        handle->options = std::move(options);
+        handle->decoder = std::move(decoder);
+    });
+}
+
 extern "C" DBS_EXPORT DBSDecoderHandle* dbs_create(DBSOptionsC options) {
     DBSDecoderHandle* h = nullptr;
     return dbs_create_ex(options, &h) == DBS_OK ? h : nullptr;

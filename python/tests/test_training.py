@@ -10,7 +10,7 @@ import torch
 import beamgrad
 from beamgrad import BeamOptions, decode, final_scores, losses, search, sequence_scores
 from beamgrad import estimators as est
-from beamgrad._ctypes import check, load_library, options_to_c
+from beamgrad._ctypes import check, load_library, options_to_c, set_extra_eos
 
 
 def random_log_probs(*shape, seed=0):
@@ -173,6 +173,7 @@ def c_library_surrogates(x, options, pool_multiplier, selected_temperature, soft
     c.soft_topk_temperature = soft_topk_temperature
     handle = ctypes.c_void_p()
     check(lib, None, lib.dbs_create_ex(c, ctypes.byref(handle)))
+    set_extra_eos(lib, handle, options)
     T, K, V = x.shape
     P = K * pool_multiplier
     result = ctypes.c_void_p()
@@ -205,7 +206,12 @@ def c_library_surrogates(x, options, pool_multiplier, selected_temperature, soft
 
 
 @pytest.mark.parametrize(
-    "options", [BeamOptions(beam_size=3), BeamOptions(beam_size=4, eos_token=2, min_length=2, length_penalty_alpha=0.6)]
+    "options",
+    [
+        BeamOptions(beam_size=3),
+        BeamOptions(beam_size=4, eos_token=2, min_length=2, length_penalty_alpha=0.6),
+        BeamOptions(beam_size=4, eos_token=(2, 5, 7), min_length=2, length_penalty_alpha=0.6),
+    ],
 )
 def test_estimators_match_the_c_library(options):
     torch.manual_seed(7)

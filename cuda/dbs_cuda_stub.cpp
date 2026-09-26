@@ -78,3 +78,15 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_backward_ex(
     const DBSCudaDecodeArgs*, const DBSCudaBackwardInputs*, float*, void*, int64_t, void*) {
     return DBS_CUDA_STATUS_UNAVAILABLE;
 }
+
+extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_ex2(
+    const void*, int, int, const DBSCudaDecodeArgs*, const DBSCudaSearchOptions*, const DBSCudaDecodeOutputs*, float*,
+    void*, int64_t, void*) {
+    return DBS_CUDA_STATUS_UNAVAILABLE;
+}
+
+extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_step_ex2(
+    const void*, int, int, const DBSCudaDecodeArgs*, const DBSCudaSearchOptions*, const DBSCudaBeamState*,
+    const DBSCudaDecodeOutputs*, float*, void*, int64_t, void*) {
+    return DBS_CUDA_STATUS_UNAVAILABLE;
+}

@@ -1,0 +1,8 @@
+gradcheck.py (float32, runs/sft.pt, 3 batches of 4 training prompts), re-run on 2026-09-26 with beamgrad 2.2.0
+batch 0: loss beamgrad 0.604007  DIY 0.604007  grad cosine 1.00000000  rel diff 1.91e-05
+batch 1: loss beamgrad 0.836453  DIY 0.836453  grad cosine 1.00000000  rel diff 7.28e-06
+batch 2: loss beamgrad 0.492162  DIY 0.492162  grad cosine 1.00000000  rel diff 8.75e-06
+
+One MRT step as train_mt.py runs it (batch 8, 4 beams), with and without CausalLMRescorer(gradient_checkpointing=True):
+gradient_checkpointing=True: ok, peak 9.2 GiB
+gradient_checkpointing=False: CUDA out of memory (peak before failing 13.6 GiB, card 15.6 GiB)

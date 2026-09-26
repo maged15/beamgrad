@@ -1,0 +1,13 @@
+per seed (paired bootstrap over test sentences, 2000 resamples)
+  seed 0: SFT 40.43  MRT 41.09  delta +0.66  95% CI [-0.24, +1.51]  P(MRT <= SFT) 0.081   (SFT start 38.56)
+  seed 1: SFT 40.00  MRT 39.68  delta -0.32  95% CI [-1.19, +0.66]  P(MRT <= SFT) 0.707   (SFT start 38.56)
+  seed 2: SFT 40.18  MRT 40.47  delta +0.29  95% CI [-0.51, +1.29]  P(MRT <= SFT) 0.225   (SFT start 38.56)
+  seed 3: SFT 39.66  MRT 41.34  delta +1.68  95% CI [+0.83, +2.57]  P(MRT <= SFT) 0.000   (SFT start 38.94)
+  seed 4: SFT 40.96  MRT 41.43  delta +0.47  95% CI [-0.47, +1.33]  P(MRT <= SFT) 0.162   (SFT start 38.94)
+  seed 5: SFT 39.53  MRT 41.10  delta +1.58  95% CI [+0.57, +2.61]  P(MRT <= SFT) 0.000   (SFT start 38.94)
+  seed 6: SFT 38.54  MRT 39.74  delta +1.21  95% CI [+0.18, +2.25]  P(MRT <= SFT) 0.009   (SFT start 38.94)
+  seed 7: SFT 39.35  MRT 39.58  delta +0.23  95% CI [-0.84, +1.26]  P(MRT <= SFT) 0.333   (SFT start 38.94)
+
+across 8 seeds: mean delta +0.72 +/- 0.70 (sd)  MRT wins 7/8
+  paired t-test t = 2.91, p = 0.023;  exact sign-flip permutation p = 0.031
+  pooled over seeds, bootstrap over sentences: delta +0.72  95% CI [+0.36, +1.09]  P(MRT <= SFT) 0.000

@@ -139,7 +139,13 @@ void test_row_scan_parity() {
         s.parent = uniform_int(0, 7);
         s.vocab_size = V;
         s.forced_token = uniform_int(0, 5) == 0 ? uniform_int(0, V - 1) : -1;
-        s.masked_token = uniform_int(0, 2) == 0 ? uniform_int(0, V - 1) : -1;
+        // Up to three masked tokens (EOS tokens below min_length), distinct and increasing.
+        std::vector<int32_t> masked;
+        for (int i = uniform_int(0, 2) == 0 ? uniform_int(1, 3) : 0; i > 0; --i) masked.push_back(uniform_int(0, V - 1));
+        std::sort(masked.begin(), masked.end());
+        masked.erase(std::unique(masked.begin(), masked.end()), masked.end());
+        s.masked_tokens = masked.data();
+        s.masked_count = static_cast<int>(masked.size());
 
         // A top-k buffer that may already hold candidates of other parents.
         const int top_count = uniform_int(1, 12);
@@ -155,6 +161,14 @@ void test_row_scan_parity() {
         bool any_invalid = false;
         for (float x : row) any_invalid |= !(x < kInf);
         CHECK(expected_invalid == any_invalid);
+        // Brute force: every token that is not masked (or forced out), one at a time.
+        std::vector<Candidate> brute = initial;
+        for (int v = 0; v < V; ++v) {
+            if (std::find(masked.begin(), masked.end(), v) != masked.end()) continue;
+            if (s.forced_token >= 0 && v != s.forced_token) continue;
+            scan_token(s, v, brute.data(), top_count);
+        }
+        CHECK(same_candidates(brute, expected));
 
         for (KernelPath path : paths) {
             KernelScope scope(path);
@@ -202,6 +216,11 @@ bool would_repeat_ngram(const std::vector<int32_t>& prefix, int token, int n) {
 DecodeResult reference_decode(const BeamOptions& opt, const float* x, int T, int V, const DecodeConstraints* c) {
     const int K = opt.beam_size;
     const int eos = opt.eos_token;
+    // Any of the EOS tokens ends a hypothesis (only with eos >= 0).
+    const auto is_eos = [&](int v) {
+        return eos >= 0 && (v == eos || std::find(opt.extra_eos_tokens.begin(), opt.extra_eos_tokens.end(), v) !=
+                                            opt.extra_eos_tokens.end());
+    };
     const int min_length = c && c->min_length >= 0 ? c->min_length : opt.min_length;
     DecodeResult r;
     r.steps = T;
@@ -227,8 +246,10 @@ DecodeResult reference_decode(const BeamOptions& opt, const float* x, int T, int
             const float parent_raw = raw[static_cast<size_t>(b)];
             if (!std::isfinite(parent_raw)) continue;
             if (eos >= 0 && ended[static_cast<size_t>(b)]) {
+                // Carried forward with the EOS it ended with: the last token of its prefix.
                 const int l = std::max(1, static_cast<int>(len[static_cast<size_t>(b)]));
-                insert_topk(top.data(), K, Candidate{parent_raw / gnmt_length_penalty(l, opt.length_penalty_alpha), parent_raw, b, eos, l, 0});
+                const int last = prefix[static_cast<size_t>(b)].back();
+                insert_topk(top.data(), K, Candidate{parent_raw / gnmt_length_penalty(l, opt.length_penalty_alpha), parent_raw, b, last, l, 0});
                 continue;
             }
             const int new_len = len[static_cast<size_t>(b)] + 1;
@@ -239,7 +260,7 @@ DecodeResult reference_decode(const BeamOptions& opt, const float* x, int T, int
             for (int v = 0; v < V; ++v) {
                 if (forced >= 0 && v != forced) continue;
                 if (c && c->banned_tokens && c->banned_tokens[v]) continue;
-                if (eos >= 0 && v == eos && new_len < min_length) continue;
+                if (is_eos(v) && new_len < min_length) continue;
                 if (c && would_repeat_ngram(p, v, c->no_repeat_ngram_size)) continue;
                 if (c && c->token_filter &&
                     c->token_filter(c->token_filter_user_data, c->batch_index, t, b, p.empty() ? nullptr : p.data(),
@@ -269,7 +290,7 @@ DecodeResult reference_decode(const BeamOptions& opt, const float* x, int T, int
             next_raw[static_cast<size_t>(k)] = cand.raw_score;
             next_len[static_cast<size_t>(k)] = cand.length;
             if (cand.parent >= 0) {
-                next_ended[static_cast<size_t>(k)] = ended[static_cast<size_t>(cand.parent)] || (eos >= 0 && cand.token == eos);
+                next_ended[static_cast<size_t>(k)] = ended[static_cast<size_t>(cand.parent)] || (cand.from_logprob && is_eos(cand.token));
                 next_prefix[static_cast<size_t>(k)] = prefix[static_cast<size_t>(cand.parent)];
                 if (cand.from_logprob) next_prefix[static_cast<size_t>(k)].push_back(cand.token);
             }
@@ -305,6 +326,10 @@ void test_constrained_decode_matches_reference() {
         const int V = uniform_int(2, 40);
         const int T = uniform_int(1, 8);
         opt.eos_token = uniform_int(0, 2) == 0 ? -1 : uniform_int(0, V - 1);
+        // Sometimes more EOS tokens, possibly repeating eos_token or each other.
+        if (opt.eos_token >= 0 && uniform_int(0, 1)) {
+            for (int i = uniform_int(1, 3); i > 0; --i) opt.extra_eos_tokens.push_back(uniform_int(0, V - 1));
+        }
         opt.min_length = uniform_int(0, 3);
         opt.length_penalty_alpha = uniform_int(0, 1) ? 0.0f : uniform_float(0.1f, 1.5f);
         opt.validate_inputs = 0;
@@ -447,6 +472,76 @@ bool decode_throws(const BeamOptions& opt, const std::vector<float>& x, int T, i
         return true;
     }
     return false;
+}
+
+template <class F>
+bool throws_invalid_argument(F&& f) {
+    try {
+        f();
+    } catch (const std::invalid_argument&) {
+        return true;
+    }
+    return false;
+}
+
+// Two EOS tokens (as Qwen's <|im_end|> and <|endoftext|>): either one finishes
+// a hypothesis, which is then carried forward with the token it ended with, and
+// min_length masks both.
+void test_multiple_eos_tokens() {
+    constexpr int K = 2, V = 5, T = 3;
+    BeamOptions opt;
+    opt.beam_size = K;
+    opt.eos_token = 3;
+    opt.extra_eos_tokens = {4};
+    std::vector<float> x(static_cast<size_t>(T) * K * V, -9.0f);
+    const auto at = [&](int t, int k, int v) -> float& { return x[(static_cast<size_t>(t) * K + k) * V + v]; };
+    at(0, 0, 4) = -0.1f;  // the second EOS token is the best first token
+    at(0, 0, 1) = -0.5f;
+    for (int t = 1; t < T; ++t) {
+        for (int k = 0; k < K; ++k) at(t, k, 2) = -0.2f;
+    }
+    const DecodeResult r = BeamSearchDecoder(opt).decode(x.data(), T, V);
+    // Step 0: beam 0 emits token 4 and finishes; beam 1 continues with token 1.
+    CHECK(r.tokens[0] == 4 && r.from_logprob[0] == 1);
+    for (int t = 1; t < T; ++t) {
+        // The finished beam is carried forward (from_logprob 0) with its own EOS, 4.
+        bool carried = false;
+        for (int k = 0; k < K; ++k) {
+            const size_t i = static_cast<size_t>(t) * K + k;
+            if (!r.from_logprob[i] && r.parents[i] >= 0) {
+                carried = true;
+                CHECK(r.tokens[i] == 4);
+                CHECK(r.lengths[i] == 1);
+            }
+        }
+        CHECK(carried);
+    }
+
+    // min_length masks both EOS tokens.
+    opt.min_length = 2;
+    const DecodeResult m = BeamSearchDecoder(opt).decode(x.data(), T, V);
+    CHECK(m.tokens[0] != 3 && m.tokens[0] != 4 && m.tokens[1] != 3 && m.tokens[1] != 4);
+
+    // One EOS token given twice behaves as one.
+    BeamOptions single = opt;
+    single.extra_eos_tokens = {3};
+    BeamOptions none = opt;
+    none.extra_eos_tokens.clear();
+    const DecodeResult a = BeamSearchDecoder(single).decode(x.data(), T, V);
+    const DecodeResult b = BeamSearchDecoder(none).decode(x.data(), T, V);
+    CHECK(same_values(a.tokens, b.tokens) && same_floats(a.final_scores, b.final_scores));
+
+    // Validation.
+    BeamOptions bad = opt;
+    bad.eos_token = -1;
+    CHECK(throws_invalid_argument([&] { BeamSearchDecoder{bad}; }));
+    bad = opt;
+    bad.extra_eos_tokens = {-2};
+    CHECK(throws_invalid_argument([&] { BeamSearchDecoder{bad}; }));
+    bad = opt;
+    bad.extra_eos_tokens = {V};
+    CHECK(throws_invalid_argument([&] { BeamSearchDecoder(bad).decode(x.data(), T, V); }));
+    std::cout << "  multiple EOS tokens: ok\n";
 }
 
 void test_validation_covers_the_rows_read() {
@@ -1037,6 +1132,9 @@ void test_step_matches_decode() {
         const int V = uniform_int(2, 40);
         const int T = uniform_int(1, 8);
         opt.eos_token = uniform_int(0, 2) == 0 ? -1 : uniform_int(0, V - 1);
+        if (opt.eos_token >= 0 && uniform_int(0, 1)) {
+            for (int i = uniform_int(1, 3); i > 0; --i) opt.extra_eos_tokens.push_back(uniform_int(0, V - 1));
+        }
         opt.min_length = uniform_int(0, 3);
         opt.length_penalty_alpha = uniform_int(0, 1) ? 0.0f : uniform_float(0.1f, 1.5f);
         opt.validate_inputs = 0;
@@ -1200,6 +1298,7 @@ int main() {
     CHECK(DBS_CAN_COMPILE_AVX2 && DBS_CAN_COMPILE_SSE42);
 #endif
     test_half_conversions_are_exact();
+    test_multiple_eos_tokens();
     test_row_scan_parity();
     test_constrained_decode_matches_reference();
     test_decode_backward_parity();

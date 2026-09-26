@@ -1195,12 +1195,86 @@ static void test_backward_batch_into_ex() {
     dbs_destroy(h);
 }
 
+// dbs_set_extra_eos_tokens: a second EOS token finishes hypotheses in every
+// decode on the handle, is carried forward as itself, and needs eos_token >= 0.
+static void test_extra_eos_tokens() {
+    constexpr int B = 2, T = 3, K = 2, V = 5;
+    DBSOptionsC opt{};
+    opt.beam_size = K;
+    opt.eos_token = 3;
+    DBSDecoderHandle* h = nullptr;
+    CHECK(dbs_create_ex(opt, &h) == DBS_OK);
+    std::vector<float> x(static_cast<size_t>(B) * T * K * V, -9.0f);
+    for (int b = 0; b < B; ++b) {
+        x[(static_cast<size_t>(b) * T * K) * V + 4] = -0.1f;  // step 0, beam 0: token 4 is best
+        x[(static_cast<size_t>(b) * T * K) * V + 1] = -0.5f;
+        for (int t = 1; t < T; ++t) {
+            for (int k = 0; k < K; ++k) x[((static_cast<size_t>(b) * T + t) * K + k) * V + 2] = -0.2f;
+        }
+    }
+    const auto decode = [&](std::vector<int32_t>& tokens, std::vector<uint8_t>& flp, std::vector<int32_t>& lengths) {
+        std::vector<float> final_scores(B * K);
+        tokens.assign(B * T * K, 0);
+        flp.assign(B * T * K, 0);
+        lengths.assign(B * T * K, 0);
+        DBSDecodeOutputsC out{};
+        out.final_scores = final_scores.data();
+        out.tokens = tokens.data();
+        out.from_logprob = flp.data();
+        out.lengths = lengths.data();
+        CHECK(dbs_decode_batch_into(h, x.data(), B, T, V, nullptr, nullptr, 1, &out) == DBS_OK);
+    };
+    std::vector<int32_t> tokens, lengths;
+    std::vector<uint8_t> flp;
+    decode(tokens, flp, lengths);
+    CHECK(tokens[0] == 4 && lengths[K + 0] == 2);  // token 4 is not an EOS yet: the beam goes on
+
+    const int32_t extra[] = {4};
+    CHECK(dbs_set_extra_eos_tokens(h, extra, 1) == DBS_OK);
+    decode(tokens, flp, lengths);
+    for (int b = 0; b < B; ++b) {
+        const size_t s0 = static_cast<size_t>(b) * T * K;
+        CHECK(tokens[s0] == 4 && flp[s0] == 1);
+        for (int t = 1; t < T; ++t) {
+            bool carried = false;
+            for (int k = 0; k < K; ++k) {
+                const size_t i = s0 + static_cast<size_t>(t) * K + k;
+                if (!flp[i] && lengths[i] == 1) {
+                    carried = true;
+                    CHECK(tokens[i] == 4);  // carried forward with the EOS it ended with
+                }
+            }
+            CHECK(carried);
+        }
+    }
+    CHECK(dbs_set_extra_eos_tokens(h, nullptr, 0) == DBS_OK);  // removed again
+    decode(tokens, flp, lengths);
+    CHECK(lengths[K + 0] == 2);
+
+    CHECK(dbs_set_extra_eos_tokens(h, nullptr, 1) == DBS_ERROR_INVALID_ARGUMENT);
+    const int32_t negative[] = {-4};
+    CHECK(dbs_set_extra_eos_tokens(h, negative, 1) == DBS_ERROR_INVALID_ARGUMENT);
+    const int32_t outside[] = {V};
+    CHECK(dbs_set_extra_eos_tokens(h, outside, 1) == DBS_OK);  // the vocabulary is only known to the decode
+    std::vector<float> final_scores(B * K);
+    DBSDecodeOutputsC out{};
+    out.final_scores = final_scores.data();
+    CHECK(dbs_decode_batch_into(h, x.data(), B, T, V, nullptr, nullptr, 1, &out) == DBS_ERROR_INVALID_ARGUMENT);
+    dbs_destroy(h);
+
+    opt.eos_token = -1;  // extra EOS tokens need EOS handling
+    CHECK(dbs_create_ex(opt, &h) == DBS_OK);
+    CHECK(dbs_set_extra_eos_tokens(h, extra, 1) == DBS_ERROR_INVALID_ARGUMENT);
+    dbs_destroy(h);
+}
+
 int main() {
     CHECK(dbs_abi_version() == DBS_ABI_VERSION);
     char expected_version[32];
     std::snprintf(expected_version, sizeof(expected_version), "%d.%d.%d", DBS_VERSION_MAJOR, DBS_VERSION_MINOR, DBS_VERSION_PATCH);
     CHECK(std::strcmp(dbs_version_string(), expected_version) == 0);
     test_deterministic_ties();
+    test_extra_eos_tokens();
     test_constraints();
     test_invalid_nan_rejected();
     test_sparse_gradient_matches_finite_difference();

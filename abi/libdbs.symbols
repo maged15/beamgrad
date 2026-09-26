@@ -73,6 +73,7 @@ dbs_result_vocab_size
 dbs_result_weights
 dbs_selected_kernel_name
 dbs_set_deterministic_seed
+dbs_set_extra_eos_tokens
 dbs_version_string
 dbs_workspace_allocated_bytes
 dbs_workspace_create

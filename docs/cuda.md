@@ -5,6 +5,13 @@ entirely on the GPU, and the same backward pass. The PyTorch
 operators in `python/csrc/cuda_ops.cpp` call it on PyTorch's current stream
 with scratch memory from PyTorch's caching allocator.
 
+`dbs_cuda_decode_ex2` and `dbs_cuda_decode_step_ex2` add search options
+(`DBSCudaSearchOptions`): extra EOS tokens. With them, the engine's copy of
+the arguments points `banned_tokens` at a per-call array of token flags
+(banned, EOS), which keeps the scans' parameters within 128 bytes (see
+below), and a `[B, K]` state holds each beam's last token, which a finished
+beam carries forward.
+
 `dbs_cuda_decode` reads float32 log-probs. `dbs_cuda_decode_ex` also reads
 fp16 and bf16 rows, converted exactly as they are scanned, and logits
 (`from_logits`), which it normalises on the fly as the CPU's

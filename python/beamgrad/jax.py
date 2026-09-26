@@ -26,6 +26,7 @@ from ._ctypes import (
     constraints_to_c,
     load_library,
     options_to_c,
+    set_extra_eos,
 )
 from ._options import BeamOptions
 
@@ -51,6 +52,7 @@ class _Decoder:
         self.lib = load_library(lib_path)
         self.handle = ctypes.c_void_p()
         check(self.lib, None, self.lib.dbs_create_ex(options_to_c(options), ctypes.byref(self.handle)))
+        set_extra_eos(self.lib, self.handle, options)
 
     def __del__(self):
         if getattr(self, "handle", None) is not None and self.handle.value:
@@ -201,8 +203,7 @@ def final_scores(
     B, T, K, V = x.shape
     if K != options.beam_size:
         raise ValueError(f"log_probs has {K} beams but options.beam_size is {options.beam_size}")
-    if options.eos_token >= V:
-        raise ValueError(f"eos_token {options.eos_token} is outside the vocabulary (size {V})")
+    options.eos_ids(V)  # checks the EOS tokens against the vocabulary
     options.banned_ids(V)  # checks the banned ids against the vocabulary
     x = x.astype(jnp.float32)  # differentiable: gradients return in the input dtype
 

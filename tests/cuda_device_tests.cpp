@@ -381,7 +381,7 @@ uint16_t to_f16_bits(float x) {
 }
 
 // dbs_cuda_decode_ex / dbs_cuda_backward_ex against the CPU's batch _ex API.
-int run_ex_case(const Case& c, int dtype, int from_logits, unsigned seed) {
+int run_ex_case(const Case& c, int dtype, int from_logits, unsigned seed, const std::vector<int32_t>& extra_eos = {}) {
     std::mt19937 rng(seed);
     const size_t n = static_cast<size_t>(c.B) * c.T * c.K * c.V;
     const size_t tk = static_cast<size_t>(c.B) * c.T * c.K;
@@ -421,6 +421,7 @@ int run_ex_case(const Case& c, int dtype, int from_logits, unsigned seed) {
     opt.validate_inputs = 1;
     DBSDecoderHandle* handle = nullptr;
     CHECK(dbs_create_ex(opt, &handle) == DBS_OK);
+    CHECK(dbs_set_extra_eos_tokens(handle, extra_eos.data(), static_cast<int>(extra_eos.size())) == DBS_OK);
     DBSAdvancedConstraintsC constraints{};
     constraints.min_length = -1;
     constraints.no_repeat_ngram_size = c.ngram;
@@ -457,8 +458,11 @@ int run_ex_case(const Case& c, int dtype, int from_logits, unsigned seed) {
     const DBSCudaDecodeOutputs gpu_out{d_final.get(),  d_final_raw.get(), d_final_len.get(), d_tokens.get(),
                                        d_parents.get(), d_lengths.get(),  d_scores.get(),    d_raw.get(),
                                        d_from_logprob.get(), d_invalid.get()};
-    CHECK(dbs_cuda_decode_ex(d_data.get(), dtype, from_logits, &args, &gpu_out, d_lse.get(), nullptr, 0, nullptr) ==
-          DBS_CUDA_STATUS_OK);
+    DBSCudaSearchOptions search{};
+    search.extra_eos_count = static_cast<int>(extra_eos.size());
+    for (size_t i = 0; i < extra_eos.size(); ++i) search.extra_eos_tokens[i] = extra_eos[i];
+    CHECK(dbs_cuda_decode_ex2(d_data.get(), dtype, from_logits, &args, &search, &gpu_out, d_lse.get(), nullptr, 0,
+                              nullptr) == DBS_CUDA_STATUS_OK);
     CUDA_CHECK(cudaDeviceSynchronize());
 
     int mismatches = 0;
@@ -560,7 +564,13 @@ int test_ex_parity() {
         c.user_workspace = rng() % 2 == 0;
         const int dtype = static_cast<int>(seed % 3);
         const int from_logits = static_cast<int>((seed / 3) % 2);
-        if (run_ex_case(c, dtype, from_logits, seed) != 0) {
+        // A third of the cases with more EOS tokens (and ties, so that they are chosen).
+        std::vector<int32_t> extra_eos;
+        if (c.eos >= 0 && seed % 3 == 1) {
+            c.ties = true;
+            for (int e = 1 + static_cast<int>(rng() % 3); e > 0; --e) extra_eos.push_back(static_cast<int32_t>(rng() % c.V));
+        }
+        if (run_ex_case(c, dtype, from_logits, seed, extra_eos) != 0) {
             std::fprintf(stderr, "_ex case %u failed: B=%d T=%d K=%d V=%d eos=%d dtype=%d from_logits=%d\n", seed, c.B,
                          c.T, c.K, c.V, c.eos, dtype, from_logits);
             ++failures;

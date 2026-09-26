@@ -46,9 +46,14 @@ the reference (`losses.structured_margin`, runnable in
 [`examples/train_lm.py`](examples/train_lm.py)) and the relaxed top-k
 estimator. There, minimum-risk training beat continued MLE on 7 of 8 seeds
 (+0.39 BLEU, paired t-test p = 0.009) and the margin against the reference
-did not help. [docs/training.md](docs/training.md) explains which loss and
-which gradient mode (through the steps, or re-scoring for large models) to
-use.
+did not help. At LLM scale,
+[`experiments/qwen-multi30k`](experiments/qwen-multi30k) fully fine-tunes
+Qwen2.5-0.5B-Instruct the same way on a 16 GB GPU. MRT beat continued
+supervised fine-tuning on 7 of 8 seeds (+0.72 BLEU, p = 0.023). Against
+`generate()` plus a hand-written re-scoring loss, the gradient is the same
+and so is the BLEU; beamgrad peaked at 9.2 GiB against 11.4–12.4 GiB.
+[docs/training.md](docs/training.md) explains which loss and which gradient
+mode (through the steps, or re-scoring for large models) to use.
 
 If the next-token distributions of every beam are already in a
 `[B, T, K, V]` tensor, score and decode it directly:
@@ -88,8 +93,11 @@ rows are read as they are.
   the search, one step at a time, reordering its cache by each beam's parent.
   On Qwen2.5-0.5B and Qwen3-0.6B, with EOS suppressed and
   `length_penalty=0`, it returns all `K` beams of `transformers`'
-  `generate(num_beams=K)` with bit-identical scores in float32, at the same
-  speed. With EOS enabled the two differ by design: beamgrad keeps finished
+  `generate(num_beams=K)`, with bit-identical scores in float32 when it runs
+  the prompt once per beam as `generate()` does (`share_prompt=False`). By
+  default it runs each prompt once per example instead: with 2,048-token
+  prompts that makes a search 3× faster than `generate()` with less than half
+  its peak memory. With EOS enabled the two differ by design: beamgrad keeps finished
   hypotheses in their beam slots, and `transformers` keeps them in a separate
   pool. So there only the best beam is compared
   ([benchmarks/hf_beam_search.py](benchmarks/hf_beam_search.py),
@@ -226,6 +234,7 @@ The complete version, with error handling, is
 | [docs/development.md](docs/development.md) | building, testing, releasing |
 | [examples/](examples) | quickstart, training a model through beam search, C usage |
 | [experiments/multi30k](experiments/multi30k) | a controlled training experiment (En→De translation) |
+| [experiments/qwen-multi30k](experiments/qwen-multi30k) | the same with a fully fine-tuned LLM, against a `generate()`-based pipeline |
 
 ## Scope and limitations
 

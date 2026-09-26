@@ -1,5 +1,66 @@
 # Changelog
 
+## 2.2.1 (2026-09-26)
+
+Fixes and improvements from running beamgrad 2.2.0 on a real LLM:
+- `pip install beamgrad` no longer fails when the CUDA operators cannot be
+  built: it warns and installs without them;
+- `BeamOptions(eos_token=...)` takes several end-of-sequence tokens, as
+  Qwen and Llama 3 need;
+- `beamgrad.hf.CausalLMStep` runs each prompt once per example rather than
+  once per beam: 3× faster than `generate()` on 2,048-token prompts, with
+  less than half its peak memory;
+- a fully fine-tuned Qwen2.5-0.5B experiment is in `experiments/`.
+
+The C ABI is unchanged (version 10): every new function is an addition.
+
+### Added
+
+- Several end-of-sequence tokens. `BeamOptions(eos_token=...)` takes a
+  sequence of token ids, such as `model.generation_config.eos_token_id` for
+  Qwen (`<|im_end|>`, `<|endoftext|>`) or Llama 3. Any of them finishes a
+  hypothesis, `min_length` masks all of them, and a finished beam is carried
+  forward with the token it emitted. `options.eos_tokens` lists them. This
+  works on CPU and CUDA, in `beam_search`, `search`, `decode`, the estimators,
+  `losses.structured_margin` and JAX, with CPU and GPU agreeing bit for bit.
+  In the C API it is `dbs_set_extra_eos_tokens` (ABI 10 unchanged); on CUDA
+  it is `dbs_cuda_decode_ex2` and `dbs_cuda_decode_step_ex2`
+  (`DBSCudaSearchOptions`, up to 16 extra tokens). The operators
+  `beamgrad::decode_ex` and `decode_step` take `extra_eos=[]`.
+- `experiments/qwen-multi30k`: minimum-risk training through `beam_search`
+  on a fully fine-tuned Qwen2.5-0.5B-Instruct. It beat continued supervised
+  fine-tuning by +0.72 BLEU on 7 of 8 seeds (p = 0.023). Against
+  `generate()` plus hand-written re-scoring, the gradient and the BLEU are the
+  same and the peak memory is lower (9.2 against 11.4–12.4 GiB). The
+  training guide notes that full fine-tuning of that model on 16 GB needs
+  `CausalLMRescorer(gradient_checkpointing=True)`.
+- `benchmarks/hf_beam_search.py` counts every EOS token of the model, turns
+  off the repetition penalty of instruct models' generation configs (which
+  made `generate()` a different search), checks both prompt modes, and times
+  long prompts (`--long-prompt`).
+
+### Changed
+
+- `beamgrad.hf.CausalLMStep(share_prompt=True)`, the new default, runs each
+  prompt once per example rather than once per beam, and copies its
+  key/value cache to the beams. With 2,048-token prompts (Qwen2.5-0.5B,
+  batch 8, 4 beams) a search takes 916 ms and 3.4 GiB instead of
+  `generate()`'s 2,759 ms and 7.8 GiB. It returns the same beams as before,
+  with scores that can differ in the last bits (the prompt runs at another
+  batch size); `share_prompt=False` keeps the previous behaviour and its
+  bit-identical parity with `generate()`.
+
+### Fixed
+
+- `pip install beamgrad` (the source distribution) no longer fails when the
+  CUDA operators cannot be built. With the default `BEAMGRAD_CUDA=auto`, a
+  CUDA toolkit whose major version differs from PyTorch's CUDA (a system
+  `nvcc` 12.4 with a PyTorch built for CUDA 13.0), a host compiler that
+  PyTorch rejects for that toolkit, or an `nvcc` failure now gives a warning
+  and an installation without the CUDA operators. Passing a CUDA tensor to it
+  raises an error that gives the reason. `BEAMGRAD_CUDA=1` still makes any of
+  these an error.
+
 ## 2.2.0 (2026-09-26)
 
 Decoding from logits and from float16/bfloat16 rows, on every backend, and

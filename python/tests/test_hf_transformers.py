@@ -104,3 +104,41 @@ def test_rescore_gradient_matches_the_steps_gradient(model):
     assert steps.numel() == rescored.numel() == sum(p.numel() for p in model.parameters())
     cosine = torch.nn.functional.cosine_similarity(steps.double(), rescored.double(), dim=0)
     assert cosine > 0.9999
+
+
+def test_shared_prompt_runs_each_prompt_once(model):
+    # share_prompt (the default) runs each prompt once and copies its cache to the
+    # beams; the search is the same as with a prompt per beam, up to rounding.
+    ids, mask = prompts()
+    batch_sizes = []
+    hook = model.register_forward_pre_hook(
+        lambda module, args, kwargs: batch_sizes.append(kwargs["input_ids"].shape), with_kwargs=True
+    )
+    try:
+        with torch.no_grad():
+            shared = beamgrad.beam_search(CausalLMStep(model, ids, mask, K), BeamOptions(beam_size=K), T, batch_size=B)
+            steps = len(batch_sizes)
+            per_beam = beamgrad.beam_search(
+                CausalLMStep(model, ids, mask, K, share_prompt=False), BeamOptions(beam_size=K), T, batch_size=B
+            )
+    finally:
+        hook.remove()
+    assert batch_sizes[0] == (B, ids.shape[1])  # the prompts, once each
+    assert batch_sizes[steps] == (B * K, ids.shape[1])  # once per beam slot
+    assert all(shape == (B * K, 1) for shape in batch_sizes[1:steps])
+    assert torch.equal(shared.sequences, per_beam.sequences)
+    torch.testing.assert_close(shared.scores, per_beam.scores, rtol=1e-5, atol=1e-5)
+
+
+def test_shared_prompt_gradients_match(model):
+    # Through the steps, the gradient reaches the model the same way with a shared prompt.
+    ids, mask = prompts()
+    grads = []
+    for share in (True, False):
+        model.zero_grad()
+        result = beamgrad.beam_search(
+            CausalLMStep(model, ids, mask, K, share_prompt=share), BeamOptions(beam_size=K), T, batch_size=B
+        )
+        result.scores.sum().backward()
+        grads.append(torch.cat([p.grad.flatten() for p in model.parameters() if p.grad is not None]))
+    torch.testing.assert_close(grads[0], grads[1], rtol=1e-4, atol=1e-5)
