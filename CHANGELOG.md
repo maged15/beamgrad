@@ -1,6 +1,11 @@
 # Changelog
 
-## Unreleased
+## 2.1.0 (2026-09-26)
+
+Fixes and hardening on top of 2.0.0: an accurate relaxed top-k at any score
+magnitude, stricter validation in the Python API, broader fuzzing, and
+faster model-step decoding and small batch decodes. The C ABI is unchanged
+(version 10).
 
 ### Added
 

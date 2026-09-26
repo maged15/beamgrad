@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20)
 
 project(beamgrad
-  VERSION 2.0.0
+  VERSION 2.1.0
   DESCRIPTION "Differentiable beam search: C ABI, SIMD CPU kernels, and native CUDA"
   HOMEPAGE_URL "https://github.com/maged15/beamgrad"
   LANGUAGES C CXX)
