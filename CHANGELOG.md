@@ -1,6 +1,17 @@
 # Changelog
 
-## Unreleased
+## 2.1.1 (2026-09-26)
+
+Closes the gaps left by 2.1.0 and its review:
+- the CUDA step's precondition is now checked in the PyTorch operator;
+- `length_penalty` has a vmap rule;
+- `relaxed_topk` is 14× faster on the GPU;
+- the `torch.compile` documentation is accurate;
+- wheels install with one command;
+- a report of the device tests on a real GPU is published;
+- the translation experiment has 8 seeds.
+
+The C ABI is unchanged (version 10).
 
 ### Added
 
