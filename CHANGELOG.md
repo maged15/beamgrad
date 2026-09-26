@@ -1,6 +1,6 @@
 # Changelog
 
-## 2.2.1 (2026-09-26)
+## 2.3.0 (2026-09-26)
 
 Fixes and improvements from running beamgrad 2.2.0 on a real LLM:
 - `pip install beamgrad` no longer fails when the CUDA operators cannot be
