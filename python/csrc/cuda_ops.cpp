@@ -83,6 +83,19 @@ Tensor workspace(int64_t bytes, const Tensor& like) {
     return torch::empty({bytes > 0 ? bytes : 1}, like.options().dtype(torch::kUInt8));
 }
 
+// Search options with more EOS tokens (token ids in [0, V), with EOS handling on).
+DBSCudaSearchOptions search_options(c10::IntArrayRef extra_eos, int64_t eos_token, int64_t V) {
+    TORCH_CHECK_VALUE(static_cast<int64_t>(extra_eos.size()) <= DBS_CUDA_MAX_EXTRA_EOS, "at most ",
+                      DBS_CUDA_MAX_EXTRA_EOS, " extra EOS tokens are supported on CUDA, got ", extra_eos.size());
+    TORCH_CHECK_VALUE(extra_eos.empty() || eos_token >= 0, "extra EOS tokens need eos_token >= 0");
+    DBSCudaSearchOptions o{};
+    for (const int64_t token : extra_eos) {
+        TORCH_CHECK_VALUE(token >= 0 && token < V, "extra EOS token ", token, " is outside the vocabulary (size ", V, ")");
+        o.extra_eos_tokens[o.extra_eos_count++] = static_cast<int32_t>(token);
+    }
+    return o;
+}
+
 // The DBS_CUDA_DTYPE_* of a tensor of rows, which must be float32, float16 or bfloat16.
 int row_type(const Tensor& t, const char* name) {
     switch (t.scalar_type()) {
@@ -104,7 +117,8 @@ DecodeExOutputs decode_ex_cuda(
     const c10::optional<Tensor>& banned_tokens,
     int64_t no_repeat_ngram_size,
     double repetition_penalty,
-    bool validate) {
+    bool validate,
+    c10::IntArrayRef extra_eos) {
     TORCH_CHECK(inputs.is_cuda(), "beamgrad::decode (CUDA) expects a CUDA tensor");
     const int type = row_type(inputs, from_logits ? "logits" : "log_probs");
     TORCH_CHECK_VALUE(inputs.dim() == 4, "inputs must have shape [B, T, K, V]");
@@ -155,8 +169,10 @@ DecodeExOutputs decode_ex_cuda(
 
     const int64_t ws_bytes = dbs_cuda_decode_workspace_size(&args);
     Tensor ws = workspace(ws_bytes, x);
-    check_status(dbs_cuda_decode_ex(x.data_ptr(), type, from_logits ? 1 : 0, &args, &out, row_lse.data_ptr<float>(),
-                                    ws.data_ptr(), ws_bytes, at::cuda::getCurrentCUDAStream().stream()),
+    const DBSCudaSearchOptions search = search_options(extra_eos, eos_token, V);
+    check_status(dbs_cuda_decode_ex2(x.data_ptr(), type, from_logits ? 1 : 0, &args, &search, &out,
+                                     row_lse.data_ptr<float>(), ws.data_ptr(), ws_bytes,
+                                     at::cuda::getCurrentCUDAStream().stream()),
                  "decode");
     if (validate) {
         const Tensor flags = invalid.cpu();  // one byte per example; synchronizes the stream
@@ -181,7 +197,7 @@ DecodeOutputs decode_cuda(
     bool validate) {
     TORCH_CHECK_VALUE(log_probs.scalar_type() == torch::kFloat32, "log_probs must be float32");
     const auto out = decode_ex_cuda(log_probs, false, steps, eos_token, min_length, length_penalty_alpha, banned_tokens,
-                                    no_repeat_ngram_size, repetition_penalty, validate);
+                                    no_repeat_ngram_size, repetition_penalty, validate, {});
     return {std::get<0>(out), std::get<1>(out), std::get<2>(out), std::get<3>(out), std::get<4>(out),
             std::get<5>(out), std::get<6>(out), std::get<7>(out), std::get<8>(out)};
 }
@@ -198,7 +214,8 @@ StepOutputs decode_step_cuda(
     const c10::optional<Tensor>& banned_tokens,
     int64_t no_repeat_ngram_size,
     double repetition_penalty,
-    bool validate) {
+    bool validate,
+    c10::IntArrayRef extra_eos) {
     TORCH_CHECK(log_probs.is_cuda(), "beamgrad::decode_step (CUDA) expects CUDA tensors");
     TORCH_CHECK_VALUE(log_probs.scalar_type() == torch::kFloat32 && log_probs.dim() == 3,
                       "log_probs must be a float32 [B, K, V] tensor");
@@ -269,8 +286,9 @@ StepOutputs decode_step_cuda(
                                  pre.numel() > 0 ? pre.data_ptr<int32_t>() : nullptr, static_cast<int>(pre.size(2)), 0};
     const int64_t ws_bytes = dbs_cuda_decode_step_workspace_size(&args, state.prefix_stride);
     Tensor ws = workspace(ws_bytes, x);
-    check_status(dbs_cuda_decode_step(x.data_ptr<float>(), &args, &state, &out, ws.data_ptr(), ws_bytes,
-                                      at::cuda::getCurrentCUDAStream().stream()),
+    const DBSCudaSearchOptions search = search_options(extra_eos, eos_token, V);
+    check_status(dbs_cuda_decode_step_ex2(x.data_ptr<float>(), DBS_CUDA_DTYPE_F32, 0, &args, &search, &state, &out,
+                                          nullptr, ws.data_ptr(), ws_bytes, at::cuda::getCurrentCUDAStream().stream()),
                  "decode_step");
     if (validate) {
         // One transfer for the NaN flags and the length check; synchronizes the stream.

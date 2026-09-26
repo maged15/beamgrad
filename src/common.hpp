@@ -164,6 +164,9 @@ inline void convert_to_float(const void* src, DType type, size_t n, float* dst) 
 struct BeamOptions {
     int beam_size = 8;
     int eos_token = -1;
+    // More end-of-sequence tokens: a hypothesis also finishes when it emits one
+    // of these (only with eos_token >= 0), and min_length masks them too.
+    std::vector<int32_t> extra_eos_tokens;
 
     float selected_temperature = 1.0f;
     float soft_topk_temperature = 0.25f;

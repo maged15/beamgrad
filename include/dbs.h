@@ -203,6 +203,15 @@ DBS_EXPORT DBSDecoderHandle* dbs_create(DBSOptionsC options);
 DBS_EXPORT void dbs_destroy(DBSDecoderHandle* handle);
 DBS_EXPORT const char* dbs_last_error(DBSDecoderHandle* handle);
 
+/* More end-of-sequence tokens for the handle's decodes, besides
+ * options.eos_token (which must then be >= 0), for models with several (e.g.
+ * <|im_end|> and <|endoftext|>). A hypothesis finishes when it emits any of
+ * them, min_length masks all of them, and a finished beam is carried forward
+ * with the token it ended with. count = 0 removes them. Tokens outside the
+ * vocabulary are rejected by the decode. Not thread-safe with respect to
+ * decodes running on the same handle. */
+DBS_EXPORT int dbs_set_extra_eos_tokens(DBSDecoderHandle* handle, const int32_t* tokens, int count);
+
 DBS_EXPORT int dbs_decode(
     DBSDecoderHandle* handle,
     const float* log_probs,

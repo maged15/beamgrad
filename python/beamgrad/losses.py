@@ -16,9 +16,11 @@ actually found.
 from __future__ import annotations
 
 import warnings
+from collections.abc import Sequence
 
 import torch
 
+from ._options import BeamOptions
 from ._search import BeamSearchResult
 
 __all__ = ["minimum_risk", "structured_margin", "matches"]
@@ -67,7 +69,7 @@ def structured_margin(
     margin: float = 1.0,
     reduction: str = "mean",
     *,
-    eos_token: int | None = None,
+    eos_token: int | Sequence[int] | None = None,
 ) -> torch.Tensor:
     """Hinge loss: the reference must outscore the best non-reference beam by ``margin``.
 
@@ -93,15 +95,16 @@ def structured_margin(
             token log-probabilities (differentiable).
         margin: Required score difference.
         reduction: ``"mean"``, ``"sum"`` or ``"none"``.
-        eos_token: The search's ``options.eos_token``. When given and
-            ``>= 0``, a ``UserWarning`` names the reference rows that do not
-            end with it (this reads the references on the host). ``None``
-            (the default) skips the check.
+        eos_token: The search's ``options.eos_token`` (one token id or
+            several). When given and ``>= 0``, a ``UserWarning`` names the
+            reference rows that do not end with (one of) them (this reads the
+            references on the host). ``None`` (the default) skips the check.
     """
     scores, sequences = _batched(result)
     B = scores.shape[0]
-    if eos_token is not None and eos_token >= 0:
-        _warn_missing_eos(reference, eos_token)
+    eos = () if eos_token is None else BeamOptions(beam_size=1, eos_token=eos_token).eos_tokens
+    if eos:
+        _warn_missing_eos(reference, eos)
     reference_scores = torch.as_tensor(reference_scores)
     # [B, 1] would broadcast against the [B] rivals into a [B, B] loss.
     if tuple(reference_scores.shape) != (B,) and not (result.scores.dim() == 1 and reference_scores.dim() == 0):
@@ -114,16 +117,18 @@ def structured_margin(
     return _reduce(loss, reduction)
 
 
-def _warn_missing_eos(reference: torch.Tensor, eos_token: int) -> None:
+def _warn_missing_eos(reference: torch.Tensor, eos: tuple[int, ...]) -> None:
     if reference.dim() != 2:
         return  # matches() reports the shape
     lengths = (reference >= 0).sum(1)
     last = reference.gather(1, (lengths - 1).clamp(min=0)[:, None])[:, 0]
-    missing = ((lengths == 0) | (last != eos_token)).nonzero().flatten().tolist()
+    ends = torch.isin(last, torch.tensor(eos, dtype=last.dtype, device=last.device))
+    missing = ((lengths == 0) | ~ends).nonzero().flatten().tolist()
     if missing:
         shown = ", ".join(str(r) for r in missing[:10]) + (", ..." if len(missing) > 10 else "")
+        named = f"eos_token {eos[0]}" if len(eos) == 1 else f"any of the EOS tokens {list(eos)}"
         warnings.warn(
-            f"structured_margin: reference rows [{shown}] do not end with eos_token {eos_token}. A finished beam "
+            f"structured_margin: reference rows [{shown}] do not end with {named}. A finished beam "
             "ends with the EOS it emitted, so these references can never match a beam and their loss cannot "
             "reach zero; append the EOS (and count it in the sequence_scores lengths).",
             UserWarning,

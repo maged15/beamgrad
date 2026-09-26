@@ -267,6 +267,53 @@ DBS_CUDA_EXPORT int dbs_cuda_backward_ex(
     int64_t workspace_bytes,
     void* stream);
 
+/* Largest number of extra end-of-sequence tokens (DBSCudaSearchOptions). */
+#define DBS_CUDA_MAX_EXTRA_EOS 16
+
+/* Search options beyond DBSCudaDecodeArgs, for the _ex2 functions. Zero it. */
+typedef struct DBSCudaSearchOptions {
+    /* More end-of-sequence tokens (host values), besides eos_token: a hypothesis
+     * finishes when it emits any of them, min_length masks all of them, and a
+     * finished beam is carried forward with the token it ended with. They need
+     * EOS handling (eos_token >= 0, or per-example EOS tokens); an example whose
+     * EOS token is -1 ignores them. Each must be in [0, V). */
+    int extra_eos_count;
+    int32_t extra_eos_tokens[DBS_CUDA_MAX_EXTRA_EOS];
+    int reserved0;        /* must be 0 */
+    void* reserved[4];    /* must be NULL */
+} DBSCudaSearchOptions;
+
+/* dbs_cuda_decode_ex with search options (may be NULL). Equals
+ * dbs_decode_batch_into_ex with dbs_set_extra_eos_tokens bit for bit. */
+DBS_CUDA_EXPORT int dbs_cuda_decode_ex2(
+    const void* inputs,
+    int data_type,
+    int from_logits,
+    const DBSCudaDecodeArgs* args,
+    const DBSCudaSearchOptions* options,
+    const DBSCudaDecodeOutputs* outputs,
+    float* row_lse,
+    void* workspace,
+    int64_t workspace_bytes,
+    void* stream);
+
+/* dbs_cuda_decode_step_ex with search options (may be NULL). With extra EOS
+ * tokens, the token a finished beam carries forward is the last token of its
+ * prefix (state->prefixes, which must then hold at least lengths[b, k] tokens
+ * of each finished beam), or eos_token when the prefix does not cover it. */
+DBS_CUDA_EXPORT int dbs_cuda_decode_step_ex2(
+    const void* inputs,
+    int data_type,
+    int from_logits,
+    const DBSCudaDecodeArgs* args,
+    const DBSCudaSearchOptions* options,
+    const DBSCudaBeamState* state,
+    const DBSCudaDecodeOutputs* outputs,
+    float* row_lse,
+    void* workspace,
+    int64_t workspace_bytes,
+    void* stream);
+
 /* out[i] = ((5 + max(lengths[i], 1)) / 6)^alpha, the GNMT length penalty,
  * bit for bit as the search computes it on the CPU and the GPU. */
 DBS_CUDA_EXPORT int dbs_cuda_length_penalty(const int32_t* lengths, int64_t count, float alpha, float* out, void* stream);

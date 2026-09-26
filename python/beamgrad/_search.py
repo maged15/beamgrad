@@ -228,8 +228,8 @@ def sequence_scores(token_log_probs: torch.Tensor, lengths: torch.Tensor, option
     penalty the search uses, so for example a reference sequence can be
     compared with the beams in a structured-margin loss. Differentiable.
 
-    With ``options.eos_token >= 0`` a finished beam's length counts the EOS it
-    emitted, and that token's log-probability is part of its score. So a
+    With EOS tokens (``options.eos_token``) a finished beam's length counts the
+    EOS it emitted, and that token's log-probability is part of its score. So a
     reference must end with the EOS, and its length and log-probabilities
     must include it, to be on the same scale (and to be recognised by
     :func:`beamgrad.losses.structured_margin`).
@@ -353,6 +353,7 @@ def _search(
     parents = torch.full((B, K), -1, dtype=torch.int64, device=state_device)
     tokens = parents.clone()
 
+    eos, extra_eos = options.native_eos()
     rows: list[torch.Tensor] = []
     picked: list[torch.Tensor] = []
     steps_run = 0
@@ -375,8 +376,7 @@ def _search(
                 state_device = lp.device
                 raw, lengths, finished, scores = (x.to(state_device) for x in (raw, lengths, finished, scores))
                 sequences, parents, tokens = (x.to(state_device) for x in (sequences, parents, tokens))
-            if options.eos_token >= vocab_size:
-                raise ValueError(f"eos_token {options.eos_token} is outside the vocabulary (size {vocab_size})")
+            options.eos_ids(vocab_size)  # checks the EOS tokens against the vocabulary
             ids = options.banned_ids(vocab_size)
             if ids is not None:
                 index = torch.tensor(ids, dtype=torch.long, device=state_device)
@@ -406,13 +406,14 @@ def _search(
             lengths,
             finished,
             sequences.to(torch.int32),
-            options.eos_token,
+            eos,
             options.min_length,
             float(options.length_penalty_alpha),
             banned,
             options.no_repeat_ngram_size,
             float(options.repetition_penalty),
             options.validate_inputs,
+            extra_eos,
         )
         trace.append((step_tokens, step_parents, lengths, scores, raw, from_logprob))
         # The entries this step's beams used, gathered now so that autograd

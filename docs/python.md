@@ -54,7 +54,7 @@ result = beamgrad.beam_search(step, options, max_steps=T, batch_size=B)
 ```python
 beamgrad.BeamOptions(
     beam_size: int,                    # K; must equal the beam dimension of log_probs
-    eos_token: int = -1,               # -1 disables EOS handling
+    eos_token: int | Sequence[int] = -1,  # EOS token id(s); -1 disables EOS handling
     min_length: int = 0,               # EOS is masked until a hypothesis has this many tokens
     length_penalty_alpha: float = 0.0, # GNMT length penalty exponent
     validate_inputs: bool = True,      # reject NaN / +inf in the rows the search reads
@@ -68,6 +68,14 @@ A frozen dataclass; invalid values raise `ValueError` on construction. NumPy
 integer and float scalars are accepted, as are arrays or tensors of
 `banned_tokens`; every field is stored as a plain Python `int`, `float` or
 tuple of `int`s.
+
+`eos_token` can list several tokens, as Hugging Face's `eos_token_id` does:
+Qwen ends with `<|im_end|>` or `<|endoftext|>`, and Llama 3 has three. So
+`BeamOptions(beam_size=4, eos_token=model.generation_config.eos_token_id)`
+works as it is. Any of them finishes a hypothesis, `min_length` masks all of
+them, and a finished beam is carried forward with the token it emitted.
+`options.eos_tokens` lists them (`()` when EOS handling is off). CUDA supports
+up to 16 besides the first.
 
 `validate_inputs` raises `ValueError` if a row the search reads (the row of a
 live, unfinished beam, including banned or masked tokens) contains NaN or

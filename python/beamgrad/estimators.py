@@ -202,12 +202,15 @@ def relaxed_topk(
     B, T, K = trace.tokens.shape
     P = K * pool_multiplier
     raws = _raw_scores(trace, rows)
-    alpha, eos = options.length_penalty_alpha, options.eos_token
+    alpha = options.length_penalty_alpha
     device = trace.tokens.device
+    eos = torch.tensor(options.eos_tokens, dtype=trace.tokens.dtype, device=device)  # every EOS token
     banned = None
     pool_scores, pool_index = [], []
     for t, row in enumerate(rows):
         V = row.shape[-1]
+        if t == 0:
+            options.eos_ids(V)  # checks the EOS tokens against the vocabulary
         if banned is None and options.banned_tokens:
             banned = torch.zeros(V, dtype=torch.bool, device=device)
             banned[list(options.banned_ids(V))] = True
@@ -216,18 +219,21 @@ def relaxed_topk(
             parent_raw[:, 0] = 0.0
             parent_len = torch.zeros(B, K, dtype=torch.long, device=device)
             parent_done = torch.zeros(B, K, dtype=torch.bool, device=device)
+            parent_tokens = None
         else:
             parent_raw = raws[t - 1]
             parent_len = trace.lengths[:, t - 1]
-            parent_done = (trace.tokens[:, t - 1] == eos) & (eos >= 0) & (trace.parents[:, t - 1] >= 0)
+            # A beam is finished when its token is an EOS token: the one it emitted, or carries.
+            parent_tokens = trace.tokens[:, t - 1]
+            parent_done = torch.isin(parent_tokens, eos) & (trace.parents[:, t - 1] >= 0)
         live = torch.isfinite(parent_raw) & ~parent_done
         new_len = parent_len + 1
         lp = row.float()
         allowed = torch.isfinite(lp) & live[..., None]
         if banned is not None:
             allowed &= ~banned
-        if eos >= 0:
-            allowed[..., eos] &= new_len >= options.min_length
+        if eos.numel():
+            allowed[..., eos] &= (new_len >= options.min_length)[..., None]
         inv = 1.0 / length_penalty(new_len, alpha)
         expanded = torch.where(allowed, (parent_raw[..., None] + lp) * inv[..., None], float("-inf"))
         carried = torch.where(
@@ -242,18 +248,21 @@ def relaxed_topk(
             index = torch.nn.functional.pad(index, (0, P - index.shape[1]), value=-1)
         index = torch.where(best > _NEG_GUARD, index, -1)
         pool_scores.append(best)
-        pool_index.append((index, K * V))
+        pool_index.append((index, K * V, parent_tokens))
     scores = torch.stack(pool_scores, 1)  # [B, T, P]
     # One bisection for every step at once. Each row's is independent, so the
     # weights are the same; but each iteration reads a convergence flag back from
     # the device, so this syncs once per iteration instead of T times.
     weights = _SoftTopK.apply(scores, K, temperature, tolerance, max_iters)
     parents, tokens, from_logprob = [], [], []
-    for index, expansions in pool_index:
+    for index, expansions, parent_tokens in pool_index:
         expanded = (index >= 0) & (index < expansions)
         V = expansions // K
-        parents.append(torch.where(expanded, index // V, torch.where(index >= 0, index - expansions, -1)))
-        tokens.append(torch.where(expanded, index % V, torch.where(index >= 0, eos, -1)))
+        parent = torch.where(expanded, index // V, torch.where(index >= 0, index - expansions, -1))
+        parents.append(parent)
+        # A carried-forward candidate keeps its beam's EOS token (only possible after step 0).
+        carried = parent_tokens.gather(1, parent.clamp(0, K - 1)) if parent_tokens is not None else index
+        tokens.append(torch.where(expanded, index % V, torch.where(index >= 0, carried, -1)))
         from_logprob.append(expanded)
     out = RelaxedTopK(
         scores,

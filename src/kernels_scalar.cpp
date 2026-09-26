@@ -18,7 +18,7 @@ bool scan_row_forced(const RowScan& s, Candidate* top, int top_count) {
     for (int v = 0; v < s.vocab_size; ++v) invalid |= !(row_log_prob(s, v) < kInf);
     const int v = s.forced_token;
     const float lp = row_log_prob(s, v);
-    if (lp < kInf && lp != -kInf && !(s.banned && s.banned[v]) && v != s.masked_token) {
+    if (lp < kInf && lp != -kInf && !(s.banned && s.banned[v]) && !is_masked(s, v)) {
         const float raw = s.parent_raw + lp;
         insert_topk(top, top_count, Candidate{raw * s.inv_penalty, raw, s.parent, v, s.new_length, 1});
     }

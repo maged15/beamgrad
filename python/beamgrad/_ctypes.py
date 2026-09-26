@@ -153,14 +153,26 @@ DTYPE_F32, DTYPE_F16, DTYPE_BF16 = 0, 1, 2
 
 
 def options_to_c(options: BeamOptions) -> DBSOptionsC:
-    """Convert :class:`BeamOptions`; unused C fields take their documented defaults."""
+    """Convert :class:`BeamOptions`; unused C fields take their documented defaults.
+
+    Only the first EOS token fits in ``DBSOptionsC``: pass the handle to
+    :func:`set_extra_eos` for the others.
+    """
     c = DBSOptionsC()
     c.beam_size = options.beam_size
-    c.eos_token = options.eos_token
+    c.eos_token = options.native_eos()[0]
     c.min_length = options.min_length
     c.length_penalty_alpha = options.length_penalty_alpha
     c.validate_inputs = 1 if options.validate_inputs else 0
     return c
+
+
+def set_extra_eos(lib: ctypes.CDLL, handle, options: BeamOptions) -> None:
+    """Give a decoder handle the options' EOS tokens after the first (dbs_set_extra_eos_tokens)."""
+    extra = options.native_eos()[1]
+    if extra:
+        tokens = (ctypes.c_int32 * len(extra))(*extra)
+        check(lib, handle, lib.dbs_set_extra_eos_tokens(handle, tokens, len(extra)))
 
 
 def constraints_to_c(options: BeamOptions, banned_mask) -> DBSAdvancedConstraintsC | None:
@@ -236,6 +248,7 @@ def _bind(lib: ctypes.CDLL) -> None:
             i32,
         ),
         "dbs_backward_batch_into_ex": ([p, ctypes.POINTER(DBSBackwardInputsC), i32, p], i32),
+        "dbs_set_extra_eos_tokens": ([p, ctypes.POINTER(ctypes.c_int32), i32], i32),
     }
     for name, (argtypes, restype) in signatures.items():
         fn = getattr(lib, name)

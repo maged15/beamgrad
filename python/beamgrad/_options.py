@@ -33,6 +33,22 @@ def _finite_float(value) -> float | None:
     return result if math.isfinite(result) else None
 
 
+def _eos_token(value) -> int | tuple[int, ...]:
+    """``eos_token`` normalized: an int, or a tuple of two or more distinct token ids."""
+    if _is_int(value):
+        if not -1 <= value <= INT32_MAX:
+            raise ValueError(f"eos_token must be -1 (disabled) or a token id, got {value!r}")
+        return int(value)
+    tokens = value.tolist() if hasattr(value, "tolist") else value  # a NumPy array or a tensor
+    if isinstance(tokens, (str, bytes)) or not isinstance(tokens, Iterable):
+        raise ValueError(f"eos_token must be -1 (disabled), a token id or a sequence of token ids, got {value!r}")
+    tokens = tuple(tokens)
+    if not tokens or any(not _is_int(t) or not 0 <= t <= INT32_MAX for t in tokens):
+        raise ValueError(f"eos_token must be a non-empty sequence of token ids, got {value!r}")
+    tokens = tuple(dict.fromkeys(int(t) for t in tokens))  # distinct, in the order given
+    return tokens[0] if len(tokens) == 1 else tokens
+
+
 @dataclass(frozen=True)
 class BeamOptions:
     """Beam search configuration.
@@ -42,7 +58,12 @@ class BeamOptions:
             ``log_probs``.
         eos_token: End-of-sequence token id, or ``-1`` to disable EOS handling.
             A beam that emits EOS is finished: it keeps its score and is carried
-            forward unchanged at every later step.
+            forward unchanged at every later step. A sequence of ids (for
+            example ``model.generation_config.eos_token_id``, which is a list
+            for Qwen and Llama 3) makes each of them an EOS token: any of them
+            finishes a beam, which is then carried forward with the one it
+            emitted. :attr:`eos_tokens` lists them all. Up to 16 extra tokens
+            are supported on CUDA.
         min_length: EOS is masked until a hypothesis has at least this many
             tokens (including the EOS itself).
         length_penalty_alpha: GNMT length penalty exponent. Beams are ranked by
@@ -66,7 +87,7 @@ class BeamOptions:
     """
 
     beam_size: int
-    eos_token: int = -1
+    eos_token: int | tuple[int, ...] = -1
     min_length: int = 0
     length_penalty_alpha: float = 0.0
     validate_inputs: bool = True
@@ -79,8 +100,7 @@ class BeamOptions:
         # ints, so NumPy scalars are accepted and nothing else leaks through.
         if not _is_int(self.beam_size) or not 1 <= self.beam_size <= INT32_MAX:
             raise ValueError(f"beam_size must be a positive int (at most 2**31 - 1), got {self.beam_size!r}")
-        if not _is_int(self.eos_token) or not -1 <= self.eos_token <= INT32_MAX:
-            raise ValueError(f"eos_token must be -1 (disabled) or a token id, got {self.eos_token!r}")
+        object.__setattr__(self, "eos_token", _eos_token(self.eos_token))
         if not _is_int(self.min_length) or not 0 <= self.min_length <= INT32_MAX:
             raise ValueError(f"min_length must be a non-negative int (at most 2**31 - 1), got {self.min_length!r}")
         alpha = _finite_float(self.length_penalty_alpha)
@@ -106,10 +126,30 @@ class BeamOptions:
         penalty = _finite_float(self.repetition_penalty)
         if penalty is None or penalty <= 0.0:
             raise ValueError(f"repetition_penalty must be a finite, positive number, got {self.repetition_penalty!r}")
-        for name in ("beam_size", "eos_token", "min_length", "no_repeat_ngram_size"):
+        for name in ("beam_size", "min_length", "no_repeat_ngram_size"):
             object.__setattr__(self, name, int(getattr(self, name)))
         object.__setattr__(self, "length_penalty_alpha", alpha)
         object.__setattr__(self, "repetition_penalty", penalty)
+
+    @property
+    def eos_tokens(self) -> tuple[int, ...]:
+        """Every end-of-sequence token id, in the order given; ``()`` when EOS handling is off."""
+        if isinstance(self.eos_token, tuple):
+            return self.eos_token
+        return () if self.eos_token < 0 else (self.eos_token,)
+
+    def eos_ids(self, vocab_size: int) -> tuple[int, ...]:
+        """:attr:`eos_tokens`, checked against ``vocab_size``."""
+        outside = [t for t in self.eos_tokens if t >= vocab_size]
+        if outside:
+            raise ValueError(f"eos_token {outside[0]} is outside the vocabulary (size {vocab_size})")
+        return self.eos_tokens
+
+    def native_eos(self) -> tuple[int, list[int]]:
+        """``(eos_token, extra_eos)`` as the operators take them: the first EOS
+        token (``-1`` when off) and the others."""
+        tokens = self.eos_tokens
+        return (tokens[0], list(tokens[1:])) if tokens else (-1, [])
 
     def banned_ids(self, vocab_size: int) -> tuple[int, ...] | None:
         """The banned token ids, checked against ``vocab_size``, or ``None``."""

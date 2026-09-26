@@ -13,11 +13,13 @@
 //        tokens, parents, lengths [B,T,K] i32, scores, raw_scores [B,T,K] f32,
 //        from_logprob [B,T,K] u8
 //   beamgrad::decode_ex(inputs[B,T,K,V] f32/f16/bf16, from_logits, <the
-//                    arguments of decode after log_probs>)
+//                    arguments of decode after log_probs>, extra_eos=[])
 //     -> the outputs of decode, and row_lse [B,T,K] f32: with from_logits
 //        the inputs are logits, normalised on the fly, and row_lse is the
 //        logsumexp of each row the search read (0 elsewhere, and without
 //        from_logits). 16-bit inputs are read as they are, without a copy.
+//        extra_eos: more end-of-sequence tokens besides eos_token (which must
+//        then be >= 0); decode_step takes it too.
 //   beamgrad::decode_backward(grad_final_scores[B,K]?, grad_final_raw_scores[B,K]?,
 //                    grad_scores[B,T,K]?, grad_raw_scores[B,T,K]?, parents,
 //                    tokens, lengths, from_logprob, steps[B]?, vocab_size,
@@ -122,6 +124,17 @@ private:
     std::string message_;
 };
 
+// More EOS tokens for the decoder options: token ids in [0, V), with EOS handling on.
+std::vector<int32_t> extra_eos_tokens(c10::IntArrayRef extra_eos, int64_t eos_token, int64_t V) {
+    std::vector<int32_t> out;
+    for (const int64_t token : extra_eos) {
+        TORCH_CHECK_VALUE(token >= 0 && token < V, "extra EOS token ", token, " is outside the vocabulary (size ", V, ")");
+        out.push_back(static_cast<int32_t>(token));
+    }
+    TORCH_CHECK_VALUE(out.empty() || eos_token >= 0, "extra EOS tokens need eos_token >= 0");
+    return out;
+}
+
 // The element type of a tensor of rows, which must be float32, float16 or bfloat16.
 dbs::DType row_type(const Tensor& t, const char* name) {
     switch (t.scalar_type()) {
@@ -143,7 +156,8 @@ DecodeExOutputs decode_ex_cpu(
     const c10::optional<Tensor>& banned_tokens,
     int64_t no_repeat_ngram_size,
     double repetition_penalty,
-    bool validate) {
+    bool validate,
+    c10::IntArrayRef extra_eos) {
     TORCH_CHECK(inputs.device().is_cpu(), "beamgrad::decode (CPU) expects a CPU tensor");
     const dbs::DType type = row_type(inputs, from_logits ? "logits" : "log_probs");
     TORCH_CHECK_VALUE(inputs.dim() == 4, "inputs must have shape [B, T, K, V]");
@@ -170,6 +184,7 @@ DecodeExOutputs decode_ex_cpu(
     dbs::BeamOptions opt;
     opt.beam_size = static_cast<int>(K);
     opt.eos_token = static_cast<int>(eos_token);
+    opt.extra_eos_tokens = extra_eos_tokens(extra_eos, eos_token, V);
     opt.min_length = static_cast<int>(min_length);
     opt.length_penalty_alpha = static_cast<float>(length_penalty_alpha);
     opt.validate_inputs = validate ? 1 : 0;
@@ -240,7 +255,7 @@ DecodeOutputs decode_cpu(
     bool validate) {
     TORCH_CHECK_VALUE(log_probs.scalar_type() == torch::kFloat32, "log_probs must be float32");
     const auto out = decode_ex_cpu(log_probs, false, steps, eos_token, min_length, length_penalty_alpha, banned_tokens,
-                                   no_repeat_ngram_size, repetition_penalty, validate);
+                                   no_repeat_ngram_size, repetition_penalty, validate, {});
     return {std::get<0>(out), std::get<1>(out), std::get<2>(out), std::get<3>(out), std::get<4>(out),
             std::get<5>(out), std::get<6>(out), std::get<7>(out), std::get<8>(out)};
 }
@@ -276,7 +291,8 @@ StepOutputs decode_step_cpu(
     const c10::optional<Tensor>& banned_tokens,
     int64_t no_repeat_ngram_size,
     double repetition_penalty,
-    bool validate) {
+    bool validate,
+    c10::IntArrayRef extra_eos) {
     TORCH_CHECK(log_probs.device().is_cpu(), "beamgrad::decode_step (CPU) expects CPU tensors");
     check_step_inputs(log_probs, raw_scores, lengths, finished, prefixes);
     const Tensor x = log_probs.contiguous();
@@ -297,6 +313,7 @@ StepOutputs decode_step_cpu(
     dbs::BeamOptions opt;
     opt.beam_size = static_cast<int>(K);
     opt.eos_token = static_cast<int>(eos_token);
+    opt.extra_eos_tokens = extra_eos_tokens(extra_eos, eos_token, V);
     opt.min_length = static_cast<int>(min_length);
     opt.length_penalty_alpha = static_cast<float>(length_penalty_alpha);
     opt.validate_inputs = validate ? 1 : 0;
@@ -577,11 +594,13 @@ TORCH_LIBRARY(beamgrad, m) {
     m.def(
         "decode_step(Tensor log_probs, Tensor raw_scores, Tensor lengths, Tensor finished, Tensor prefixes, "
         "int eos_token, int min_length, float length_penalty_alpha, Tensor? banned_tokens, int no_repeat_ngram_size, "
-        "float repetition_penalty, bool validate) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "float repetition_penalty, bool validate, int[] extra_eos=[]) -> "
+        "(Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
     m.def(
         "decode_ex(Tensor inputs, bool from_logits, Tensor? steps, int eos_token, int min_length, "
         "float length_penalty_alpha, Tensor? banned_tokens, int no_repeat_ngram_size, float repetition_penalty, "
-        "bool validate) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+        "bool validate, int[] extra_eos=[]) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, "
+        "Tensor)");
     m.def(
         "decode_backward(Tensor? grad_final_scores, Tensor? grad_final_raw_scores, Tensor? grad_scores, "
         "Tensor? grad_raw_scores, Tensor parents, Tensor tokens, Tensor lengths, Tensor from_logprob, Tensor? steps, "

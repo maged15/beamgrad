@@ -48,6 +48,7 @@ def expected_paths(trace):
         BeamOptions(beam_size=3),
         BeamOptions(beam_size=4, eos_token=2, min_length=2, length_penalty_alpha=0.6),
         BeamOptions(beam_size=3, eos_token=1, banned_tokens=[4, 5], no_repeat_ngram_size=2, repetition_penalty=1.5),
+        BeamOptions(beam_size=4, eos_token=(2, 7, 9), min_length=2, length_penalty_alpha=0.6),
     ],
 )
 def test_matches_decode_of_the_rows_it_produced(options):

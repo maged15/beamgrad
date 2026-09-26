@@ -2,6 +2,20 @@
 
 ## Unreleased
 
+### Added
+
+- Several end-of-sequence tokens. `BeamOptions(eos_token=...)` takes a
+  sequence of token ids, such as `model.generation_config.eos_token_id` for
+  Qwen (`<|im_end|>`, `<|endoftext|>`) or Llama 3. Any of them finishes a
+  hypothesis, `min_length` masks all of them, and a finished beam is carried
+  forward with the token it emitted. `options.eos_tokens` lists them. This
+  works on CPU and CUDA, in `beam_search`, `search`, `decode`, the estimators,
+  `losses.structured_margin` and JAX, with CPU and GPU agreeing bit for bit.
+  In the C API it is `dbs_set_extra_eos_tokens` (ABI 10 unchanged); on CUDA
+  it is `dbs_cuda_decode_ex2` and `dbs_cuda_decode_step_ex2`
+  (`DBSCudaSearchOptions`, up to 16 extra tokens). The operators
+  `beamgrad::decode_ex` and `decode_step` take `extra_eos=[]`.
+
 ### Fixed
 
 - `pip install beamgrad` (the source distribution) no longer fails when the

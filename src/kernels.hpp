@@ -60,13 +60,23 @@ struct RowScan {
     int new_length;            // parent length + 1
     int vocab_size;
     int forced_token;          // >= 0: only this token is a candidate
-    int masked_token;          // >= 0: this token is excluded (EOS below min_length)
+    // Tokens excluded from the row (the EOS tokens below min_length): masked_count
+    // distinct ids in increasing order, each in [0, vocab_size).
+    const int32_t* masked_tokens = nullptr;
+    int masked_count = 0;
     bool has_offset = false;
     float offset = 0.0f;       // subtracted from every entry when has_offset (finite)
 };
 
 inline float row_log_prob(const RowScan& s, int v) noexcept {
     return s.has_offset ? det::sub(s.row[v], s.offset) : s.row[v];
+}
+
+inline bool is_masked(const RowScan& s, int v) noexcept {
+    for (int i = 0; i < s.masked_count; ++i) {
+        if (s.masked_tokens[i] == v) return true;
+    }
+    return false;
 }
 
 // Inserts every finite, allowed candidate of the row into `top` (a descending
@@ -97,7 +107,7 @@ bool scan_row(const RowScan& scan, Candidate* top, int top_count);
 }
 #endif
 
-// Scalar reference for one token (the masked token is handled by the caller,
+// Scalar reference for one token (masked tokens are handled by the caller,
 // see scan_around_masked); the SIMD kernels use it for their tails. Returns
 // true if row[v] is NaN or +inf.
 inline bool scan_token(const RowScan& s, int v, Candidate* top, int top_count) noexcept {
@@ -111,15 +121,21 @@ inline bool scan_token(const RowScan& s, int v, Candidate* top, int top_count) n
     return false;
 }
 
-// Runs scan_range(begin, end) over the row without the masked token, which is
-// only checked for NaN/+inf, and returns whether any entry was NaN or +inf.
+// Runs scan_range(begin, end) over the ranges of the row between the masked
+// tokens, which are only checked for NaN/+inf, and returns whether any entry
+// was NaN or +inf. (The top-k buffer does not depend on the order in which
+// candidates are inserted.)
 template <class ScanRange>
 inline bool scan_around_masked(const RowScan& s, ScanRange&& scan_range) {
-    const int m = s.masked_token;
-    if (m < 0) return scan_range(0, s.vocab_size);
-    bool invalid = !(row_log_prob(s, m) < std::numeric_limits<float>::infinity());
-    invalid |= scan_range(0, m);
-    invalid |= scan_range(m + 1, s.vocab_size);
+    bool invalid = false;
+    int begin = 0;
+    for (int i = 0; i < s.masked_count; ++i) {
+        const int m = s.masked_tokens[i];
+        invalid |= !(row_log_prob(s, m) < std::numeric_limits<float>::infinity());
+        if (m > begin) invalid |= scan_range(begin, m);
+        begin = m + 1;
+    }
+    if (begin < s.vocab_size) invalid |= scan_range(begin, s.vocab_size);
     return invalid;
 }
 

@@ -37,13 +37,14 @@ finished flag. At every step `t`:
    where `penalty(l) = ((5 + max(l, 1)) / 6) ** alpha` is the GNMT length
    penalty (`alpha = 0` disables it, so `score == raw`).
 
-2. **Carry finished beams.** A beam that has emitted EOS is finished. Instead
-   of expanding it, it proposes one candidate that repeats EOS with its score,
-   raw score and length unchanged. Finished hypotheses therefore compete
-   fairly with longer ones at every later step.
+2. **Carry finished beams.** A beam that has emitted EOS (any of the EOS
+   tokens, when there are several) is finished. Instead of expanding it, it
+   proposes one candidate that repeats that EOS token with its score, raw
+   score and length unchanged. Finished hypotheses therefore compete fairly
+   with longer ones at every later step.
 
 3. **Mask early EOS and apply constraints.** While a hypothesis is shorter
-   than `min_length` tokens (counting the EOS itself), EOS is not proposed.
+   than `min_length` tokens (counting the EOS itself), no EOS token is proposed.
    Banned tokens are never proposed. With `no_repeat_ngram_size = n`, a beam
    does not propose a token that would complete an n-gram already present in
    its own prefix. With `repetition_penalty = r > 1`, a token already in the

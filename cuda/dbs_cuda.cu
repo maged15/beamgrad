@@ -84,6 +84,11 @@ constexpr int kBackwardThreads = 256;
 constexpr int64_t kMaxStepBlocks = 65535;     // blocks of the backward's per-step kernels (each loops over steps)
 constexpr int kCorrectionItems = 8;           // vocabulary entries per thread in logit_correction_kernel
 constexpr int64_t kMaxLseBlocks = 1 << 20;    // blocks of row_lse_kernel (each loops over rows)
+// With extra EOS tokens, the engine's internal copy of the arguments points
+// banned_tokens at a [V] array of these flags and sets reserved0 (which callers
+// must leave 0), so the scans read one array and ScanParams keeps its size.
+constexpr uint8_t kFlagBanned = 1;
+constexpr uint8_t kFlagEos = 2;
 constexpr int64_t kAlign = 256;               // workspace sub-buffer alignment
 
 static_assert(kTile % kThreads == 0, "tile must be a multiple of the block size");
@@ -147,6 +152,11 @@ __device__ __forceinline__ Meta load_meta(const DBSCudaDecodeArgs& a, int b) {
     m.eos = a.eos_tokens_per_example ? a.eos_tokens_per_example[b] : a.eos_token;
     m.min_length = a.min_lengths_per_example ? a.min_lengths_per_example[b] : a.min_length;
     return m;
+}
+
+// Whether `token` is one of the extra EOS tokens (see kFlagEos).
+__device__ __forceinline__ bool extra_eos(const DBSCudaDecodeArgs& a, int token) {
+    return a.reserved0 != 0 && a.banned_tokens && (a.banned_tokens[token] & kFlagEos) != 0;
 }
 
 // Bitonic sort of n (a power of two) keys in shared memory, descending or
@@ -342,8 +352,11 @@ __device__ __forceinline__ uint64_t candidate_key(
         lp = __fsub_rn(x, lse);
     }
     if (lp == neg_inf()) return 0;
-    if (p.a.banned_tokens && p.a.banned_tokens[token]) return 0;
-    if (m.eos >= 0 && token == m.eos && parent_len + 1 < m.min_length) return 0;
+    const uint8_t flags = p.a.banned_tokens ? p.a.banned_tokens[token] : 0;
+    // flags is the caller's banned mask, or kFlag* bits with extra EOS tokens.
+    if (p.a.reserved0 != 0 ? (flags & kFlagBanned) != 0 : flags != 0) return 0;
+    const bool eos = m.eos >= 0 && (token == m.eos || (p.a.reserved0 != 0 && (flags & kFlagEos) != 0));
+    if (eos && parent_len + 1 < m.min_length) return 0;
     float value = lp;
     if (p.blocked) {
         const int64_t word = (static_cast<int64_t>(b) * K + parent) * p.words + (token >> 5);
@@ -372,7 +385,7 @@ __global__ void validate_meta_kernel(DBSCudaDecodeArgs a, int* status) {
 }
 
 __global__ void init_state_kernel(DBSCudaDecodeArgs a, float* beam_raw, int32_t* beam_len, uint8_t* beam_ended,
-                                  uint8_t* invalid) {
+                                  int32_t* beam_last, uint8_t* invalid) {
     const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     const int64_t total = static_cast<int64_t>(a.batch_size) * a.beam_size;
     if (i >= total) return;
@@ -382,7 +395,35 @@ __global__ void init_state_kernel(DBSCudaDecodeArgs a, float* beam_raw, int32_t*
     beam_raw[i] = (k == 0 && k < m.beam) ? 0.0f : neg_inf();
     beam_len[i] = 0;
     beam_ended[i] = 0;
+    if (beam_last) beam_last[i] = -1;
     if (invalid && k == 0) invalid[b] = 0;
+}
+
+// Extra EOS tokens by value, so that no host memory has to outlive the launch.
+struct ExtraEos {
+    int count;
+    int32_t tokens[DBS_CUDA_MAX_EXTRA_EOS];
+};
+
+// One thread per token: the kFlag* flags of the scans (see kFlagBanned).
+__global__ void token_flags_kernel(int V, const uint8_t* __restrict__ banned, ExtraEos extra, uint8_t* __restrict__ flags) {
+    const int64_t v = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (v >= V) return;
+    uint8_t f = banned && banned[v] ? kFlagBanned : 0;
+    for (int i = 0; i < extra.count; ++i) {
+        if (extra.tokens[i] == v) f = static_cast<uint8_t>(f | kFlagEos);
+    }
+    flags[v] = f;
+}
+
+// Step API with extra EOS tokens: the last token of each beam's prefix (-1 when
+// the prefix does not cover the hypothesis), which a finished beam carries.
+__global__ void last_token_kernel(int64_t beams, const int32_t* __restrict__ prefixes, int stride,
+                                  const int32_t* __restrict__ lengths, int32_t* __restrict__ last) {
+    const int64_t i = static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (i >= beams) return;
+    const int len = lengths[i];
+    last[i] = prefixes && len >= 1 && len <= stride ? prefixes[i * stride + len - 1] : -1;
 }
 
 // Constraint state of one beam slot: its token prefix (double-buffered across
@@ -724,6 +765,7 @@ struct SelectShared {
             float c_raw[kMaxBeam];
             int32_t c_parent[kMaxBeam];
             int32_t c_len[kMaxBeam];
+            int32_t c_token[kMaxBeam];
         } m;
     } u;
 };
@@ -737,6 +779,7 @@ __global__ void select_step_kernel(
     float* __restrict__ beam_raw,
     int32_t* __restrict__ beam_len,
     uint8_t* __restrict__ beam_ended,
+    int32_t* __restrict__ beam_last,
     StepOutputs out,
     PrefixBuffers prefixes) {
     __shared__ SelectShared sh;
@@ -817,6 +860,13 @@ __global__ void select_step_kernel(
                     sh.u.m.c_raw[n_carry] = raw;
                     sh.u.m.c_parent[n_carry] = p;
                     sh.u.m.c_len[n_carry] = len;
+                    // The EOS token the beam ended with (beam_last is kept only with extra EOS tokens).
+                    int token = m.eos;
+                    if (beam_last) {
+                        const int last = beam_last[static_cast<int64_t>(b) * K + p];
+                        if (last >= 0 && last < V && (last == m.eos || extra_eos(a, last))) token = last;
+                    }
+                    sh.u.m.c_token[n_carry] = token;
                     ++n_carry;
                 }
             }
@@ -851,7 +901,7 @@ __global__ void select_step_kernel(
         c.score = sh.u.m.c_score[j];
         c.raw = sh.u.m.c_raw[j];
         c.parent = sh.u.m.c_parent[j];
-        c.token = m.eos;
+        c.token = sh.u.m.c_token[j];
         c.length = sh.u.m.c_len[j];
         c.from_logprob = 0;
         return c;
@@ -862,7 +912,8 @@ __global__ void select_step_kernel(
         const int64_t s = static_cast<int64_t>(b) * K + pos;
         beam_raw[s] = c.raw;
         beam_len[s] = c.length;
-        beam_ended[s] = static_cast<uint8_t>(c.from_logprob ? (c.token == m.eos && m.eos >= 0) : 1);
+        beam_ended[s] = static_cast<uint8_t>(c.from_logprob ? (m.eos >= 0 && (c.token == m.eos || extra_eos(a, c.token))) : 1);
+        if (beam_last) beam_last[s] = c.token;
         if (prefixes.next_prefix) {
             // The new hypothesis' prefix: its parent's, plus the token it emitted.
             const int64_t from = static_cast<int64_t>(b) * K + c.parent;
@@ -898,6 +949,7 @@ __global__ void select_step_kernel(
         beam_raw[s] = neg_inf();
         beam_len[s] = 0;
         beam_ended[s] = 0;
+        if (beam_last) beam_last[s] = -1;
         if (prefixes.next_prefix) prefixes.next_prefix_len[s] = 0;
     }
 }
@@ -1245,6 +1297,8 @@ struct DecodePlan {
     int64_t keys1_offset;
     int64_t status_offset;
     int64_t lse_offset;  // [B, T, K] logsumexp of the rows (decoding from logits)
+    int64_t flags_offset;  // [V] kFlag* token flags (extra EOS tokens)
+    int64_t last_offset;   // [B, K] each beam's last token (extra EOS tokens)
     // Constraint buffers (only when n-gram blocking or a repetition penalty is on).
     int64_t prefix_offset[2];
     int64_t prefix_len_offset[2];
@@ -1282,6 +1336,8 @@ DecodePlan make_plan(const DBSCudaDecodeArgs& a, int prefix_stride = -1) {
     p.keys1_offset = take(B * n1 * static_cast<int64_t>(sizeof(uint64_t)));
     p.status_offset = take(static_cast<int64_t>(sizeof(int)));
     p.lse_offset = take(B * T * K * static_cast<int64_t>(sizeof(float)));
+    p.flags_offset = take(a.vocab_size);
+    p.last_offset = take(B * K * static_cast<int64_t>(sizeof(int32_t)));
     if (constrained(a)) {
         p.words = static_cast<int>(ceil_div(a.vocab_size, 32));
         p.prefix_stride = prefix_stride < 0 ? a.steps : prefix_stride;
@@ -1457,7 +1513,7 @@ bool prepare_constraints(const DecodePlan& plan, const DBSCudaDecodeArgs& a, con
 // state in place.
 void launch_step(const DecodePlan& plan, const ScanParams& params, int dtype, const ConstraintState* cons,
                  const PrefixBuffers& prefixes, int t, float* beam_raw, int32_t* beam_len, uint8_t* beam_ended,
-                 uint64_t* keys0, uint64_t* keys1, const StepOutputs& step_out, cudaStream_t stream) {
+                 int32_t* beam_last, uint64_t* keys0, uint64_t* keys1, const StepOutputs& step_out, cudaStream_t stream) {
     const DBSCudaDecodeArgs& a = params.a;
     const unsigned int B = static_cast<unsigned int>(a.batch_size);
     if (cons) {
@@ -1477,7 +1533,7 @@ void launch_step(const DecodePlan& plan, const ScanParams& params, int dtype, co
         dst = tmp;
     }
     DBS_LAUNCH(select_step_kernel, dim3(B), dim3(kThreads), stream,
-               a, t, src, n, beam_raw, beam_len, beam_ended, step_out, prefixes);
+               a, t, src, n, beam_raw, beam_len, beam_ended, beam_last, step_out, prefixes);
 }
 
 StepOutputs step_outputs(const DBSCudaDecodeOutputs& o, const float* lse, float* row_lse) {
@@ -1491,6 +1547,34 @@ StepOutputs step_outputs(const DBSCudaDecodeOutputs& o, const float* lse, float*
     s.lse = lse;
     s.row_lse = row_lse;
     return s;
+}
+
+bool valid_search_options(const DBSCudaSearchOptions* o, const DBSCudaDecodeArgs& a) {
+    if (!o) return true;
+    if (o->reserved0 != 0 || o->reserved[0] || o->reserved[1] || o->reserved[2] || o->reserved[3]) return false;
+    if (o->extra_eos_count < 0 || o->extra_eos_count > DBS_CUDA_MAX_EXTRA_EOS) return false;
+    for (int i = 0; i < o->extra_eos_count; ++i) {
+        if (o->extra_eos_tokens[i] < 0 || o->extra_eos_tokens[i] >= a.vocab_size) return false;
+    }
+    // Extra EOS tokens need EOS handling.
+    return o->extra_eos_count == 0 || a.eos_token >= 0 || a.eos_tokens_per_example;
+}
+
+// With extra EOS tokens: builds the token flags in the workspace and points the
+// engine's copy of the arguments at them (see kFlagBanned). Returns the [B, K]
+// last-token state, or null without extra EOS tokens.
+int32_t* use_extra_eos(const DBSCudaSearchOptions* o, const DecodePlan& plan, const Workspace& ws, DBSCudaDecodeArgs& a,
+                       cudaStream_t stream) {
+    if (!o || o->extra_eos_count == 0) return nullptr;
+    ExtraEos extra{};
+    extra.count = o->extra_eos_count;
+    for (int i = 0; i < extra.count; ++i) extra.tokens[i] = o->extra_eos_tokens[i];
+    uint8_t* flags = ws.at<uint8_t>(plan.flags_offset);
+    DBS_LAUNCH(token_flags_kernel, dim3(static_cast<unsigned int>(ceil_div(a.vocab_size, kThreads))), dim3(kThreads),
+               stream, a.vocab_size, a.banned_tokens, extra, flags);
+    a.banned_tokens = flags;
+    a.reserved0 = 1;
+    return ws.at<int32_t>(plan.last_offset);
 }
 
 // From logits: the logsumexp of every row of `inputs`, into lse [B, steps, K].
@@ -1549,11 +1633,12 @@ extern "C" DBS_CUDA_EXPORT int64_t dbs_cuda_backward_workspace_size(const DBSCud
     return make_backward_plan(*args).total_bytes;
 }
 
-extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_ex(
+extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_ex2(
     const void* inputs,
     int data_type,
     int from_logits,
     const DBSCudaDecodeArgs* args,
+    const DBSCudaSearchOptions* options,
     const DBSCudaDecodeOutputs* outputs,
     float* row_lse,
     void* workspace,
@@ -1562,7 +1647,8 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_ex(
     if (!inputs || !valid_dtype(data_type) || !valid_args(args) || !outputs || !outputs->final_scores) {
         return DBS_CUDA_STATUS_INVALID_ARGUMENT;
     }
-    const DBSCudaDecodeArgs& a = *args;
+    if (!valid_search_options(options, *args)) return DBS_CUDA_STATUS_INVALID_ARGUMENT;
+    DBSCudaDecodeArgs a = *args;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const DecodePlan plan = make_plan(a);
     Workspace ws(workspace, workspace_bytes, plan.total_bytes, stream);
@@ -1578,7 +1664,9 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_ex(
     if (rc != DBS_CUDA_STATUS_OK) return rc;
     const int64_t beams = static_cast<int64_t>(a.batch_size) * a.beam_size;
     const dim3 beam_grid(static_cast<unsigned int>(ceil_div(beams, kThreads)));
-    DBS_LAUNCH(init_state_kernel, beam_grid, dim3(kThreads), stream, a, beam_raw, beam_len, beam_ended, outputs->invalid_input);
+    int32_t* beam_last = use_extra_eos(options, plan, ws, a, stream);
+    DBS_LAUNCH(init_state_kernel, beam_grid, dim3(kThreads), stream, a, beam_raw, beam_len, beam_ended, beam_last,
+               outputs->invalid_input);
 
     ScanParams params{};
     params.a = a;
@@ -1615,12 +1703,26 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_ex(
             prefixes.next_prefix_len = prefix_len[(t + 1) & 1];
         }
         launch_step(plan, params, data_type, with_constraints ? &cons : nullptr, prefixes, t, beam_raw, beam_len, beam_ended,
-                    keys0, keys1, step_out, stream);
+                    beam_last, keys0, keys1, step_out, stream);
     }
 
     DBS_LAUNCH(finalize_kernel, beam_grid, dim3(kThreads), stream,
                a, beam_raw, beam_len, outputs->final_scores, outputs->final_raw_scores, outputs->final_lengths);
     return finish(stream);
+}
+
+extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_ex(
+    const void* inputs,
+    int data_type,
+    int from_logits,
+    const DBSCudaDecodeArgs* args,
+    const DBSCudaDecodeOutputs* outputs,
+    float* row_lse,
+    void* workspace,
+    int64_t workspace_bytes,
+    void* stream) {
+    return dbs_cuda_decode_ex2(inputs, data_type, from_logits, args, nullptr, outputs, row_lse, workspace,
+                               workspace_bytes, stream);
 }
 
 extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode(
@@ -1638,11 +1740,12 @@ extern "C" DBS_CUDA_EXPORT int64_t dbs_cuda_decode_step_workspace_size(const DBS
     return make_plan(*args, prefix_stride).total_bytes;
 }
 
-extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_step_ex(
+extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_step_ex2(
     const void* inputs,
     int data_type,
     int from_logits,
     const DBSCudaDecodeArgs* args,
+    const DBSCudaSearchOptions* options,
     const DBSCudaBeamState* state,
     const DBSCudaDecodeOutputs* outputs,
     float* row_lse,
@@ -1650,7 +1753,8 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_step_ex(
     int64_t workspace_bytes,
     void* stream_ptr) {
     if (!inputs || !valid_dtype(data_type) || !valid_args(args) || !state || !outputs) return DBS_CUDA_STATUS_INVALID_ARGUMENT;
-    const DBSCudaDecodeArgs& a = *args;
+    if (!valid_search_options(options, *args)) return DBS_CUDA_STATUS_INVALID_ARGUMENT;
+    DBSCudaDecodeArgs a = *args;
     if (a.steps != 1 || a.steps_per_example) return DBS_CUDA_STATUS_INVALID_ARGUMENT;
     if (!state->raw_scores || !state->lengths || !state->finished || state->prefix_stride < 0 || state->reserved0 != 0) {
         return DBS_CUDA_STATUS_INVALID_ARGUMENT;
@@ -1669,6 +1773,12 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_step_ex(
         return DBS_CUDA_STATUS_LAUNCH_FAILED;
     }
     const int64_t beams = static_cast<int64_t>(a.batch_size) * a.beam_size;
+    int32_t* beam_last = use_extra_eos(options, plan, ws, a, stream);
+    if (beam_last) {
+        // The token each finished beam carries forward: the last of its prefix.
+        DBS_LAUNCH(last_token_kernel, dim3(static_cast<unsigned int>(ceil_div(beams, kThreads))), dim3(kThreads), stream,
+                   beams, state->prefixes, state->prefix_stride, static_cast<const int32_t*>(state->lengths), beam_last);
+    }
 
     ScanParams params{};
     params.a = a;
@@ -1684,7 +1794,7 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_step_ex(
     }
     const PrefixBuffers no_prefixes{};  // the caller tracks the prefixes
     launch_step(plan, params, data_type, with_constraints ? &cons : nullptr, no_prefixes, 0, state->raw_scores, state->lengths,
-                state->finished, ws.at<uint64_t>(plan.keys0_offset), ws.at<uint64_t>(plan.keys1_offset),
+                state->finished, beam_last, ws.at<uint64_t>(plan.keys0_offset), ws.at<uint64_t>(plan.keys1_offset),
                 step_outputs(*outputs, params.row_lse, row_lse), stream);
     if (outputs->final_scores) {
         DBS_LAUNCH(finalize_kernel, dim3(static_cast<unsigned int>(ceil_div(beams, kThreads))), dim3(kThreads), stream,
@@ -1692,6 +1802,21 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_step_ex(
                    outputs->final_lengths);
     }
     return finish(stream);
+}
+
+extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_step_ex(
+    const void* inputs,
+    int data_type,
+    int from_logits,
+    const DBSCudaDecodeArgs* args,
+    const DBSCudaBeamState* state,
+    const DBSCudaDecodeOutputs* outputs,
+    float* row_lse,
+    void* workspace,
+    int64_t workspace_bytes,
+    void* stream) {
+    return dbs_cuda_decode_step_ex2(inputs, data_type, from_logits, args, nullptr, state, outputs, row_lse, workspace,
+                                    workspace_bytes, stream);
 }
 
 extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_step(

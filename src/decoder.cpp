@@ -54,6 +54,13 @@ public:
           selected_scores_(K_, kNegInf),
           top_(static_cast<size_t>(P_)) {
         raw_[0] = 0.0f;
+        if (eos_ >= 0) {
+            // Every end-of-sequence token, distinct and in increasing order.
+            eos_set_.push_back(eos_);
+            eos_set_.insert(eos_set_.end(), opt.extra_eos_tokens.begin(), opt.extra_eos_tokens.end());
+            std::sort(eos_set_.begin(), eos_set_.end());
+            eos_set_.erase(std::unique(eos_set_.begin(), eos_set_.end()), eos_set_.end());
+        }
         if (with_pool_) pool_scores_.assign(static_cast<size_t>(P_), kNegInf);
         if (c_) {
             penalise_ = c_->repetition_penalty > 1.0f;
@@ -83,6 +90,10 @@ public:
             raw_[i] = raw[k];
             len_[i] = lengths[k];
             ended_[i] = finished[k] != 0 ? 1 : 0;
+            // A finished beam's last token (its EOS), from its prefix when given.
+            tokens_[i] = prefixes && lengths[k] >= 1 && lengths[k] <= prefix_stride
+                             ? prefixes[i * static_cast<size_t>(prefix_stride) + static_cast<size_t>(lengths[k] - 1)]
+                             : -1;
             if (constrained_) {
                 const int n = std::max(0, std::min(lengths[k], prefix_stride));
                 const int32_t* row = prefixes + i * static_cast<size_t>(prefix_stride);
@@ -118,10 +129,12 @@ public:
             if (!std::isfinite(parent_raw)) continue;
 
             if (eos_ >= 0 && ended_[static_cast<size_t>(b)]) {
-                // A finished beam competes with its unchanged score.
+                // A finished beam competes with its unchanged score, and carries
+                // the EOS token it ended with.
                 const int len = std::max(1, static_cast<int>(len_[static_cast<size_t>(b)]));
                 const float rank = parent_raw / gnmt_length_penalty(len, alpha_);
-                insert_topk(top_.data(), P_, Candidate{rank, parent_raw, b, eos_, len, 0});
+                const int32_t last = tokens_[static_cast<size_t>(b)];
+                insert_topk(top_.data(), P_, Candidate{rank, parent_raw, b, is_eos(last) ? last : eos_, len, 0});
                 continue;
             }
 
@@ -147,7 +160,10 @@ public:
             s.parent = b;
             s.vocab_size = V_;
             s.forced_token = forced;
-            s.masked_token = eos_ >= 0 && s.new_length < min_length_ ? eos_ : -1;
+            if (s.new_length < min_length_) {
+                s.masked_tokens = eos_set_.data();
+                s.masked_count = static_cast<int>(eos_set_.size());
+            }
 
             const bool invalid = constrained_ ? scan_constrained(s, t) : scan_row(s, top_.data(), P_);
             if (invalid && opt_.validate_inputs) {
@@ -171,6 +187,10 @@ public:
     }
 
 private:
+    bool is_eos(int32_t token) const noexcept {
+        return std::binary_search(eos_set_.begin(), eos_set_.end(), token);
+    }
+
     // Prefix tokens outside the vocabulary (only possible in a caller-supplied
     // state, see restore) are ignored.
     void mark(int token, uint8_t bit) {
@@ -225,7 +245,7 @@ private:
             for (int32_t v : penalised_) {
                 if (mask_[static_cast<size_t>(v)] & (kBanned | kNgram)) continue;
                 if (s.forced_token >= 0 && v != s.forced_token) continue;
-                if (v == s.masked_token) continue;
+                if (is_masked(s, v)) continue;
                 const float lp = row_log_prob(s, v);
                 if (!(lp < kInf) || lp == kNegInf) continue;
                 const float raw = s.parent_raw + (lp - log_penalty_);
@@ -247,7 +267,7 @@ private:
             if (s.forced_token >= 0 && v != s.forced_token) continue;
             const uint8_t m = mask_[static_cast<size_t>(v)];
             if (m & kBanned) continue;
-            if (v == s.masked_token) continue;
+            if (is_masked(s, v)) continue;
             if (m & kNgram) continue;
             const int allowed = c_->token_filter(
                 c_->token_filter_user_data, c_->batch_index, t, s.parent,
@@ -311,7 +331,7 @@ private:
             tokens_[i] = c.token;
             if (c.parent >= 0) {
                 const size_t parent = static_cast<size_t>(c.parent);
-                next_ended_[i] = static_cast<uint8_t>(ended_[parent] != 0 || (eos_ >= 0 && c.token == eos_));
+                next_ended_[i] = static_cast<uint8_t>(ended_[parent] != 0 || is_eos(c.token));
                 if (constrained_) {
                     next_prefix_[i] = prefix_[parent];
                     if (c.from_logprob && c.token >= 0) next_prefix_[i].push_back(c.token);
@@ -339,6 +359,7 @@ private:
     bool from_logits_;
     float alpha_;
     int eos_;
+    std::vector<int32_t> eos_set_;  // every EOS token, sorted; empty when eos_ < 0
     int min_length_;
     bool constrained_ = false;  // n-gram blocking, repetition penalty or a token filter
     bool penalise_ = false;
@@ -365,6 +386,9 @@ void check_decode_args(const BeamOptions& opt, int steps, int vocab_size, const 
     if (steps <= 0) throw std::invalid_argument("steps must be positive");
     if (vocab_size <= 0) throw std::invalid_argument("vocab_size must be positive");
     if (opt.eos_token >= vocab_size) throw std::invalid_argument("eos_token is outside the vocabulary");
+    for (int32_t token : opt.extra_eos_tokens) {
+        if (token >= vocab_size) throw std::invalid_argument("an extra EOS token is outside the vocabulary");
+    }
     if (constraints) {
         if (constraints->forced_tokens) {
             for (int t = 0; t < steps; ++t) {
@@ -674,6 +698,12 @@ BeamSearchDecoder::BeamSearchDecoder(BeamOptions options)
     : opt_(options) {
     if (opt_.beam_size <= 0) throw std::invalid_argument("beam_size must be positive");
     if (opt_.eos_token < -1) throw std::invalid_argument("eos_token must be -1 (disabled) or a token id");
+    for (int32_t token : opt_.extra_eos_tokens) {
+        if (token < 0) throw std::invalid_argument("extra EOS tokens must be token ids");
+    }
+    if (!opt_.extra_eos_tokens.empty() && opt_.eos_token < 0) {
+        throw std::invalid_argument("extra EOS tokens need EOS handling: set eos_token to one of the EOS tokens");
+    }
     if (!(opt_.selected_temperature > 0.0f) || !std::isfinite(opt_.selected_temperature)) {
         throw std::invalid_argument("selected_temperature must be finite and positive");
     }

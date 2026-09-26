@@ -55,6 +55,12 @@ default, so `DBSOptionsC opt = {0}` is valid; explicit negative or non-finite
 values are rejected by `dbs_create_ex`. **Note:** `eos_token = 0` means
 token 0, so set it to `-1` to disable EOS handling.
 
+For models with several EOS tokens, `dbs_set_extra_eos_tokens(handle, tokens,
+count)` adds more to a decoder (`eos_token` must then be `>= 0`). A hypothesis
+finishes when it emits any of them, `min_length` masks all of them, and a
+finished beam is carried forward with the token it ended with. `count = 0`
+removes them.
+
 | field | default | meaning |
 |---|---|---|
 | `beam_size` | 8 | beams `K` |
@@ -230,6 +236,10 @@ int status = dbs_cuda_decode(d_log_probs, &args, &out, NULL, 0, stream);
   through the rows of a tensor selects exactly what `dbs_cuda_decode` selects.
   Its workspace size is `dbs_cuda_decode_step_workspace_size(&args,
   prefix_stride)`. `beamgrad.beam_search` is built on it.
+- `dbs_cuda_decode_ex2` and `dbs_cuda_decode_step_ex2` take a
+  `DBSCudaSearchOptions` as well: up to `DBS_CUDA_MAX_EXTRA_EOS` (16) extra EOS
+  tokens, as `dbs_set_extra_eos_tokens` gives the CPU decoder. The step
+  function reads the token a finished beam carries from its prefix.
 - `dbs_cuda_backward` takes the `parents`, `tokens`, `lengths` and
   `from_logprob` outputs plus `grad_final_scores [B, K]` and accumulates the
   final-score gradient into `grad_log_probs [B, T, K, V]`.

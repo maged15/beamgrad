@@ -81,7 +81,8 @@ std::vector<float> make_log_probs(const Case& c, std::mt19937& rng) {
 // would; every step output, the final scores, the NaN/+inf flags and (from
 // logits) the rows' logsumexp must equal the full decode's.
 int check_step_api(const Case& c, const void* x, int dtype, int from_logits, DBSCudaDecodeArgs args,
-                   const GpuResult& g, const std::vector<uint8_t>& invalid_full) {
+                   const GpuResult& g, const std::vector<uint8_t>& invalid_full,
+                   const DBSCudaSearchOptions* search = nullptr) {
     args.steps = 1;
     const size_t BK = static_cast<size_t>(c.B) * c.K;
     const size_t V = static_cast<size_t>(c.V);
@@ -115,7 +116,10 @@ int check_step_api(const Case& c, const void* x, int dtype, int from_logits, DBS
         out.final_raw_scores = last ? final_raw.data() : nullptr;
         out.final_lengths = last ? final_len.data() : nullptr;
         const DBSCudaBeamState state{raw.data(), len.data(), finished.data(), paths.data(), c.T, 0};
-        if (dtype == DBS_CUDA_DTYPE_F32 && !from_logits && t % 2 == 0) {
+        if (search) {
+            CHECK(dbs_cuda_decode_step_ex2(rows.data(), dtype, from_logits, &args, search, &state, &out, row_lse.data(),
+                                           nullptr, 0, nullptr) == DBS_CUDA_STATUS_OK);
+        } else if (dtype == DBS_CUDA_DTYPE_F32 && !from_logits && t % 2 == 0) {
             CHECK(dbs_cuda_decode_step(reinterpret_cast<const float*>(rows.data()), &args, &state, &out, nullptr, 0,
                                        nullptr) == DBS_CUDA_STATUS_OK);
             std::fill(row_lse.begin(), row_lse.end(), 0.0f);
@@ -392,7 +396,7 @@ std::vector<unsigned char> encode(const std::vector<float>& x, int dtype) {
 // stay ties), and with value_mode 2 some rows have no finite entry at all. The
 // batch API has one beam size and EOS per batch, so `variable` only varies the
 // steps per example.
-int run_ex_case(const Case& c, int dtype, int from_logits, uint32_t seed) {
+int run_ex_case(const Case& c, int dtype, int from_logits, uint32_t seed, const std::vector<int32_t>& extra_eos = {}) {
     std::mt19937 rng(seed);
     std::vector<float> values = make_log_probs(c, rng);
     const size_t B = static_cast<size_t>(c.B), T = static_cast<size_t>(c.T), K = static_cast<size_t>(c.K);
@@ -453,8 +457,16 @@ int run_ex_case(const Case& c, int dtype, int from_logits, uint32_t seed) {
     out.scores = g.scores.data();
     out.raw_scores = g.raw_scores.data();
     out.from_logprob = g.from_logprob.data();
-    CHECK(dbs_cuda_decode_ex(data.data(), dtype, from_logits, &args, &out, g.row_lse.data(), nullptr, 0, nullptr) ==
-          DBS_CUDA_STATUS_OK);
+    DBSCudaSearchOptions search{};
+    search.extra_eos_count = static_cast<int>(extra_eos.size());
+    for (size_t i = 0; i < extra_eos.size(); ++i) search.extra_eos_tokens[i] = extra_eos[i];
+    if (extra_eos.empty()) {
+        CHECK(dbs_cuda_decode_ex(data.data(), dtype, from_logits, &args, &out, g.row_lse.data(), nullptr, 0, nullptr) ==
+              DBS_CUDA_STATUS_OK);
+    } else {
+        CHECK(dbs_cuda_decode_ex2(data.data(), dtype, from_logits, &args, &search, &out, g.row_lse.data(), nullptr, 0,
+                                  nullptr) == DBS_CUDA_STATUS_OK);
+    }
 
     DBSOptionsC opt{};
     opt.beam_size = c.K;
@@ -464,6 +476,7 @@ int run_ex_case(const Case& c, int dtype, int from_logits, uint32_t seed) {
     opt.validate_inputs = 0;
     DBSDecoderHandle* h = nullptr;
     CHECK(dbs_create_ex(opt, &h) == 0);
+    CHECK(dbs_set_extra_eos_tokens(h, extra_eos.data(), static_cast<int>(extra_eos.size())) == 0);
     DBSAdvancedConstraintsC constraints{};
     constraints.min_length = -1;
     constraints.banned_tokens = c.banned ? banned.data() : nullptr;
@@ -522,6 +535,7 @@ int run_ex_case(const Case& c, int dtype, int from_logits, uint32_t seed) {
     strict.validate_inputs = 1;
     DBSDecoderHandle* hs = nullptr;
     CHECK(dbs_create_ex(strict, &hs) == 0);
+    CHECK(dbs_set_extra_eos_tokens(hs, extra_eos.data(), static_cast<int>(extra_eos.size())) == 0);
     const size_t example_bytes = T * K * V * dtype_bytes(dtype);
     std::vector<float> scratch(BTK * 2);
     for (size_t b = 0; b < B; ++b) {
@@ -589,7 +603,10 @@ int run_ex_case(const Case& c, int dtype, int from_logits, uint32_t seed) {
     }
     dbs_destroy(h);
 
-    if (!c.variable) mismatches += check_step_api(c, data.data(), dtype, from_logits, args, g, invalid);
+    if (!c.variable) {
+        mismatches += check_step_api(c, data.data(), dtype, from_logits, args, g, invalid,
+                                     extra_eos.empty() ? nullptr : &search);
+    }
     return mismatches;
 }
 
@@ -645,6 +662,74 @@ void test_ex_parity() {
     cases += 6;
     std::printf("cuda emulation _ex parity: %d cases x 3 types x 2 input kinds, %d failing runs\n", cases, failures);
     CHECK(failures == 0);
+}
+
+// Extra EOS tokens (DBSCudaSearchOptions) against dbs_set_extra_eos_tokens.
+// Heavy ties make every token, EOS tokens included, often the best.
+void test_extra_eos_parity() {
+    std::mt19937 rng(20261001);
+    int cases = 0;
+    int failures = 0;
+    for (int i = 0; i < 24; ++i) {
+        Case c{};
+        c.B = 1 + static_cast<int>(rng() % 3);
+        c.T = 2 + static_cast<int>(rng() % 5);
+        c.K = 1 + static_cast<int>(rng() % 6);
+        c.V = 3 + static_cast<int>(rng() % 12);
+        c.eos = static_cast<int>(rng() % c.V);
+        c.min_length = static_cast<int>(rng() % 3);
+        c.alpha = (rng() % 3) * 0.35f;
+        c.variable = rng() % 4 == 0;
+        c.value_mode = rng() % 2 ? 1 : 0;
+        if (rng() % 3 == 0) {
+            c.ngram = static_cast<int>(rng() % 3);
+            c.penalty = rng() % 2 ? 1.5f : 0.0f;
+            c.banned = rng() % 2 == 0;
+        }
+        std::vector<int32_t> extra;
+        for (int e = 1 + static_cast<int>(rng() % 3); e > 0; --e) extra.push_back(static_cast<int32_t>(rng() % c.V));
+        const int dtype = static_cast<int>(rng() % 3);
+        const int from_logits = static_cast<int>(rng() % 2);
+        const uint32_t seed = static_cast<uint32_t>(rng());
+        for (auto schedule : {dbs_emu::Schedule::Forward, dbs_emu::Schedule::Shuffled}) {
+            dbs_emu::set_schedule(schedule, seed);
+            failures += run_ex_case(c, dtype, from_logits, seed, extra) != 0 ? 1 : 0;
+        }
+        ++cases;
+    }
+    // The tile scan (K > 16) and the maximum number of extra tokens.
+    std::vector<int32_t> many;
+    for (int v = 0; v < DBS_CUDA_MAX_EXTRA_EOS; ++v) many.push_back(v);
+    failures += run_ex_case(Case{2, 4, 20, 40, 21, 1, 0.6f, false, 1, 0, 0.0f, true}, DBS_CUDA_DTYPE_BF16, 1, 7, many);
+    cases += 1;
+    dbs_emu::set_schedule(dbs_emu::Schedule::Forward);
+    std::printf("cuda emulation extra EOS parity: %d cases, %d failing runs\n", cases, failures);
+    CHECK(failures == 0);
+
+    // Validation.
+    std::vector<float> x(2 * 3, -1.0f), scores(2);
+    DBSCudaDecodeOutputs out{};
+    out.final_scores = scores.data();
+    DBSCudaDecodeArgs a{};
+    a.batch_size = 1;
+    a.steps = 1;
+    a.beam_size = 2;
+    a.vocab_size = 3;
+    a.eos_token = 0;
+    DBSCudaSearchOptions o{};
+    o.extra_eos_count = 1;
+    o.extra_eos_tokens[0] = 3;  // outside the vocabulary
+    CHECK(dbs_cuda_decode_ex2(x.data(), 0, 0, &a, &o, &out, nullptr, nullptr, 0, nullptr) == DBS_CUDA_STATUS_INVALID_ARGUMENT);
+    o.extra_eos_tokens[0] = 2;
+    CHECK(dbs_cuda_decode_ex2(x.data(), 0, 0, &a, &o, &out, nullptr, nullptr, 0, nullptr) == DBS_CUDA_STATUS_OK);
+    o.extra_eos_count = DBS_CUDA_MAX_EXTRA_EOS + 1;
+    CHECK(dbs_cuda_decode_ex2(x.data(), 0, 0, &a, &o, &out, nullptr, nullptr, 0, nullptr) == DBS_CUDA_STATUS_INVALID_ARGUMENT);
+    o.extra_eos_count = 1;
+    o.reserved0 = 1;
+    CHECK(dbs_cuda_decode_ex2(x.data(), 0, 0, &a, &o, &out, nullptr, nullptr, 0, nullptr) == DBS_CUDA_STATUS_INVALID_ARGUMENT);
+    o.reserved0 = 0;
+    a.eos_token = -1;  // extra EOS tokens need EOS handling
+    CHECK(dbs_cuda_decode_ex2(x.data(), 0, 0, &a, &o, &out, nullptr, nullptr, 0, nullptr) == DBS_CUDA_STATUS_INVALID_ARGUMENT);
 }
 
 void test_ex_argument_validation() {
@@ -892,6 +977,7 @@ int main() {
     test_validation_flags();
     test_randomized_parity();
     test_ex_argument_validation();
+    test_extra_eos_parity();
     test_ex_parity();
     std::printf("cuda_emulation_tests passed\n");
     return 0;
