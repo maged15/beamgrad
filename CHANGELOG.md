@@ -19,6 +19,14 @@
   differentiates the final, per-step and raw scores, through the log-softmax
   from logits. The results equal the CPU's `_ex` functions bit for bit (the
   relaxed pool stays CPU-only).
+- PyTorch and JAX: `final_scores`, `decode` and `search` take
+  `from_logits=True` (`beamgrad.jax.final_scores` too). The search is then
+  the one over `log_softmax(logits)`, without materialising it, and the
+  gradient flows through the log-softmax. The operators are
+  `torch.ops.beamgrad.decode_ex` and `decode_backward`.
+- `beamgrad.decode` is differentiable: when the input requires grad, its
+  final, per-step and raw scores carry the path gradient. A loss can use any
+  of them.
 
 ### Changed
 
@@ -31,6 +39,11 @@
 - `dbs_cuda_backward_workspace_size` returns the scratch that
   `dbs_cuda_backward_ex` needs from logits, instead of 0. `dbs_cuda_backward`
   still needs none.
+- float16 and bfloat16 inputs are read as they are, on CPU and CUDA, instead
+  of being copied to float32 first. The results are the same.
+- `beamgrad.decode`'s scores now require grad when its input does (they were
+  always detached). Call it under `torch.no_grad()`, or on a detached input,
+  where that matters, for example before `.numpy()`.
 
 ## 2.1.1 (2026-09-26)
 

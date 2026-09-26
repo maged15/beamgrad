@@ -58,6 +58,11 @@ scores = beamgrad.final_scores(log_probs, options)             # [B, K], differe
 best = beamgrad.backtrack(beamgrad.decode(log_probs, options))[:, 0]   # [B, T] best sequence
 ```
 
+Raw logits work too (`from_logits=True`): each row the search reads is
+normalised on the fly, so no `[B, T, K, V]` tensor of log-probabilities is
+built, and the gradient flows through the log-softmax. float16 and bfloat16
+rows are read as they are.
+
 ## Features
 
 - **Exact beam search.** GNMT length penalty, EOS handling (finished beams are
@@ -94,7 +99,7 @@ best = beamgrad.backtrack(beamgrad.decode(log_probs, options))[:, 0]   # [B, T] 
   pick AVX-512, AVX2, SSE4.2 or NEON at runtime. A CUDA engine runs forward
   and backward on the GPU for beams up to 1024, on PyTorch's stream and
   allocator. Every backend selects the same beams with the same scores, bit
-  for bit.
+  for bit, from float32, float16 or bfloat16 log-probs or logits.
 - **A good PyTorch citizen.** The operators are registered with
   `torch.library`, with fake-tensor, autograd and vmap rules. So
   `final_scores`, `decode` and `search` work under `torch.compile` (even

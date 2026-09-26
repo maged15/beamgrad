@@ -99,3 +99,29 @@ def test_step_counts_beyond_int32_are_rejected():
     # Traced values cannot be checked eagerly; out-of-range ones fail in the library.
     with pytest.raises(Exception, match="steps"):
         jax.jit(lambda y, s: bjax.final_scores(y, options, steps=s))(x, jnp.asarray([4, 0])).block_until_ready()
+
+
+@pytest.mark.parametrize("shape", [(5, 3, 11), (2, 5, 3, 11)])
+def test_from_logits_matches_torch(shape):
+    x = np.random.default_rng(3).normal(size=shape).astype(np.float32) * 3.0
+    options = BeamOptions(beam_size=3, eos_token=2, length_penalty_alpha=0.4)
+    weights = np.linspace(-1.0, 1.0, 3, dtype=np.float32)
+
+    def loss(y):
+        return (bjax.final_scores(y, options, from_logits=True) * weights).sum()
+
+    value, grad = jax.value_and_grad(loss)(jnp.asarray(x))
+    xt = torch.from_numpy(x).requires_grad_(True)
+    expected = (beamgrad.final_scores(xt, options, from_logits=True) * torch.from_numpy(weights)).sum()
+    expected.backward()
+    np.testing.assert_array_equal(np.float32(value), np.float32(expected.item()))
+    np.testing.assert_array_equal(np.asarray(grad), xt.grad.numpy())
+    # Under jit and vmap too.
+    jitted = jax.jit(jax.grad(loss))(jnp.asarray(x))
+    np.testing.assert_array_equal(np.asarray(jitted), xt.grad.numpy())
+    if len(shape) == 4:
+        per_example = jax.vmap(jax.grad(loss))(jnp.asarray(x))
+        for b in range(shape[0]):
+            xb = torch.from_numpy(x[b]).requires_grad_(True)
+            (beamgrad.final_scores(xb, options, from_logits=True) * torch.from_numpy(weights)).sum().backward()
+            np.testing.assert_array_equal(np.asarray(per_example[b]), xb.grad.numpy())

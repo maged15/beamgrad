@@ -12,6 +12,19 @@
 //     -> final_scores[B,K], final_raw_scores[B,K], final_lengths[B,K] i32,
 //        tokens, parents, lengths [B,T,K] i32, scores, raw_scores [B,T,K] f32,
 //        from_logprob [B,T,K] u8
+//   beamgrad::decode_ex(inputs[B,T,K,V] f32/f16/bf16, from_logits, <the
+//                    arguments of decode after log_probs>)
+//     -> the outputs of decode, and row_lse [B,T,K] f32: with from_logits
+//        the inputs are logits, normalised on the fly, and row_lse is the
+//        logsumexp of each row the search read (0 elsewhere, and without
+//        from_logits). 16-bit inputs are read as they are, without a copy.
+//   beamgrad::decode_backward(grad_final_scores[B,K]?, grad_final_raw_scores[B,K]?,
+//                    grad_scores[B,T,K]?, grad_raw_scores[B,T,K]?, parents,
+//                    tokens, lengths, from_logprob, steps[B]?, vocab_size,
+//                    length_penalty_alpha, logits[B,T,K,V]?, row_lse[B,T,K]?)
+//     -> grad_inputs[B,T,K,V] f32: the surrogate gradient of the given decode
+//        outputs (all f32; any may be absent), through the log-softmax when
+//        logits and decode_ex's row_lse are given.
 //   beamgrad::final_scores_backward(grad_final[B,K], parents, tokens, lengths,
 //                    from_logprob, steps[B]?, vocab_size, length_penalty_alpha)
 //     -> grad_log_probs[B,T,K,V] f32
@@ -59,6 +72,7 @@ namespace {
 
 using Tensor = at::Tensor;
 using DecodeOutputs = std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>;
+using DecodeExOutputs = std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>;
 using StepOutputs = std::tuple<Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor>;
 
 constexpr int64_t kIntMax = std::numeric_limits<int>::max();
@@ -108,8 +122,20 @@ private:
     std::string message_;
 };
 
-DecodeOutputs decode_cpu(
-    const Tensor& log_probs,
+// The element type of a tensor of rows, which must be float32, float16 or bfloat16.
+dbs::DType row_type(const Tensor& t, const char* name) {
+    switch (t.scalar_type()) {
+        case torch::kFloat32: return dbs::DType::F32;
+        case torch::kFloat16: return dbs::DType::F16;
+        case torch::kBFloat16: return dbs::DType::BF16;
+        default: TORCH_CHECK_VALUE(false, name, " must be float32, float16 or bfloat16, got ", t.scalar_type());
+    }
+    return dbs::DType::F32;
+}
+
+DecodeExOutputs decode_ex_cpu(
+    const Tensor& inputs,
+    bool from_logits,
     const c10::optional<Tensor>& steps,
     int64_t eos_token,
     int64_t min_length,
@@ -118,10 +144,10 @@ DecodeOutputs decode_cpu(
     int64_t no_repeat_ngram_size,
     double repetition_penalty,
     bool validate) {
-    TORCH_CHECK(log_probs.device().is_cpu(), "beamgrad::decode (CPU) expects a CPU tensor");
-    TORCH_CHECK_VALUE(log_probs.scalar_type() == torch::kFloat32, "log_probs must be float32");
-    TORCH_CHECK_VALUE(log_probs.dim() == 4, "log_probs must have shape [B, T, K, V]");
-    const Tensor x = log_probs.contiguous();
+    TORCH_CHECK(inputs.device().is_cpu(), "beamgrad::decode (CPU) expects a CPU tensor");
+    const dbs::DType type = row_type(inputs, from_logits ? "logits" : "log_probs");
+    TORCH_CHECK_VALUE(inputs.dim() == 4, "inputs must have shape [B, T, K, V]");
+    const Tensor x = inputs.contiguous();
     const int64_t B = x.size(0), T = x.size(1), K = x.size(2), V = x.size(3);
     check_dim(B, "B");
     check_dim(T, "T");
@@ -168,8 +194,10 @@ DecodeOutputs decode_cpu(
     Tensor scores = torch::full({B, T, K}, neg_inf, f32);
     Tensor raw_scores = torch::full({B, T, K}, neg_inf, f32);
     Tensor from_logprob = torch::zeros({B, T, K}, torch::TensorOptions().dtype(torch::kUInt8));
+    Tensor row_lse = torch::zeros({B, T, K}, f32);  // the decoder writes the rows it reads
 
-    const float* xp = x.data_ptr<float>();
+    const char* xp = static_cast<const char*>(x.data_ptr());
+    const int64_t example_bytes = T * K * V * static_cast<int64_t>(dbs::dtype_size(type));
     FirstError error;
     at::parallel_for(0, B, 1, [&](int64_t begin, int64_t end) {
         for (int64_t b = begin; b < end; ++b) {
@@ -181,11 +209,12 @@ DecodeOutputs decode_cpu(
             out.scores = scores.data_ptr<float>() + trace;
             out.raw_scores = raw_scores.data_ptr<float>() + trace;
             out.from_logprob = from_logprob.data_ptr<uint8_t>() + trace;
+            out.row_lse = from_logits ? row_lse.data_ptr<float>() + trace : nullptr;
             dbs::DecodeConstraints c = constraints;
             c.batch_index = static_cast<int>(b);
             try {
-                decoder.decode_into(xp + b * T * K * V, dbs::DType::F32, /*from_logits=*/false,
-                                    steps_b[static_cast<size_t>(b)], static_cast<int>(V),
+                decoder.decode_into(xp + b * example_bytes, type, from_logits, steps_b[static_cast<size_t>(b)],
+                                    static_cast<int>(V),
                                     constrained ? &c : nullptr, out, final_scores.data_ptr<float>() + b * K,
                                     final_raw.data_ptr<float>() + b * K, final_lengths.data_ptr<int32_t>() + b * K);
             } catch (const std::invalid_argument& e) {
@@ -196,7 +225,24 @@ DecodeOutputs decode_cpu(
         }
     });
     error.raise_if_failed();
-    return {final_scores, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob};
+    return {final_scores, final_raw, final_lengths, tokens, parents, lengths, scores, raw_scores, from_logprob, row_lse};
+}
+
+DecodeOutputs decode_cpu(
+    const Tensor& log_probs,
+    const c10::optional<Tensor>& steps,
+    int64_t eos_token,
+    int64_t min_length,
+    double length_penalty_alpha,
+    const c10::optional<Tensor>& banned_tokens,
+    int64_t no_repeat_ngram_size,
+    double repetition_penalty,
+    bool validate) {
+    TORCH_CHECK_VALUE(log_probs.scalar_type() == torch::kFloat32, "log_probs must be float32");
+    const auto out = decode_ex_cpu(log_probs, false, steps, eos_token, min_length, length_penalty_alpha, banned_tokens,
+                                   no_repeat_ngram_size, repetition_penalty, validate);
+    return {std::get<0>(out), std::get<1>(out), std::get<2>(out), std::get<3>(out), std::get<4>(out),
+            std::get<5>(out), std::get<6>(out), std::get<7>(out), std::get<8>(out)};
 }
 
 void check_step_inputs(const Tensor& log_probs, const Tensor& raw_scores, const Tensor& lengths, const Tensor& finished,
@@ -399,6 +445,106 @@ Tensor final_scores_path_gradient_cpu(
     return draws;
 }
 
+// A score gradient: absent, or a float32 tensor of the given shape.
+const float* grad_data(const c10::optional<Tensor>& g, torch::IntArrayRef shape, const char* name, Tensor& keep) {
+    if (!g.has_value()) return nullptr;
+    TORCH_CHECK_VALUE(g->scalar_type() == torch::kFloat32 && g->sizes() == shape, name, " must be a float32 ", shape,
+                      " tensor");
+    keep = g->contiguous();
+    return keep.data_ptr<float>();
+}
+
+Tensor decode_backward_cpu(
+    const c10::optional<Tensor>& grad_final_scores,
+    const c10::optional<Tensor>& grad_final_raw_scores,
+    const c10::optional<Tensor>& grad_scores,
+    const c10::optional<Tensor>& grad_raw_scores,
+    const Tensor& parents,
+    const Tensor& tokens,
+    const Tensor& lengths,
+    const Tensor& from_logprob,
+    const c10::optional<Tensor>& steps,
+    int64_t vocab_size,
+    double length_penalty_alpha,
+    const c10::optional<Tensor>& logits,
+    const c10::optional<Tensor>& row_lse) {
+    TORCH_CHECK_VALUE(parents.dim() == 3 && parents.scalar_type() == torch::kInt32,
+                      "parents must be an int32 [B, T, K] tensor");
+    const int64_t B = parents.size(0), T = parents.size(1), K = parents.size(2), V = vocab_size;
+    check_dim(V, "vocab_size");
+    for (const Tensor* t : {&tokens, &lengths}) {
+        TORCH_CHECK_VALUE(t->sizes() == parents.sizes() && t->scalar_type() == torch::kInt32,
+                          "tokens and lengths must be int32 [B, T, K] tensors");
+    }
+    TORCH_CHECK_VALUE(from_logprob.sizes() == parents.sizes() && from_logprob.scalar_type() == torch::kUInt8,
+                      "from_logprob must be a uint8 [B, T, K] tensor");
+    Tensor g_final, g_final_raw, g_scores, g_raw;
+    const float* gf = grad_data(grad_final_scores, {B, K}, "grad_final_scores", g_final);
+    const float* gfr = grad_data(grad_final_raw_scores, {B, K}, "grad_final_raw_scores", g_final_raw);
+    const float* gs = grad_data(grad_scores, {B, T, K}, "grad_scores", g_scores);
+    const float* gr = grad_data(grad_raw_scores, {B, T, K}, "grad_raw_scores", g_raw);
+    TORCH_CHECK_VALUE(logits.has_value() == row_lse.has_value(), "logits and row_lse must be given together");
+    Tensor x, lse;
+    dbs::DType type = dbs::DType::F32;
+    if (logits.has_value()) {
+        type = row_type(*logits, "logits");
+        TORCH_CHECK_VALUE(logits->dim() == 4 && logits->size(0) == B && logits->size(1) == T && logits->size(2) == K &&
+                              logits->size(3) == V,
+                          "logits must have shape [B, T, K, V] = [", B, ", ", T, ", ", K, ", ", V, "]");
+        TORCH_CHECK_VALUE(row_lse->scalar_type() == torch::kFloat32 && row_lse->sizes() == parents.sizes(),
+                          "row_lse must be a float32 [B, T, K] tensor");
+        x = logits->contiguous();
+        lse = row_lse->contiguous();
+    }
+    const Tensor par = parents.contiguous(), tok = tokens.contiguous(), len = lengths.contiguous();
+    const Tensor flp = from_logprob.contiguous();
+    const std::vector<int32_t> steps_b = per_example_steps(steps, B, T);
+    Tensor grad = torch::zeros({B, T, K, V}, torch::TensorOptions().dtype(torch::kFloat32));
+    const size_t row_bytes = static_cast<size_t>(V) * dbs::dtype_size(type);
+    FirstError error;
+    at::parallel_for(0, B, 1, [&](int64_t begin, int64_t end) {
+        for (int64_t b = begin; b < end; ++b) {
+            const int64_t off = b * T * K;
+            dbs::TraceView trace;
+            trace.steps = steps_b[static_cast<size_t>(b)];
+            trace.beam_size = static_cast<int>(K);
+            trace.vocab_size = static_cast<int>(V);
+            trace.length_penalty_alpha = static_cast<float>(length_penalty_alpha);
+            trace.parents = par.data_ptr<int32_t>() + off;
+            trace.tokens = tok.data_ptr<int32_t>() + off;
+            trace.lengths = len.data_ptr<int32_t>() + off;
+            trace.from_logprob = flp.data_ptr<uint8_t>() + off;
+            dbs::OutputGradients g;
+            g.final_scores = gf ? gf + b * K : nullptr;
+            g.final_raw_scores = gfr ? gfr + b * K : nullptr;
+            g.scores = gs ? gs + off : nullptr;
+            g.raw_scores = gr ? gr + off : nullptr;
+            float* out = grad.data_ptr<float>() + off * V;
+            const auto add = [out](int64_t index, float value) { out[index] += value; };
+            try {
+                const std::vector<dbs::SparseGradEntry> entries = dbs::path_gradient(trace, g);
+                if (!x.defined()) {
+                    dbs::apply_path_gradient(entries, static_cast<int>(V), nullptr,
+                                             [](int64_t, float*) -> const float* { return nullptr; }, add);
+                } else {
+                    const char* rows = static_cast<const char*>(x.data_ptr()) + static_cast<size_t>(off) * row_bytes;
+                    const auto read_row = [&](int64_t r, float* buffer) -> const float* {
+                        const char* row = rows + static_cast<size_t>(r) * row_bytes;
+                        if (type == dbs::DType::F32) return reinterpret_cast<const float*>(row);
+                        dbs::convert_to_float(row, type, static_cast<size_t>(V), buffer);
+                        return buffer;
+                    };
+                    dbs::apply_path_gradient(entries, static_cast<int>(V), lse.data_ptr<float>() + off, read_row, add);
+                }
+            } catch (const std::invalid_argument& e) {
+                error.record(b, e.what(), true);
+            }
+        }
+    });
+    error.raise_if_failed();
+    return grad;
+}
+
 Tensor length_penalty_cpu(const Tensor& lengths, double alpha) {
     TORCH_CHECK_VALUE(!lengths.is_floating_point() && !lengths.is_complex() && lengths.scalar_type() != torch::kBool,
                       "lengths must be an integer tensor");
@@ -432,6 +578,14 @@ TORCH_LIBRARY(beamgrad, m) {
         "decode_step(Tensor log_probs, Tensor raw_scores, Tensor lengths, Tensor finished, Tensor prefixes, "
         "int eos_token, int min_length, float length_penalty_alpha, Tensor? banned_tokens, int no_repeat_ngram_size, "
         "float repetition_penalty, bool validate) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+    m.def(
+        "decode_ex(Tensor inputs, bool from_logits, Tensor? steps, int eos_token, int min_length, "
+        "float length_penalty_alpha, Tensor? banned_tokens, int no_repeat_ngram_size, float repetition_penalty, "
+        "bool validate) -> (Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor, Tensor)");
+    m.def(
+        "decode_backward(Tensor? grad_final_scores, Tensor? grad_final_raw_scores, Tensor? grad_scores, "
+        "Tensor? grad_raw_scores, Tensor parents, Tensor tokens, Tensor lengths, Tensor from_logprob, Tensor? steps, "
+        "int vocab_size, float length_penalty_alpha, Tensor? logits, Tensor? row_lse) -> Tensor");
 }
 
 TORCH_LIBRARY_IMPL(beamgrad, CPU, m) {
@@ -440,6 +594,8 @@ TORCH_LIBRARY_IMPL(beamgrad, CPU, m) {
     m.impl("decode_step", &decode_step_cpu);
     m.impl("final_scores_path_gradient", &final_scores_path_gradient_cpu);
     m.impl("length_penalty", &length_penalty_cpu);
+    m.impl("decode_ex", &decode_ex_cpu);
+    m.impl("decode_backward", &decode_backward_cpu);
 }
 
 PyMODINIT_FUNC PyInit__C(void) {

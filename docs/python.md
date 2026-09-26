@@ -4,20 +4,31 @@
 import beamgrad
 ```
 
-All functions accept CPU or CUDA tensors of any floating dtype. Computation
+All functions accept CPU or CUDA tensors of any floating dtype. float16 and
+bfloat16 rows are read as they are (converted exactly, row by row, without a
+float32 copy of the input); other dtypes are converted to float32. Computation
 runs in float32 on the tensor's device; gradients are returned in the input's
 dtype. There is no silent device fallback: CUDA tensors run the native CUDA
 engine, forward and backward.
 
+`final_scores`, `decode` and `search` also take logits (`from_logits=True`):
+each row the search reads is normalised on the fly, `x - logsumexp(row)`, so
+the search is the one over `log_softmax(logits)` without materialising a
+`[B, T, K, V]` tensor of log-probabilities, and gradients flow through the
+log-softmax. The logsumexp is the library's own (a fixed summation order and
+`exp` polynomial), so CPU and CUDA agree bit for bit; it can differ from
+`torch.logsumexp` in the last bits, which only matters for exact ties.
+
 The work is done by operators registered with `torch.library`
-(`torch.ops.beamgrad.decode`, `decode_step`, `final_scores_backward`,
-`final_scores_path_gradient` and `length_penalty`)
+(`torch.ops.beamgrad.decode_ex`, `decode_backward`, `decode_step`,
+`final_scores_path_gradient` and `length_penalty`, and the float32-only
+`decode` and `final_scores_backward` they extend)
 with fake-tensor implementations, an autograd formula and a vmap rule. So
 `final_scores`, `decode`, `search` and `sequence_scores` work inside
 `torch.compile` (including `fullgraph=True`), with `torch.export` and
-fake-tensor tracing, and under `torch.vmap` (PyTorch 2.5+). `final_scores`
-also works under the `torch.func` transforms (`grad`, `vjp`, `jacrev`, and
-`vmap` of them, for example per-example gradients).
+fake-tensor tracing, and under `torch.vmap` (PyTorch 2.5+). `final_scores` and
+`decode` also work under the `torch.func` transforms (`grad`, `vjp`,
+`jacrev`, and `vmap` of them, for example per-example gradients).
 
 ### torch.compile and `beam_search`
 
@@ -71,7 +82,7 @@ token's log-probability; that shift is a constant, so gradients are unchanged.
 Values in `(0, 1]` disable it: unlike `transformers`' `repetition_penalty`,
 values below 1 do not favour repeated tokens.
 
-## `final_scores(log_probs, options, steps=None)`
+## `final_scores(log_probs, options, steps=None, *, from_logits=False)`
 
 Runs beam search and returns the final scores, best beam first, with
 gradients.
@@ -84,11 +95,13 @@ gradients.
 `steps` (batched input only) is an optional `[B]` tensor or sequence giving
 the number of steps to decode for each example, for variable-length batches;
 each entry must be in `[1, T]` (checked by the operator, which raises
-`ValueError`).
+`ValueError`). `from_logits=True` takes logits instead of log-probabilities
+(see above).
 
 The backward pass returns the gradient of each final score along the path
 that produced it; see [algorithm.md](algorithm.md#backward-surrogate-gradients).
-Double backward is not supported.
+From logits it continues through the log-softmax: a row whose path gradient
+is `g` gets `g - softmax(row) * sum(g)`. Double backward is not supported.
 
 ```python
 options = beamgrad.BeamOptions(beam_size=4, eos_token=2)
@@ -106,10 +119,16 @@ With a model whose rows depend on the beams chosen so far, use
 [`beam_search`](#beam_searchstep_fn-options-max_steps--batch_size1-devicenone---beamsearchresult)
 instead.
 
-## `decode(log_probs, options, steps=None) -> BeamSearchOutput`
+## `decode(log_probs, options, steps=None, *, from_logits=False) -> BeamSearchOutput`
 
-The same search without gradients, returning the whole trace as a named tuple.
+The same search, returning the whole trace as a named tuple.
 The leading `[B]` dimension is absent for unbatched input.
+
+When `log_probs` requires grad, the four score fields (`final_scores`,
+`final_raw_scores`, `scores` and `raw_scores`) are differentiable: each
+score's gradient flows along the path of tokens that produced it, holding the
+selection fixed, as for `final_scores`. A loss can combine any of them, for
+example per-step scores.
 
 | field | shape | dtype | meaning |
 |---|---|---|---|
@@ -215,13 +234,16 @@ result = beamgrad.beam_search(step, options, max_steps=20, batch_size=B)
 [`examples/train_lm.py`](../examples/train_lm.py) trains such a model so that
 reference sequences win the search by a margin.
 
-## `search(log_probs, options, steps=None) -> BeamSearchResult`
+## `search(log_probs, options, steps=None, *, from_logits=False) -> BeamSearchResult`
 
 `final_scores` and `decode` in one decode, returned as a `BeamSearchResult`,
 for rows that are already a `[B, T, K, V]` (or `[T, K, V]`) tensor.
 `scores` carry the path gradient, `sequences` are `-1`-padded after each
 beam's length, and `step_log_probs` are views of the input's steps. The
 losses and estimators below accept it like `beam_search`'s result.
+With `from_logits=True`, `step_log_probs` is empty (the log-probabilities are
+never materialised); the estimators, which read them, then need
+`log_softmax(logits)` passed without `from_logits`.
 
 ## `sequence_scores(token_log_probs, lengths, options) -> Tensor`
 
@@ -311,9 +333,11 @@ failing later with undefined symbols.
 ```python
 import beamgrad.jax
 scores = beamgrad.jax.final_scores(log_probs, beamgrad.BeamOptions(beam_size=4), steps=None)
+scores = beamgrad.jax.final_scores(logits, beamgrad.BeamOptions(beam_size=4), from_logits=True)
 ```
 
-Same values, options and gradients as the PyTorch function, via a custom VJP.
+Same values, options and gradients as the PyTorch function (including
+`from_logits`), via a custom VJP.
 Decoding runs on the host through the bundled C library (`jax.pure_callback`):
 the whole batch is decoded in one multi-threaded call, and the forward pass
 keeps the decode trace so the backward pass does not decode again. It composes
