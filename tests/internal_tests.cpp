@@ -714,6 +714,28 @@ std::vector<uint16_t> random_half_row(int V, bool bf16) {
     return row;
 }
 
+// Every fp16 and bf16 bit pattern converts exactly (NaN payloads kept), as
+// the CPU decoder and the CUDA engine both read them.
+void test_half_conversions_are_exact() {
+    for (uint32_t h = 0; h < 0x10000u; ++h) {
+        const uint32_t sign = h >> 15, exp = (h >> 10) & 0x1fu, mant = h & 0x3ffu;
+        float expected;
+        if (exp == 31) {
+            const uint32_t bits = (sign << 31) | 0x7f800000u | (mant << 13);
+            std::memcpy(&expected, &bits, sizeof(expected));
+        } else {
+            const double magnitude = exp == 0 ? std::ldexp(static_cast<double>(mant), -24)
+                                              : std::ldexp(1.0 + static_cast<double>(mant) / 1024.0, static_cast<int>(exp) - 15);
+            expected = static_cast<float>(sign ? -magnitude : magnitude);
+        }
+        const float got = dbs::f16_bits_to_float(static_cast<uint16_t>(h));
+        CHECK(std::memcmp(&got, &expected, sizeof(float)) == 0);
+        const float bf = dbs::bf16_bits_to_float(static_cast<uint16_t>(h));
+        const uint32_t bf_bits = h << 16;
+        CHECK(std::memcmp(&bf, &bf_bits, sizeof(float)) == 0);
+    }
+}
+
 void test_typed_rows_match_float_rows() {
     for (int trial = 0; trial < 300; ++trial) {
         const RandomDecodeSetup d = random_setup(uniform_int(0, 1) == 1);
@@ -1177,6 +1199,7 @@ int main() {
 #if (defined(__GNUC__) || defined(__clang__)) && (defined(__x86_64__) || defined(__i386__))
     CHECK(DBS_CAN_COMPILE_AVX2 && DBS_CAN_COMPILE_SSE42);
 #endif
+    test_half_conversions_are_exact();
     test_row_scan_parity();
     test_constrained_decode_matches_reference();
     test_decode_backward_parity();

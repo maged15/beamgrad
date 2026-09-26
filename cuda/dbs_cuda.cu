@@ -6,7 +6,8 @@
 //
 //   0. constraint_kernel (only with n-gram blocking or a repetition penalty):
 //      rebuilds, for every live beam, bitmaps of the tokens its prefix blocks
-//      and penalises.
+//      and penalises. (From logits, row_lse_kernel has computed the
+//      logsumexp of every row before the first step, in the CPU's fixed order.)
 //   1. A scan kernel turns the K*V candidates of every example into 64-bit keys
 //          ordered(raw score) << 32 | ~(p * V + v)
 //      and keeps the K largest per block, in no particular order: for K <= 16,
@@ -15,7 +16,9 @@
 //      example fills the GPU); for larger beams every thread holds kTile /
 //      kThreads candidates (scan_tiles_kernel). The block then finds its K
 //      largest keys with a radix select (block_top_k), which sorts nothing.
-//      Both scans check every element of the rows they read for NaN and +inf.
+//      Both scans check every element of the rows they read for NaN and +inf,
+//      reading 16-bit inputs as float32 and subtracting the row's logsumexp
+//      from logits (candidate_key is the only place inputs are read).
 //   2. reduce_tiles_kernel: block winners are reduced the same way until at
 //      most kTile keys per example remain.
 //   3. select_step_kernel: one block per example selects the K best survivors
@@ -43,7 +46,9 @@
 // The backward pass walks each example's selected paths from the last step to
 // the first with one block per example. Within a step every beam is handled by
 // its own thread (their gradient entries are distinct), and each parent sums
-// its children in slot order, the same order as the CPU backward.
+// its children in slot order, the same order as the CPU backward. From logits,
+// the path gradients are then grouped by row in token order (logit_rows_kernel)
+// and every such row gets its log-softmax correction (logit_correction_kernel).
 #include "dbs_cuda.h"
 
 #if defined(DBS_CUDA_EMULATION)
@@ -54,6 +59,7 @@
 #define DBS_LAUNCH(kernel, grid, block, stream, ...) kernel<<<(grid), (block), 0, (stream)>>>(__VA_ARGS__)
 #endif
 
+#include "half.hpp"
 #include "penalty.hpp"
 
 #include <algorithm>
@@ -75,12 +81,19 @@ constexpr int kTargetBlocks = 512;            // scan blocks worth launching to 
 constexpr int kMaxGridY = 65535;
 constexpr int kMaxBeam = DBS_CUDA_MAX_BEAM;
 constexpr int kBackwardThreads = 256;
+constexpr int64_t kMaxStepBlocks = 65535;     // blocks of the backward's per-step kernels (each loops over steps)
+constexpr int kCorrectionItems = 8;           // vocabulary entries per thread in logit_correction_kernel
+constexpr int64_t kMaxLseBlocks = 1 << 20;    // blocks of row_lse_kernel (each loops over rows)
 constexpr int64_t kAlign = 256;               // workspace sub-buffer alignment
 
 static_assert(kTile % kThreads == 0, "tile must be a multiple of the block size");
 static_assert(2 * kMaxBeam <= kTile, "tile reduction must shrink the candidate set");
 static_assert(kThreads >= 16, "block_top_k clears its 16-bin histogram with the first 16 threads");
 static_assert((kMaxBeam & (kMaxBeam - 1)) == 0, "select_step_kernel sorts next_pow2(beam) <= kMaxBeam keys");
+static_assert(DBS_CUDA_DTYPE_F32 == static_cast<int>(dbs::DType::F32) &&
+                  DBS_CUDA_DTYPE_F16 == static_cast<int>(dbs::DType::F16) &&
+                  DBS_CUDA_DTYPE_BF16 == static_cast<int>(dbs::DType::BF16),
+              "DBS_CUDA_DTYPE_* are dbs::DType values");
 
 std::atomic<int> g_synchronize{0};
 
@@ -273,10 +286,28 @@ __device__ __forceinline__ bool better(const Cand& a, const Cand& b) {
     return a.from_logprob > b.from_logprob;
 }
 
-// Everything a scan kernel needs besides the beam state.
+// Element i of inputs of type kType (a DBS_CUDA_DTYPE_*), as float32. A
+// template parameter rather than a runtime switch, which the compiler does not
+// always resolve in the unrolled loops.
+template <int kType>
+__device__ __forceinline__ float load_input(const void* inputs, int64_t i) {
+    if constexpr (kType == DBS_CUDA_DTYPE_F16) {
+        return dbs::f16_bits_to_float(static_cast<const uint16_t*>(inputs)[i]);
+    } else if constexpr (kType == DBS_CUDA_DTYPE_BF16) {
+        return dbs::bf16_bits_to_float(static_cast<const uint16_t*>(inputs)[i]);
+    } else {
+        return static_cast<const float*>(inputs)[i];
+    }
+}
+
+// Everything a scan kernel needs besides the beam state. At most 128 bytes:
+// a larger kernel parameter costs the scans about 30 registers (and the tile
+// scan 50% of its speed) with CUDA 12.4. The input type is a template
+// parameter of the scans instead (see candidate_key).
 struct ScanParams {
     DBSCudaDecodeArgs a;
-    const float* log_probs;
+    const void* inputs;         // [B, T, K, V] of the scan's input type
+    const float* row_lse;       // [B, steps, K] logsumexp of the rows (row_lse_kernel) from logits, or null
     const uint32_t* blocked;    // [B, K, words] n-gram bitmap, or null
     const uint32_t* penalised;  // [B, K, words] repetition bitmap, or null
     int words;                  // bitmap words per beam
@@ -285,17 +316,30 @@ struct ScanParams {
 };
 
 // The key of candidate (parent, token) of example b at step t, or 0 if it is
-// not a candidate. Sets `invalid` if the log-prob is NaN or +inf. Only called
+// not a candidate. Sets `invalid` if the input is NaN or +inf. Only called
 // for live, unfinished parents, so every element of their rows is checked.
+// The inputs are of type kType (a DBS_CUDA_DTYPE_*); with kLogits they are
+// logits and lp = x - logsumexp(row), as in dbs::row_log_prob (a row without
+// a finite logit has no candidates). Both are template parameters so that
+// each scan kernel is compiled for exactly one kind of input: a runtime switch
+// in the unrolled scans costs registers and, for float32 log-probs, speed.
+template <int kType, bool kLogits>
 __device__ __forceinline__ uint64_t candidate_key(
     const ScanParams& p, int b, int t, int parent, int token, float parent_raw, int parent_len, const Meta& m,
     uint32_t index, bool& invalid) {
     const int K = p.a.beam_size;
     const int V = p.a.vocab_size;
-    const float lp = p.log_probs[((static_cast<int64_t>(b) * p.a.steps + t) * K + parent) * V + token];
-    if (!(lp < pos_inf())) {
+    const int64_t i = ((static_cast<int64_t>(b) * p.a.steps + t) * K + parent) * V + token;
+    const float x = load_input<kType>(p.inputs, i);
+    if (!(x < pos_inf())) {
         invalid = true;
         return 0;
+    }
+    float lp = x;
+    if constexpr (kLogits) {
+        const float lse = p.row_lse[(static_cast<int64_t>(b) * p.a.steps + t) * K + parent];
+        if (lse == neg_inf()) return 0;
+        lp = __fsub_rn(x, lse);
     }
     if (lp == neg_inf()) return 0;
     if (p.a.banned_tokens && p.a.banned_tokens[token]) return 0;
@@ -412,10 +456,73 @@ __global__ void constraint_kernel(DBSCudaDecodeArgs a, int t, ConstraintState c,
     }
 }
 
+// grid = (row blocks), block = dbs::kLogitLanes threads. The logsumexp of
+// every row [b, t, k] of an example's active steps and beams, into lse
+// [B, steps, K] (-inf for a row without a finite entry, and for the other
+// rows), as dbs::logit_stats computes it: the maximum over finite entries,
+// then thread j sums exp(x - max) over the entries v = j, j + kLogitLanes, ...
+// in increasing v (lane j of the CPU's reduction), and the lanes are combined
+// by the same pairwise tree. All rows at once: the rows a search step reads
+// are only known once the previous step has run, but one block per row of a
+// single step leaves most of the GPU idle. select_step_kernel reports the
+// values of the rows the search read.
+template <int kType>
+__global__ void row_lse_kernel(DBSCudaDecodeArgs a, const void* __restrict__ inputs, float* __restrict__ lse) {
+    __shared__ float lanes[dbs::kLogitLanes];
+
+    const int tid = static_cast<int>(threadIdx.x);
+    const int K = a.beam_size;
+    const int V = a.vocab_size;
+    const int64_t n_rows = static_cast<int64_t>(a.batch_size) * a.steps * K;
+    for (int64_t r = blockIdx.x; r < n_rows; r += gridDim.x) {
+        const int k = static_cast<int>(r % K);
+        const int t = static_cast<int>((r / K) % a.steps);
+        const Meta m = load_meta(a, static_cast<int>(r / (static_cast<int64_t>(K) * a.steps)));
+        if (t >= m.steps || k >= m.beam) {
+            if (tid == 0) lse[r] = neg_inf();
+            continue;
+        }
+        const int64_t row = r * V;
+
+        float max = neg_inf();
+        for (int v = tid; v < V; v += dbs::kLogitLanes) {
+            const float x = load_input<kType>(inputs, row + v);
+            if (x < pos_inf() && x > max) max = x;
+        }
+        lanes[tid] = max;
+        __syncthreads();
+        for (int stride = dbs::kLogitLanes / 2; stride > 0; stride >>= 1) {
+            if (tid < stride && lanes[tid + stride] > lanes[tid]) lanes[tid] = lanes[tid + stride];
+            __syncthreads();
+        }
+        max = lanes[0];
+        __syncthreads();  // every thread has read the maximum before the lanes are reused
+
+        float value = neg_inf();
+        if (max != neg_inf()) {
+            float lane = 0.0f;
+            for (int v = tid; v < V; v += dbs::kLogitLanes) {
+                const float x = load_input<kType>(inputs, row + v);
+                if (x < pos_inf() && x != neg_inf()) lane = dbs::det::add(lane, dbs::det::exp_nonpositive(dbs::det::sub(x, max)));
+            }
+            lanes[tid] = lane;
+            __syncthreads();
+            for (int stride = dbs::kLogitLanes / 2; stride > 0; stride >>= 1) {
+                if (tid < stride) lanes[tid] = dbs::det::add(lanes[tid], lanes[tid + stride]);
+                __syncthreads();
+            }
+            value = dbs::logsumexp_from(max, lanes[0]);
+        }
+        if (tid == 0) lse[r] = value;
+        __syncthreads();  // lanes[0] has been read before the next row reuses the lanes
+    }
+}
+
 // grid = (B, chunks), for beam_size <= KMAX <= kSmallBeam. Every thread keeps
 // the KMAX best keys of its `items` candidates in registers, and the block
-// writes the K best keys of its chunk (0 = no candidate).
-template <int KMAX>
+// writes the K best keys of its chunk (0 = no candidate). kType and kLogits:
+// see candidate_key.
+template <int KMAX, int kType, bool kLogits>
 __global__ void scan_small_kernel(
     ScanParams p,
     int t,
@@ -457,8 +564,9 @@ __global__ void scan_small_kernel(
         int token = static_cast<int>(c - static_cast<int64_t>(parent) * V);
         for (int i = 0; i < items && c < total; ++i) {
             if (expand[parent]) {
-                const uint64_t key = candidate_key(p, b, t, parent, token, parent_raw[parent], parent_len[parent], m,
-                                                   static_cast<uint32_t>(c), invalid);
+                const uint64_t key = candidate_key<kType, kLogits>(p, b, t, parent, token, parent_raw[parent],
+                                                                   parent_len[parent], m, static_cast<uint32_t>(c),
+                                                                   invalid);
                 if (key > best[KMAX - 1]) {
                     best[KMAX - 1] = key;
 #pragma unroll
@@ -486,6 +594,7 @@ __global__ void scan_small_kernel(
 }
 
 // grid = (B, tiles). Writes the K best keys of each tile (0 = no candidate).
+template <int kType, bool kLogits>
 __global__ void scan_tiles_kernel(
     ScanParams p,
     int t,
@@ -521,7 +630,8 @@ __global__ void scan_tiles_kernel(
                 const float parent_raw = beam_raw[s];
                 const bool ended = m.eos >= 0 && beam_ended[s] != 0;
                 if (is_finite(parent_raw) && !ended) {
-                    key = candidate_key(p, b, t, parent, token, parent_raw, beam_len[s], m, static_cast<uint32_t>(c), invalid);
+                    key = candidate_key<kType, kLogits>(p, b, t, parent, token, parent_raw, beam_len[s], m,
+                                                        static_cast<uint32_t>(c), invalid);
                 }
             }
         }
@@ -563,6 +673,8 @@ struct StepOutputs {
     float* scores;
     float* raw_scores;
     uint8_t* from_logprob;
+    const float* lse;  // [B, T, K] every row's logsumexp (from logits), or null
+    float* row_lse;    // [B, T, K] output: lse of the rows the step reads, 0 for the others; or null
 };
 
 // Token prefixes of the beams (only with n-gram blocking or a repetition
@@ -639,6 +751,7 @@ __global__ void select_step_kernel(
         // Finished example: no state change, empty step outputs.
         for (int k = static_cast<int>(threadIdx.x); k < K; k += static_cast<int>(blockDim.x)) {
             write_slot(out, slot_base + k, empty_slot());
+            if (out.row_lse) out.row_lse[slot_base + k] = 0.0f;
         }
         return;
     }
@@ -648,6 +761,11 @@ __global__ void select_step_kernel(
         sh.state_raw[k] = beam_raw[s];
         sh.state_len[k] = beam_len[s];
         sh.state_ended[k] = beam_ended[s];
+        if (out.row_lse) {
+            // The logsumexp of the rows the step read (live, unfinished beams), as the CPU reports it.
+            const bool read = k < m.beam && is_finite(beam_raw[s]) && !(m.eos >= 0 && beam_ended[s] != 0);
+            out.row_lse[slot_base + k] = read && out.lse ? out.lse[slot_base + k] : 0.0f;
+        }
     }
     // The m.beam best of the n_in (<= kTile) surviving keys, then sorted.
     const uint64_t* in = in_keys + static_cast<int64_t>(b) * n_in;
@@ -817,18 +935,30 @@ __global__ void length_penalty_kernel(const int32_t* __restrict__ lengths, int64
     if (i < count) out[i] = length_penalty(lengths[i], alpha);
 }
 
-// grid = (B). Mirrors the CPU backward with only grad_final_scores supplied.
-// Per step, each thread handles some beams: it computes the beam's raw-score
-// gradient, writes its log-prob entry (distinct beams of a step have distinct
-// entries), and files (parent, beam) as a sort key; after sorting, each parent
-// sums its children's gradients in beam order, like the CPU.
+// Gradients of a loss with respect to the decode's score outputs; any may be
+// null (a zero gradient).
+struct OutputGrads {
+    const float* final_scores;      // [B, K]
+    const float* final_raw_scores;  // [B, K]
+    const float* scores;            // [B, T, K]
+    const float* raw_scores;        // [B, T, K]
+};
+
+// grid = (B). Mirrors the CPU backward (dbs::run_backward without a relaxed
+// pool). Per step, each thread handles some beams: it computes the beam's
+// raw-score gradient
+//     draw = next + drank * inv_penalty + g_raw [+ g_final_raw at the last step]
+// with drank = g_scores [+ g_final at the last step], adding the terms in the
+// CPU's order, writes its log-prob entry (distinct beams of a step have
+// distinct entries), and files (parent, beam) as a sort key; after sorting,
+// each parent sums its children's gradients in beam order, like the CPU.
 __global__ void backward_kernel(
     DBSCudaDecodeArgs a,
     const int32_t* __restrict__ parents,
     const int32_t* __restrict__ tokens,
     const int32_t* __restrict__ lengths,
     const uint8_t* __restrict__ from_logprob,
-    const float* __restrict__ grad_final_scores,
+    OutputGrads grads,
     float* __restrict__ grad_log_probs,
     float* __restrict__ draws) {
     __shared__ float grad_a[kMaxBeam];
@@ -858,9 +988,15 @@ __global__ void backward_kernel(
                 const int64_t slot = (static_cast<int64_t>(b) * a.steps + t) * K + k;
                 const int parent = parents[slot];
                 if (parent >= 0 && parent < Kb) {  // also rejects malformed traces
-                    const float drank = t == m.steps - 1 ? grad_final_scores[static_cast<int64_t>(b) * K + k] : 0.0f;
+                    const bool last = t == m.steps - 1;
+                    const int64_t beam = static_cast<int64_t>(b) * K + k;
+                    float drank = 0.0f;
+                    if (grads.scores) drank = __fadd_rn(drank, grads.scores[slot]);
+                    if (last && grads.final_scores) drank = __fadd_rn(drank, grads.final_scores[beam]);
                     const float inv_penalty = __fdiv_rn(1.0f, length_penalty(lengths[slot], a.length_penalty_alpha));
                     d = __fadd_rn(next[k], __fmul_rn(drank, inv_penalty));
+                    if (grads.raw_scores) d = __fadd_rn(d, grads.raw_scores[slot]);
+                    if (last && grads.final_raw_scores) d = __fadd_rn(d, grads.final_raw_scores[beam]);
                     if (d != 0.0f) {
                         const int token = tokens[slot];
                         if (from_logprob[slot] && token >= 0 && token < V) {
@@ -901,6 +1037,132 @@ __global__ void backward_kernel(
     }
 }
 
+// The path gradients of each decode step, grouped by the row they belong to.
+// Row j of step (b, t) (j < n_rows[b, t]) is row parent[.., j] of the step's
+// inputs; its entries are token / value[.., first .. first + count), in token
+// order, and sum is their sum in that order.
+struct LogitRows {
+    int32_t* n_rows;  // [B, T]
+    int32_t* parent;  // [B, T, K]
+    int32_t* first;   // [B, T, K]
+    int32_t* count;   // [B, T, K]
+    float* sum;       // [B, T, K]
+    int32_t* token;   // [B, T, K] entries, sorted by (parent, token)
+    float* value;     // [B, T, K]
+};
+
+// grid = (steps blocks), one decode step (b, t) per block at a time. Groups
+// the step's path gradients (draws, one per selected slot, 0 for none) by row
+// in token order, the order of the CPU's merged entries (dbs::path_gradient):
+// sorting the keys (parent * V + token, slot) puts every row's entries
+// together in token order, and one thread sums each row in that order.
+__global__ void logit_rows_kernel(
+    DBSCudaDecodeArgs a,
+    const int32_t* __restrict__ parents,
+    const int32_t* __restrict__ tokens,
+    const float* __restrict__ draws,
+    LogitRows rows) {
+    __shared__ uint64_t order[kMaxBeam];
+    constexpr uint64_t kNone = ~static_cast<uint64_t>(0);
+    constexpr int kSlotBits = 16;
+    static_assert(kMaxBeam <= (1 << kSlotBits), "slots must fit in the key's low bits");
+
+    const int K = a.beam_size;
+    const int64_t V = a.vocab_size;
+    const int64_t n_steps = static_cast<int64_t>(a.batch_size) * a.steps;
+    for (int64_t step = blockIdx.x; step < n_steps; step += gridDim.x) {
+        const int b = static_cast<int>(step / a.steps);
+        const int t = static_cast<int>(step - static_cast<int64_t>(b) * a.steps);
+        const Meta m = load_meta(a, b);
+        if (t >= m.steps) {
+            if (threadIdx.x == 0) rows.n_rows[step] = 0;
+            continue;
+        }
+        const int64_t base = step * K;
+        const int n = next_pow2(m.beam);
+        for (int k = static_cast<int>(threadIdx.x); k < n; k += static_cast<int>(blockDim.x)) {
+            uint64_t key = kNone;
+            // A non-zero draw belongs to a slot with a valid parent and token (backward_kernel).
+            if (k < m.beam && draws[base + k] != 0.0f) {
+                const uint64_t entry = static_cast<uint64_t>(parents[base + k]) * static_cast<uint64_t>(V) +
+                                       static_cast<uint64_t>(tokens[base + k]);
+                key = (entry << kSlotBits) | static_cast<uint64_t>(k);
+            }
+            order[k] = key;
+        }
+        __syncthreads();
+        bitonic_sort<uint64_t, false>(order, n);
+        if (threadIdx.x == 0) {
+            int n_rows = 0;
+            int i = 0;
+            while (i < n && order[i] != kNone) {
+                const uint64_t row = (order[i] >> kSlotBits) / static_cast<uint64_t>(V);
+                float sum = 0.0f;
+                int j = i;
+                for (; j < n && order[j] != kNone && (order[j] >> kSlotBits) / static_cast<uint64_t>(V) == row; ++j) {
+                    const int slot = static_cast<int>(order[j] & ((1u << kSlotBits) - 1));
+                    const float d = draws[base + slot];
+                    rows.token[base + j] = tokens[base + slot];
+                    rows.value[base + j] = d;
+                    sum = __fadd_rn(sum, d);
+                }
+                rows.parent[base + n_rows] = static_cast<int32_t>(row);
+                rows.first[base + n_rows] = i;
+                rows.count[base + n_rows] = j - i;
+                rows.sum[base + n_rows] = sum;
+                ++n_rows;
+                i = j;
+            }
+            rows.n_rows[step] = n_rows;
+        }
+        __syncthreads();  // `order` is rewritten for the block's next step
+    }
+}
+
+// grid = (steps blocks, vocabulary chunks). Adds the log-softmax gradient of
+// every row with path gradients to grad, as dbs::apply_path_gradient does:
+// entry v of such a row gets g_v - softmax(row)_v * S, where g_v is its path
+// gradient (0 for tokens without one) and S the row's sum. The logits are of
+// type kType.
+template <int kType>
+__global__ void logit_correction_kernel(
+    DBSCudaDecodeArgs a,
+    const void* __restrict__ logits,
+    const float* __restrict__ row_lse,
+    LogitRows rows,
+    float* __restrict__ grad) {
+    const int K = a.beam_size;
+    const int64_t V = a.vocab_size;
+    const int64_t n_steps = static_cast<int64_t>(a.batch_size) * a.steps;
+    const int64_t v0 = static_cast<int64_t>(blockIdx.y) * blockDim.x + threadIdx.x;
+    const int64_t v_stride = static_cast<int64_t>(gridDim.y) * blockDim.x;
+    for (int64_t step = blockIdx.x; step < n_steps; step += gridDim.x) {
+        const int64_t base = step * K;
+        const int n_rows = rows.n_rows[step];
+        for (int j = 0; j < n_rows; ++j) {
+            const int64_t r = base + rows.parent[base + j];
+            const int32_t* tok = rows.token + base + rows.first[base + j];
+            const float* val = rows.value + base + rows.first[base + j];
+            const int count = rows.count[base + j];
+            const float sum = rows.sum[base + j];
+            const float lse = row_lse[r];
+            for (int64_t v = v0; v < V; v += v_stride) {
+                const float x = load_input<kType>(logits, r * V + v);
+                int lo = 0;
+                int hi = count;
+                while (lo < hi) {
+                    const int mid = (lo + hi) >> 1;
+                    if (tok[mid] < v) lo = mid + 1;
+                    else hi = mid;
+                }
+                const float g = lo < count && tok[lo] == v ? val[lo] : 0.0f;
+                const float d = __fsub_rn(g, __fmul_rn(dbs::softmax_probability(x, lse), sum));
+                grad[r * V + v] = __fadd_rn(grad[r * V + v], d);
+            }
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Host helpers
 // ---------------------------------------------------------------------------
@@ -931,6 +1193,10 @@ bool has_per_example(const DBSCudaDecodeArgs& a) {
 
 bool constrained(const DBSCudaDecodeArgs& a) {
     return a.no_repeat_ngram_size > 0 || a.repetition_penalty > 1.0f;
+}
+
+bool valid_dtype(int dtype) {
+    return dtype == DBS_CUDA_DTYPE_F32 || dtype == DBS_CUDA_DTYPE_F16 || dtype == DBS_CUDA_DTYPE_BF16;
 }
 
 bool valid_args(const DBSCudaDecodeArgs* a) {
@@ -964,6 +1230,8 @@ int small_scan_items(const DBSCudaDecodeArgs& a) {
     return static_cast<int>(std::min<int64_t>(kSmallItemsMax, std::max<int64_t>(kSmallItemsMin, items)));
 }
 
+static_assert(sizeof(ScanParams) <= 128, "see ScanParams");
+
 struct DecodePlan {
     bool small;          // register top-k scan (beam_size <= kSmallBeam)
     int small_items;     // candidates per thread in the register top-k scan
@@ -976,6 +1244,7 @@ struct DecodePlan {
     int64_t keys0_offset;
     int64_t keys1_offset;
     int64_t status_offset;
+    int64_t lse_offset;  // [B, T, K] logsumexp of the rows (decoding from logits)
     // Constraint buffers (only when n-gram blocking or a repetition penalty is on).
     int64_t prefix_offset[2];
     int64_t prefix_len_offset[2];
@@ -1012,6 +1281,7 @@ DecodePlan make_plan(const DBSCudaDecodeArgs& a, int prefix_stride = -1) {
     p.keys0_offset = take(B * n0 * static_cast<int64_t>(sizeof(uint64_t)));
     p.keys1_offset = take(B * n1 * static_cast<int64_t>(sizeof(uint64_t)));
     p.status_offset = take(static_cast<int64_t>(sizeof(int)));
+    p.lse_offset = take(B * T * K * static_cast<int64_t>(sizeof(float)));
     if (constrained(a)) {
         p.words = static_cast<int>(ceil_div(a.vocab_size, 32));
         p.prefix_stride = prefix_stride < 0 ? a.steps : prefix_stride;
@@ -1029,6 +1299,42 @@ DecodePlan make_plan(const DBSCudaDecodeArgs& a, int prefix_stride = -1) {
         p.marked_count_offset = take(B * K * static_cast<int64_t>(sizeof(int32_t)));
         p.constraint_bytes = off - zero_begin;
     }
+    p.total_bytes = off;
+    return p;
+}
+
+// Scratch of dbs_cuda_backward_ex's logits correction: the path gradient of
+// every slot, and the rows they belong to (LogitRows).
+struct BackwardPlan {
+    int64_t draws_offset;
+    int64_t n_rows_offset;
+    int64_t parent_offset;
+    int64_t first_offset;
+    int64_t count_offset;
+    int64_t sum_offset;
+    int64_t token_offset;
+    int64_t value_offset;
+    int64_t total_bytes;
+};
+
+BackwardPlan make_backward_plan(const DBSCudaDecodeArgs& a) {
+    BackwardPlan p{};
+    const int64_t steps = static_cast<int64_t>(a.batch_size) * a.steps;
+    const int64_t slots = steps * a.beam_size;
+    int64_t off = 0;
+    auto take = [&off](int64_t bytes) {
+        const int64_t at = off;
+        off = align_up(off + bytes);
+        return at;
+    };
+    p.draws_offset = take(slots * static_cast<int64_t>(sizeof(float)));
+    p.n_rows_offset = take(steps * static_cast<int64_t>(sizeof(int32_t)));
+    p.parent_offset = take(slots * static_cast<int64_t>(sizeof(int32_t)));
+    p.first_offset = take(slots * static_cast<int64_t>(sizeof(int32_t)));
+    p.count_offset = take(slots * static_cast<int64_t>(sizeof(int32_t)));
+    p.sum_offset = take(slots * static_cast<int64_t>(sizeof(float)));
+    p.token_offset = take(slots * static_cast<int64_t>(sizeof(int32_t)));
+    p.value_offset = take(slots * static_cast<int64_t>(sizeof(float)));
     p.total_bytes = off;
     return p;
 }
@@ -1087,24 +1393,38 @@ private:
     int status_ = DBS_CUDA_STATUS_OK;
 };
 
-void launch_scan(const DecodePlan& plan, const ScanParams& params, int t, const float* beam_raw, const int32_t* beam_len,
-                 const uint8_t* beam_ended, uint64_t* keys, cudaStream_t stream) {
+template <int kType, bool kLogits>
+void launch_scan_as(const DecodePlan& plan, const ScanParams& params, int t, const float* beam_raw,
+                    const int32_t* beam_len, const uint8_t* beam_ended, uint64_t* keys, cudaStream_t stream) {
     const dim3 grid(static_cast<unsigned int>(params.a.batch_size), static_cast<unsigned int>(plan.blocks0));
     if (!plan.small) {
-        DBS_LAUNCH(scan_tiles_kernel, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0);
+        const auto tiles = scan_tiles_kernel<kType, kLogits>;
+        DBS_LAUNCH(tiles, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0);
         return;
     }
     const int K = params.a.beam_size;
-    if (K <= 1) {
-        DBS_LAUNCH(scan_small_kernel<1>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0, plan.small_items);
-    } else if (K <= 2) {
-        DBS_LAUNCH(scan_small_kernel<2>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0, plan.small_items);
-    } else if (K <= 4) {
-        DBS_LAUNCH(scan_small_kernel<4>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0, plan.small_items);
-    } else if (K <= 8) {
-        DBS_LAUNCH(scan_small_kernel<8>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0, plan.small_items);
-    } else {
-        DBS_LAUNCH(scan_small_kernel<16>, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0, plan.small_items);
+    const auto small = K <= 1   ? scan_small_kernel<1, kType, kLogits>
+                       : K <= 2 ? scan_small_kernel<2, kType, kLogits>
+                       : K <= 4 ? scan_small_kernel<4, kType, kLogits>
+                       : K <= 8 ? scan_small_kernel<8, kType, kLogits>
+                                : scan_small_kernel<16, kType, kLogits>;
+    DBS_LAUNCH(small, grid, dim3(kThreads), stream, params, t, beam_raw, beam_len, beam_ended, keys, plan.blocks0,
+               plan.small_items);
+}
+
+void launch_scan(const DecodePlan& plan, const ScanParams& params, int dtype, int t, const float* beam_raw,
+                 const int32_t* beam_len, const uint8_t* beam_ended, uint64_t* keys, cudaStream_t stream) {
+    const bool logits = params.row_lse != nullptr;
+    switch (dtype) {
+        case DBS_CUDA_DTYPE_F16:
+            if (logits) return launch_scan_as<DBS_CUDA_DTYPE_F16, true>(plan, params, t, beam_raw, beam_len, beam_ended, keys, stream);
+            return launch_scan_as<DBS_CUDA_DTYPE_F16, false>(plan, params, t, beam_raw, beam_len, beam_ended, keys, stream);
+        case DBS_CUDA_DTYPE_BF16:
+            if (logits) return launch_scan_as<DBS_CUDA_DTYPE_BF16, true>(plan, params, t, beam_raw, beam_len, beam_ended, keys, stream);
+            return launch_scan_as<DBS_CUDA_DTYPE_BF16, false>(plan, params, t, beam_raw, beam_len, beam_ended, keys, stream);
+        default:
+            if (logits) return launch_scan_as<DBS_CUDA_DTYPE_F32, true>(plan, params, t, beam_raw, beam_len, beam_ended, keys, stream);
+            return launch_scan_as<DBS_CUDA_DTYPE_F32, false>(plan, params, t, beam_raw, beam_len, beam_ended, keys, stream);
     }
 }
 
@@ -1132,9 +1452,10 @@ bool prepare_constraints(const DecodePlan& plan, const DBSCudaDecodeArgs& a, con
     return true;
 }
 
-// Queues the kernels of decode step t; `cons` is null without n-gram blocking
-// or a repetition penalty. Advances the beam state in place.
-void launch_step(const DecodePlan& plan, const ScanParams& params, const ConstraintState* cons,
+// Queues the kernels of decode step t, whose inputs are of type dtype; `cons`
+// is null without n-gram blocking or a repetition penalty. Advances the beam
+// state in place.
+void launch_step(const DecodePlan& plan, const ScanParams& params, int dtype, const ConstraintState* cons,
                  const PrefixBuffers& prefixes, int t, float* beam_raw, int32_t* beam_len, uint8_t* beam_ended,
                  uint64_t* keys0, uint64_t* keys1, const StepOutputs& step_out, cudaStream_t stream) {
     const DBSCudaDecodeArgs& a = params.a;
@@ -1142,7 +1463,7 @@ void launch_step(const DecodePlan& plan, const ScanParams& params, const Constra
     if (cons) {
         DBS_LAUNCH(constraint_kernel, dim3(B), dim3(kThreads), stream, a, t, *cons, static_cast<const float*>(beam_raw));
     }
-    launch_scan(plan, params, t, beam_raw, beam_len, beam_ended, keys0, stream);
+    launch_scan(plan, params, dtype, t, beam_raw, beam_len, beam_ended, keys0, stream);
     int n = plan.blocks0 * a.beam_size;
     uint64_t* src = keys0;
     uint64_t* dst = keys1;
@@ -1159,7 +1480,7 @@ void launch_step(const DecodePlan& plan, const ScanParams& params, const Constra
                a, t, src, n, beam_raw, beam_len, beam_ended, step_out, prefixes);
 }
 
-StepOutputs step_outputs(const DBSCudaDecodeOutputs& o) {
+StepOutputs step_outputs(const DBSCudaDecodeOutputs& o, const float* lse, float* row_lse) {
     StepOutputs s;
     s.tokens = o.tokens;
     s.parents = o.parents;
@@ -1167,7 +1488,19 @@ StepOutputs step_outputs(const DBSCudaDecodeOutputs& o) {
     s.scores = o.scores;
     s.raw_scores = o.raw_scores;
     s.from_logprob = o.from_logprob;
+    s.lse = lse;
+    s.row_lse = row_lse;
     return s;
+}
+
+// From logits: the logsumexp of every row of `inputs`, into lse [B, steps, K].
+void launch_row_lse(const DBSCudaDecodeArgs& a, const void* inputs, int dtype, float* lse, cudaStream_t stream) {
+    const int64_t rows = static_cast<int64_t>(a.batch_size) * a.steps * a.beam_size;
+    const auto kernel = dtype == DBS_CUDA_DTYPE_F16    ? row_lse_kernel<DBS_CUDA_DTYPE_F16>
+                        : dtype == DBS_CUDA_DTYPE_BF16 ? row_lse_kernel<DBS_CUDA_DTYPE_BF16>
+                                                       : row_lse_kernel<DBS_CUDA_DTYPE_F32>;
+    DBS_LAUNCH(kernel, dim3(static_cast<unsigned int>(std::min(rows, kMaxLseBlocks))), dim3(dbs::kLogitLanes), stream,
+               a, inputs, lse);
 }
 
 } // namespace
@@ -1211,17 +1544,24 @@ extern "C" DBS_CUDA_EXPORT int64_t dbs_cuda_decode_workspace_size(const DBSCudaD
 
 extern "C" DBS_CUDA_EXPORT int64_t dbs_cuda_backward_workspace_size(const DBSCudaDecodeArgs* args) {
     if (!valid_args(args)) return -1;
-    return 0;  // the backward keeps its state in shared memory
+    // The backward keeps its state in shared memory; only the logits
+    // correction of dbs_cuda_backward_ex needs scratch.
+    return make_backward_plan(*args).total_bytes;
 }
 
-extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode(
-    const float* log_probs,
+extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_ex(
+    const void* inputs,
+    int data_type,
+    int from_logits,
     const DBSCudaDecodeArgs* args,
     const DBSCudaDecodeOutputs* outputs,
+    float* row_lse,
     void* workspace,
     int64_t workspace_bytes,
     void* stream_ptr) {
-    if (!log_probs || !valid_args(args) || !outputs || !outputs->final_scores) return DBS_CUDA_STATUS_INVALID_ARGUMENT;
+    if (!inputs || !valid_dtype(data_type) || !valid_args(args) || !outputs || !outputs->final_scores) {
+        return DBS_CUDA_STATUS_INVALID_ARGUMENT;
+    }
     const DBSCudaDecodeArgs& a = *args;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const DecodePlan plan = make_plan(a);
@@ -1236,15 +1576,16 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode(
 
     const int rc = validate_per_example(a, ws.at<int>(plan.status_offset), stream);
     if (rc != DBS_CUDA_STATUS_OK) return rc;
-
     const int64_t beams = static_cast<int64_t>(a.batch_size) * a.beam_size;
     const dim3 beam_grid(static_cast<unsigned int>(ceil_div(beams, kThreads)));
     DBS_LAUNCH(init_state_kernel, beam_grid, dim3(kThreads), stream, a, beam_raw, beam_len, beam_ended, outputs->invalid_input);
 
     ScanParams params{};
     params.a = a;
-    params.log_probs = log_probs;
+    params.inputs = inputs;
+    params.row_lse = from_logits ? ws.at<float>(plan.lse_offset) : nullptr;
     params.invalid = outputs->invalid_input;
+    if (from_logits) launch_row_lse(a, inputs, data_type, ws.at<float>(plan.lse_offset), stream);
 
     ConstraintState cons{};
     PrefixBuffers prefixes{};
@@ -1263,7 +1604,7 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode(
         prefixes.stride = plan.prefix_stride;
     }
 
-    const StepOutputs step_out = step_outputs(*outputs);
+    const StepOutputs step_out = step_outputs(*outputs, params.row_lse, row_lse);
     for (int t = 0; t < a.steps; ++t) {
         if (with_constraints) {
             cons.prefix = prefix[t & 1];
@@ -1273,7 +1614,7 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode(
             prefixes.next_prefix = prefix[(t + 1) & 1];
             prefixes.next_prefix_len = prefix_len[(t + 1) & 1];
         }
-        launch_step(plan, params, with_constraints ? &cons : nullptr, prefixes, t, beam_raw, beam_len, beam_ended,
+        launch_step(plan, params, data_type, with_constraints ? &cons : nullptr, prefixes, t, beam_raw, beam_len, beam_ended,
                     keys0, keys1, step_out, stream);
     }
 
@@ -1282,20 +1623,33 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode(
     return finish(stream);
 }
 
+extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode(
+    const float* log_probs,
+    const DBSCudaDecodeArgs* args,
+    const DBSCudaDecodeOutputs* outputs,
+    void* workspace,
+    int64_t workspace_bytes,
+    void* stream) {
+    return dbs_cuda_decode_ex(log_probs, DBS_CUDA_DTYPE_F32, 0, args, outputs, nullptr, workspace, workspace_bytes, stream);
+}
+
 extern "C" DBS_CUDA_EXPORT int64_t dbs_cuda_decode_step_workspace_size(const DBSCudaDecodeArgs* args, int prefix_stride) {
     if (!valid_args(args) || args->steps != 1 || args->steps_per_example || prefix_stride < 0) return -1;
     return make_plan(*args, prefix_stride).total_bytes;
 }
 
-extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_step(
-    const float* log_probs,
+extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_step_ex(
+    const void* inputs,
+    int data_type,
+    int from_logits,
     const DBSCudaDecodeArgs* args,
     const DBSCudaBeamState* state,
     const DBSCudaDecodeOutputs* outputs,
+    float* row_lse,
     void* workspace,
     int64_t workspace_bytes,
     void* stream_ptr) {
-    if (!log_probs || !valid_args(args) || !state || !outputs) return DBS_CUDA_STATUS_INVALID_ARGUMENT;
+    if (!inputs || !valid_dtype(data_type) || !valid_args(args) || !state || !outputs) return DBS_CUDA_STATUS_INVALID_ARGUMENT;
     const DBSCudaDecodeArgs& a = *args;
     if (a.steps != 1 || a.steps_per_example) return DBS_CUDA_STATUS_INVALID_ARGUMENT;
     if (!state->raw_scores || !state->lengths || !state->finished || state->prefix_stride < 0 || state->reserved0 != 0) {
@@ -1314,11 +1668,14 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_step(
         cudaMemsetAsync(outputs->invalid_input, 0, static_cast<size_t>(a.batch_size), stream) != cudaSuccess) {
         return DBS_CUDA_STATUS_LAUNCH_FAILED;
     }
+    const int64_t beams = static_cast<int64_t>(a.batch_size) * a.beam_size;
 
     ScanParams params{};
     params.a = a;
-    params.log_probs = log_probs;
+    params.inputs = inputs;
+    params.row_lse = from_logits ? ws.at<float>(plan.lse_offset) : nullptr;
     params.invalid = outputs->invalid_input;
+    if (from_logits) launch_row_lse(a, inputs, data_type, ws.at<float>(plan.lse_offset), stream);
     ConstraintState cons{};
     if (with_constraints) {
         if (!prepare_constraints(plan, a, ws, stream, cons, params)) return DBS_CUDA_STATUS_LAUNCH_FAILED;
@@ -1326,16 +1683,27 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_step(
         cons.prefix_len = state->lengths;  // live beams' prefixes are exactly their hypotheses
     }
     const PrefixBuffers no_prefixes{};  // the caller tracks the prefixes
-    launch_step(plan, params, with_constraints ? &cons : nullptr, no_prefixes, 0, state->raw_scores, state->lengths,
+    launch_step(plan, params, data_type, with_constraints ? &cons : nullptr, no_prefixes, 0, state->raw_scores, state->lengths,
                 state->finished, ws.at<uint64_t>(plan.keys0_offset), ws.at<uint64_t>(plan.keys1_offset),
-                step_outputs(*outputs), stream);
+                step_outputs(*outputs, params.row_lse, row_lse), stream);
     if (outputs->final_scores) {
-        const int64_t beams = static_cast<int64_t>(a.batch_size) * a.beam_size;
         DBS_LAUNCH(finalize_kernel, dim3(static_cast<unsigned int>(ceil_div(beams, kThreads))), dim3(kThreads), stream,
                    a, state->raw_scores, state->lengths, outputs->final_scores, outputs->final_raw_scores,
                    outputs->final_lengths);
     }
     return finish(stream);
+}
+
+extern "C" DBS_CUDA_EXPORT int dbs_cuda_decode_step(
+    const float* log_probs,
+    const DBSCudaDecodeArgs* args,
+    const DBSCudaBeamState* state,
+    const DBSCudaDecodeOutputs* outputs,
+    void* workspace,
+    int64_t workspace_bytes,
+    void* stream) {
+    return dbs_cuda_decode_step_ex(log_probs, DBS_CUDA_DTYPE_F32, 0, args, state, outputs, nullptr, workspace,
+                                   workspace_bytes, stream);
 }
 
 extern "C" DBS_CUDA_EXPORT int dbs_cuda_backward(
@@ -1349,15 +1717,74 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_backward(
     void* workspace,
     int64_t workspace_bytes,
     void* stream_ptr) {
-    (void)workspace;
-    (void)workspace_bytes;
     if (!valid_args(args) || !parents || !tokens || !lengths || !from_logprob || !grad_final_scores || !grad_log_probs) {
         return DBS_CUDA_STATUS_INVALID_ARGUMENT;
     }
+    DBSCudaBackwardInputs in{};
+    in.parents = parents;
+    in.tokens = tokens;
+    in.lengths = lengths;
+    in.from_logprob = from_logprob;
+    in.grad_final_scores = grad_final_scores;
+    return dbs_cuda_backward_ex(args, &in, grad_log_probs, workspace, workspace_bytes, stream_ptr);
+}
+
+extern "C" DBS_CUDA_EXPORT int dbs_cuda_backward_ex(
+    const DBSCudaDecodeArgs* args,
+    const DBSCudaBackwardInputs* in,
+    float* grad_inputs,
+    void* workspace,
+    int64_t workspace_bytes,
+    void* stream_ptr) {
+    if (!valid_args(args) || !in || !grad_inputs) return DBS_CUDA_STATUS_INVALID_ARGUMENT;
+    if (!in->parents || !in->tokens || !in->lengths || !in->from_logprob) return DBS_CUDA_STATUS_INVALID_ARGUMENT;
+    if (in->reserved0 != 0 || in->reserved[0] || in->reserved[1] || in->reserved[2] || in->reserved[3]) {
+        return DBS_CUDA_STATUS_INVALID_ARGUMENT;
+    }
+    if (in->logits && (!in->row_lse || !valid_dtype(in->logits_type))) return DBS_CUDA_STATUS_INVALID_ARGUMENT;
     const DBSCudaDecodeArgs& a = *args;
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
-    DBS_LAUNCH(backward_kernel, dim3(static_cast<unsigned int>(a.batch_size)), dim3(kBackwardThreads), stream,
-               a, parents, tokens, lengths, from_logprob, grad_final_scores, grad_log_probs, static_cast<float*>(nullptr));
+    OutputGrads grads{};
+    grads.final_scores = in->grad_final_scores;
+    grads.final_raw_scores = in->grad_final_raw_scores;
+    grads.scores = in->grad_scores;
+    grads.raw_scores = in->grad_raw_scores;
+    const dim3 grid(static_cast<unsigned int>(a.batch_size));
+    if (!in->logits) {
+        DBS_LAUNCH(backward_kernel, grid, dim3(kBackwardThreads), stream,
+                   a, in->parents, in->tokens, in->lengths, in->from_logprob, grads, grad_inputs, static_cast<float*>(nullptr));
+        return finish(stream);
+    }
+
+    // From logits: the path gradients per slot, grouped by row, then every
+    // row with one gets its log-softmax gradient.
+    const BackwardPlan plan = make_backward_plan(a);
+    Workspace ws(workspace, workspace_bytes, plan.total_bytes, stream);
+    if (!ws.ok()) return ws.status();
+    float* draws = ws.at<float>(plan.draws_offset);
+    const size_t slots = static_cast<size_t>(a.batch_size) * a.steps * a.beam_size;
+    if (cudaMemsetAsync(draws, 0, slots * sizeof(float), stream) != cudaSuccess) return DBS_CUDA_STATUS_LAUNCH_FAILED;
+    DBS_LAUNCH(backward_kernel, grid, dim3(kBackwardThreads), stream,
+               a, in->parents, in->tokens, in->lengths, in->from_logprob, grads, static_cast<float*>(nullptr), draws);
+    LogitRows rows{};
+    rows.n_rows = ws.at<int32_t>(plan.n_rows_offset);
+    rows.parent = ws.at<int32_t>(plan.parent_offset);
+    rows.first = ws.at<int32_t>(plan.first_offset);
+    rows.count = ws.at<int32_t>(plan.count_offset);
+    rows.sum = ws.at<float>(plan.sum_offset);
+    rows.token = ws.at<int32_t>(plan.token_offset);
+    rows.value = ws.at<float>(plan.value_offset);
+    const int64_t n_steps = static_cast<int64_t>(a.batch_size) * a.steps;
+    const unsigned int step_blocks = static_cast<unsigned int>(std::min<int64_t>(n_steps, kMaxStepBlocks));
+    DBS_LAUNCH(logit_rows_kernel, dim3(step_blocks), dim3(kBackwardThreads), stream,
+               a, in->parents, in->tokens, static_cast<const float*>(draws), rows);
+    const unsigned int vocab_blocks = static_cast<unsigned int>(
+        std::min<int64_t>(ceil_div(a.vocab_size, static_cast<int64_t>(kThreads) * kCorrectionItems), kMaxGridY));
+    const auto correction = in->logits_type == DBS_CUDA_DTYPE_F16    ? logit_correction_kernel<DBS_CUDA_DTYPE_F16>
+                            : in->logits_type == DBS_CUDA_DTYPE_BF16 ? logit_correction_kernel<DBS_CUDA_DTYPE_BF16>
+                                                                     : logit_correction_kernel<DBS_CUDA_DTYPE_F32>;
+    DBS_LAUNCH(correction, dim3(step_blocks, vocab_blocks), dim3(kThreads), stream,
+               a, in->logits, in->row_lse, rows, grad_inputs);
     return finish(stream);
 }
 
@@ -1389,7 +1816,9 @@ extern "C" DBS_CUDA_EXPORT int dbs_cuda_path_gradient(
     cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
     const size_t slots = static_cast<size_t>(a.batch_size) * a.steps * a.beam_size;
     if (cudaMemsetAsync(draws, 0, slots * sizeof(float), stream) != cudaSuccess) return DBS_CUDA_STATUS_LAUNCH_FAILED;
+    OutputGrads grads{};
+    grads.final_scores = grad_final_scores;
     DBS_LAUNCH(backward_kernel, dim3(static_cast<unsigned int>(a.batch_size)), dim3(kBackwardThreads), stream,
-               a, parents, tokens, lengths, from_logprob, grad_final_scores, static_cast<float*>(nullptr), draws);
+               a, parents, tokens, lengths, from_logprob, grads, static_cast<float*>(nullptr), draws);
     return finish(stream);
 }

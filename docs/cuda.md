@@ -1,14 +1,37 @@
 # The CUDA engine
 
 `cuda/dbs_cuda.cu` implements the same beam search as the CPU decoder,
-entirely on the GPU, and the same final-score backward pass. The PyTorch
+entirely on the GPU, and the same backward pass. The PyTorch
 operators in `python/csrc/cuda_ops.cpp` call it on PyTorch's current stream
 with scratch memory from PyTorch's caching allocator.
+
+`dbs_cuda_decode` reads float32 log-probs. `dbs_cuda_decode_ex` also reads
+fp16 and bf16 rows, converted exactly as they are scanned, and logits
+(`from_logits`), which it normalises on the fly as the CPU's
+`dbs_decode_batch_into_ex` does. `dbs_cuda_backward_ex` differentiates any
+of the decode's score outputs, through the log-softmax when the inputs were
+logits, and equals `dbs_backward_batch_into_ex`.
 
 ## Forward
 
 A beam search step must pick the `K` best of `K * V` candidates (up to tens
-of millions) with the CPU's exact tie-breaking. Each step runs:
+of millions) with the CPU's exact tie-breaking.
+
+From logits, **`row_lse_kernel`** first computes the logsumexp of every row
+of the input, with one block of 256 threads per row, in the CPU's fixed
+order. The maximum over finite entries comes first. Thread `j` then sums
+`exp(x - max)` over the entries `j, j + 256, ...` in increasing order; this
+is lane `j` of the CPU's reduction. The 256 lanes are combined by the same
+pairwise tree. `exp` is the library's own polynomial (`src/logits.hpp`),
+built from rounded basic operations. The scan then reads `x - logsumexp` for
+each entry `x`.
+
+The CPU computes the logsumexp only for the rows it reads. The GPU computes
+all of them in one launch: one block per row of a single step would leave
+most of the GPU idle. The select kernel then reports the values of the rows
+that were read, and 0 for the others, as the CPU does.
+
+Each step runs:
 
 0. **`constraint_kernel`** (only with `no_repeat_ngram_size` or
    `repetition_penalty`): for every live beam, rebuilds bitmaps of the tokens
@@ -21,9 +44,10 @@ of millions) with the CPU's exact tie-breaking. Each step runs:
    key = ordered_bits(raw score) << 32 | (0xffffffff - (parent * V + token))
    ```
 
-   and keeps the `K` largest per block. Rows are read with coalesced loads,
-   and every element of the rows of live, unfinished beams is checked for
-   NaN and `+inf` on the way (per-example flags in
+   and keeps the `K` largest per block. Rows are read with coalesced loads
+   (16-bit rows converted to float32 exactly, logits normalised by their
+   row's logsumexp). Every element of the rows of live, unfinished beams is
+   checked for NaN and `+inf` on the way (per-example flags in
    `DBSCudaDecodeOutputs::invalid_input`).
    - **`scan_small_kernel`** (`K <= 16`): each of the 256 threads scans 4 to
      32 candidates and keeps its own top `K` in registers (most candidates are
@@ -80,13 +104,16 @@ feeds a result uses an explicitly rounded intrinsic (`__fadd_rn`,
 penalty comes from `src/penalty.hpp`, which the CPU decoder shares: it is
 evaluated in double precision from basic IEEE operations only (no `pow`),
 which round identically on the host and the device. `log(repetition_penalty)`
-is computed once on the host, as the CPU does.
+is computed once on the host, as the CPU does. The logsumexp of logits and
+the fp16/bf16 conversions (`src/logits.hpp`, `src/half.hpp`) are shared the
+same way.
 
-Resource use (CUDA 13.2, sm_80 and sm_90, from `ptxas -v`): the register
+Resource use (CUDA 12.4, sm_80 and sm_90, from `ptxas -v`): the register
 scan uses 32–64 registers and under 300 bytes of static shared memory, the
-tile scan and reduce kernels 48–56 registers and 96 bytes, the select kernel
-56–62 registers and 38 KB, the backward 36–39 registers and 16 KB; no kernel
-spills.
+tile scan 48–58 registers and 96 bytes, the reduce kernel 48 registers and
+96 bytes, the select kernel 56–64 registers and 38 KB, `row_lse_kernel` 31–35
+registers and 1 KB, the backward 40–44 registers and 16 KB, and the logits
+correction's kernels at most 40 registers and 8 KB; no kernel spills.
 
 Decode time through the C APIs on an RTX 4080 SUPER, against the CPU decoder
 (`dbs_decode_batch_into`) on all 8 hardware threads of the same machine
@@ -104,11 +131,33 @@ Decode time through the C APIs on an RTX 4080 SUPER, against the CPU decoder
 
 Small problems are bound by kernel launches (two or three per step).
 
+The scan kernels are compiled once per input type (float32, fp16, bf16) and
+kind (log-probs or logits), so each variant uses as many registers as the
+float32 one. Their parameters stay within 128 bytes: with CUDA 12.4, a
+larger parameter block costs the scans about 30 registers and slows the tile
+scan by half. Decoding from logits adds the logsumexp pass, which reads the
+input twice (once for the maximum, once for the sum):
+
+| B × T × K × V | f32 log-probs | f32 logits | bf16 log-probs | bf16 logits |
+|---|--:|--:|--:|--:|
+| 1 × 16 × 4 × 32k | 0.24 ms | 0.28 ms | 0.27 ms | 0.31 ms |
+| 8 × 32 × 8 × 32k | 1.2 ms | 1.7 ms | 1.3 ms | 1.6 ms |
+| 4 × 16 × 8 × 128k | 0.88 ms | 1.8 ms | 0.93 ms | 1.4 ms |
+| 16 × 64 × 4 × 50k | 2.8 ms | 4.4 ms | 2.7 ms | 3.5 ms |
+| 8 × 16 × 64 × 32k | 3.7 ms | 5.7 ms | 4.5 ms | 5.5 ms |
+
 ## Backward
 
 `backward_kernel` runs one block per example and walks its steps from the
 last to the first. Within a step, each beam is handled by its own thread: it
-computes the beam's raw-score gradient and adds it to the beam's log-prob
+computes the beam's raw-score gradient,
+
+```
+draw = next + (g_scores [+ g_final at the last step]) / penalty(length)
+            + g_raw_scores [+ g_final_raw at the last step]
+```
+
+with the terms added in the CPU's order, and adds it to the beam's log-prob
 entry (distinct beams of a step have distinct entries, so no two threads
 write the same element). The parents' gradients are then formed by sorting
 the beams by `(parent, beam)` and letting each parent sum its children in beam
@@ -116,12 +165,24 @@ order, which is the CPU backward's order. The result is deterministic, uses no
 atomics, and equals the CPU's bit for bit. Zero-filling the dense
 `[B, T, K, V]` gradient dominates the cost.
 
+From logits, `dbs_cuda_backward_ex` keeps each slot's path gradient in its
+workspace instead, and two more kernels apply the log-softmax:
+
+- **`logit_rows_kernel`**, one block per step, sorts the step's non-zero path
+  gradients by `(parent * V + token, slot)`, which groups them by input row
+  in token order. One thread then sums each row in that order, as the CPU sums
+  its merged sparse entries.
+- **`logit_correction_kernel`**, grid (steps, vocabulary chunks), adds
+  `g_v - softmax(row)_v * S` to every entry `v` of each such row, where `g_v`
+  is the entry's path gradient (0 for most tokens) and `S` the row's sum.
+
 ## Limits
 
 - `beam_size <= DBS_CUDA_MAX_BEAM` (1024).
 - `K * V <= 2^31 - 1`, and `ceil(K * V / 4096)` must fit in `gridDim.y`
   (65535): about 268 million candidates per step.
-- Inputs are float32; the PyTorch layer converts other dtypes.
+- Inputs are float32, fp16 or bf16 (`dbs_cuda_decode_ex`; `dbs_cuda_decode`
+  takes float32).
 - Per-example `steps`/beam arrays are validated on the device, which reads one
   status flag back and therefore synchronizes the stream once per call. The
   PyTorch operator also reads the NaN/`+inf` flags back when
@@ -154,8 +215,11 @@ against libdbs, requiring every forward output, NaN/`+inf` flag and gradient
 to match bit for bit. The cases cover ties, `-inf`, NaN and `+inf` entries,
 EOS, `min_length`, length penalty, banned tokens, n-gram blocking, repetition
 penalty, variable batches, both scan kernels and the boundary between them,
-multi-level reduction, and `K = 1024`. CI runs this suite, with and without
-sanitizers, on every change.
+multi-level reduction, and `K = 1024`. Another 46 cases run
+`dbs_cuda_decode_ex`, `dbs_cuda_decode_step_ex` and `dbs_cuda_backward_ex` for
+every input type, with log-probs and logits, against
+`dbs_decode_batch_into_ex` and `dbs_backward_batch_into_ex`. CI runs this
+suite, with and without sanitizers, on every change.
 
 The emulation checks the kernels' logic, not their performance or warp-level
 timing.

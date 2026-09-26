@@ -13,6 +13,12 @@
   decode output (final, per-step and pool scores and raw scores), through
   the logits' log-softmax when the batch was decoded from logits. Both new
   functions are additions; ABI 10 is unchanged.
+- The same on the GPU. `dbs_cuda_decode_ex` and `dbs_cuda_decode_step_ex`
+  read fp16 and bf16 rows directly, and logits (`from_logits`), and return
+  each row's logsumexp. `dbs_cuda_backward_ex` (`DBSCudaBackwardInputs`)
+  differentiates the final, per-step and raw scores, through the log-softmax
+  from logits. The results equal the CPU's `_ex` functions bit for bit (the
+  relaxed pool stays CPU-only).
 
 ### Changed
 
@@ -22,6 +28,9 @@
 - The selected-beam softmax weights and the relaxed pool's sigmoid use the
   library's deterministic `exp`. Their values can differ from 2.1.1's in the
   last bits.
+- `dbs_cuda_backward_workspace_size` returns the scratch that
+  `dbs_cuda_backward_ex` needs from logits, instead of 0. `dbs_cuda_backward`
+  still needs none.
 
 ## 2.1.1 (2026-09-26)
 
