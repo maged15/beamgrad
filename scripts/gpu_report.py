@@ -65,7 +65,11 @@ def environment(tag: str | None) -> list[str]:
         ("PyTorch", f"{torch.__version__} (CUDA {torch.version.cuda})"),
         ("beamgrad", f"{beamgrad.__version__}, CUDA operators: {beamgrad.cuda_available()}"),
         ("Python", sys.version.split()[0]),
-        ("Commit", first_line(["git", "describe", "--always", "--dirty", "--tags"])),
+        (
+            "Commit",
+            first_line(["git", "log", "-1", "--format=%h %s"])
+            + (" (with uncommitted changes)" if run(["git", "status", "--porcelain"])[1].strip() else ""),
+        ),
     ]
     if tag:
         code, diff = run(["git", "diff", "--stat", tag, "--", *LIBRARY_PATHS])
@@ -109,7 +113,11 @@ def python_suite() -> tuple[bool, list[str]]:
         [sys.executable, "-m", "pytest", str(ROOT / "python" / "tests"), "-q", "-rs", "-p", "no:cacheprovider"],
         cwd=Path(os.environ.get("TMPDIR", "/tmp")),
     )
-    tail = [line for line in out.splitlines() if " passed" in line or " failed" in line or line.startswith("SKIPPED")]
+    tail = [
+        re.sub(r"\S*?(python/tests/)", r"\1", line)  # repository-relative paths
+        for line in out.splitlines()
+        if " passed" in line or " failed" in line or line.startswith("SKIPPED")
+    ]
     code_cuda, out_cuda = run(
         [sys.executable, "-m", "pytest", str(ROOT / "python" / "tests"), "-q", "-p", "no:cacheprovider", "-k", "cuda"],
         cwd=Path(os.environ.get("TMPDIR", "/tmp")),
